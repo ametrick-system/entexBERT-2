@@ -1,0 +1,2 @@
+experiment	jitter_max_offset	train_n	val_n	test_n	offset_min	offset_max	offset_mean	offset_std	acc	auc	aupr	f1	mcc	precision	recall	model_dir	log_file
+jitter_16	16	16005	1996	1998	-16	16	0.108755	9.525534	0.6321321321321322	0.6800228676883575	0.6918633585207481	0.5768566493955095	0.2643451851998633	0.6514954486345904	0.5175619834710744	/home/asm242/entexBERT-2/entexBERT-1_tests/results/jitter_exp_10k/jitter_16/model	/home/asm242/entexBERT-2/entexBERT-1_tests/results/jitter_exp_10k/jitter_16/run.log

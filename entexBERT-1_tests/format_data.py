@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 import pysam
+import hashlib
 
 def seq_to_kmers(seq, k):
     return " ".join(seq[i:i+k] for i in range(len(seq) - k + 1))
@@ -13,6 +14,8 @@ def seq_to_kmers(seq, k):
 def clean_offset_name(offset):
     if offset == "random":
         return "offset_random"
+    if offset == "jitter":
+        return "offset_jitter"
     offset = int(offset)
     if offset < 0:
         return f"offset_m{abs(offset)}"
@@ -122,6 +125,8 @@ def main():
     parser.add_argument("--offsets", default="0,16,32,64,-16,-32,-64")
     parser.add_argument("--include_random", action="store_true")
     parser.add_argument("--random_margin", type=int, default=16)
+    parser.add_argument("--include_jitter", action="store_true")
+    parser.add_argument("--jitter_max_offset", type=int, default=64)
 
     parser.add_argument("--min_total_reads", type=int, default=10)
     parser.add_argument("--max_per_class", type=int, default=None)
@@ -205,8 +210,12 @@ def main():
     print(pd.crosstab(data["split"], data["label"]))
 
     offsets = [x.strip() for x in args.offsets.split(",") if x.strip()]
+
     if args.include_random:
         offsets.append("random")
+
+    if args.include_jitter:
+        offsets.append("jitter")
 
     fasta = pysam.FastaFile(args.ref_fasta)
 
@@ -234,11 +243,27 @@ def main():
 
         for _, row in data.iterrows():
             if offset == "random":
-                desired_snp_index = rng.randint(
+                # SNP can appear almost anywhere in the window, excluding margins.
+                per_example_rng = random.Random( # makes same random examples per random seed for reproducibility
+                    int(hashlib.md5(f"{args.seed}:{row['example_id']}:random".encode()).hexdigest(), 16)
+                )
+                desired_snp_index = per_example_rng.randint(
                     args.random_margin,
                     args.window_size - args.random_margin - 1
                 )
                 actual_offset = desired_snp_index - center_idx
+
+            elif offset == "jitter":
+                # SNP appears at a random position within +/- jitter_max_offset of center.
+                per_example_rng = random.Random(
+                    int(hashlib.md5(f"{args.seed}:{row['example_id']}:jitter".encode()).hexdigest(), 16)
+                )
+                actual_offset = per_example_rng.randint(
+                    -args.jitter_max_offset,
+                    args.jitter_max_offset
+                )
+                desired_snp_index = center_idx + actual_offset
+
             else:
                 actual_offset = int(offset)
                 desired_snp_index = center_idx + actual_offset
