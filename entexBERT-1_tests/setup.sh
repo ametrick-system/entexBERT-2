@@ -14,6 +14,7 @@ conda activate entexbert_dnabert1
 set -u
 
 conda install pytorch==1.10.2 torchvision==0.11.3 cudatoolkit=11.3 -c pytorch -c conda-forge -y
+python -m pip install "matplotlib==3.3.4" # an old version since old python version
 
 cd ~/entexBERT-2/entexBERT-1_tests/external/DNABERT
 
