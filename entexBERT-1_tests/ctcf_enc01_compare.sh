@@ -23,7 +23,7 @@ PROJECT_DIR="$HOME/entexBERT-2/entexBERT-1_tests"
 AS_TSV="$HOME/entex_data/hetSNVs.tsv"
 REF_FASTA="$HOME/reference_genome/hg38.fa"
 
-PRETRAINED_MODEL="$HOME/pretrained_models/DNABERT_6"
+PRETRAINED_MODEL="$HOME/pretrained_models/DNABERT_3"
 DNABERT_EXAMPLES="$PROJECT_DIR/external/DNABERT/examples"
 
 DATA_DIR="$PROJECT_DIR/data/ctcf_enc01_compare_10k"
@@ -36,7 +36,7 @@ SEED=42
 MAX_PER_CLASS=10000
 
 WINDOW_SIZE=256
-KMER=6
+KMER=3
 JITTER_MAX_OFFSET=64
 
 EPOCHS=5
@@ -188,7 +188,7 @@ run_experiment () {
 
     python entexbert_ft.py \
       --model_type "$MODEL_TYPE" \
-      --tokenizer_name dna6 \
+      --tokenizer_name dna3 \
       --model_name_or_path "$PRETRAINED_MODEL" \
       --task_name dnaprom \
       --do_train \

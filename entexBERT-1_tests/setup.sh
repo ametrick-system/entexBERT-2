@@ -69,7 +69,7 @@ import os
 import torch
 from transformers import BertConfig, BertForMaskedLM, DNATokenizer
 
-model_dir = os.path.expanduser("~/models/DNABERT1/DNA_bert_6")
+model_dir = os.path.expanduser("~/pretrained_models/DNABERT_6")
 
 print("model_dir:", model_dir)
 print("torch:", torch.__version__)

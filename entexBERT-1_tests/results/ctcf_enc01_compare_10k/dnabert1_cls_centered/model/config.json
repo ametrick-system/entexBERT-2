@@ -24,7 +24,7 @@
   "initializer_range": 0.02,
   "intermediate_size": 3072,
   "is_decoder": false,
-  "k": "6",
+  "k": "3",
   "label2id": {
     "LABEL_0": 0,
     "LABEL_1": 1
@@ -56,5 +56,5 @@
   "torchscript": false,
   "type_vocab_size": 2,
   "use_bfloat16": false,
-  "vocab_size": 4101
+  "vocab_size": 69
 }
