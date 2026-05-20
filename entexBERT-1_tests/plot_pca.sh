@@ -17,5 +17,5 @@ export PYTHONNOUSERSITE=1
 python plot_pca.py \
   --split val \
   --include_jitter \
-  --out_png "$HOME/entexBERT-2/entexBERT-1_tests/results/ctcf_enc01_compare_uncapped/pca_attention_with_jitter.png" \
-  --out_pdf "$HOME/entexBERT-2/entexBERT-1_tests/results/ctcf_enc01_compare_uncapped/pca_attention_with_jitter.pdf"
+  --out_png "$HOME/entexBERT-2/entexBERT-1_tests/results/ctcf_enc01_compare_uncapped/embedding_pca_like_paper_with_jitter.png" \
+  --out_pdf "$HOME/entexBERT-2/entexBERT-1_tests/results/ctcf_enc01_compare_uncapped/embedding_pca_like_paper_with_jitter.pdf"
