@@ -18,8 +18,8 @@ import matplotlib.patches as mpatches
 
 
 DEFAULT_PROJECT_DIR = os.path.expanduser("~/entexBERT-2/entexBERT-1_tests")
-DEFAULT_DATA_DIR = os.path.join(DEFAULT_PROJECT_DIR, "data", "ctcf_enc01_compare_10k")
-DEFAULT_RESULT_DIR = os.path.join(DEFAULT_PROJECT_DIR, "results", "ctcf_enc01_compare_10k")
+DEFAULT_DATA_DIR = os.path.join(DEFAULT_PROJECT_DIR, "data", "ctcf_enc01_compare_uncapped")
+DEFAULT_RESULT_DIR = os.path.join(DEFAULT_PROJECT_DIR, "results", "ctcf_enc01_compare_uncapped")
 
 
 def add_repo_paths(project_dir):
