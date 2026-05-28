@@ -1,2 +1,0 @@
-experiment	model_type	train_n	val_n	test_n	acc	auc	aupr	f1	mcc	precision	recall	model_dir	log_file
-jitter_16	dna_cls	16005	1996	1998	0.6596596596596597	0.727565092674316	0.7331205168795616	0.5981087470449172	0.3234222536034033	0.6988950276243094	0.5227272727272727	/home/asm242/entexBERT-2/entexBERT-1_tests/results/cls_control_10k/jitter_16/model	/home/asm242/entexBERT-2/entexBERT-1_tests/results/cls_control_10k/jitter_16/run.log

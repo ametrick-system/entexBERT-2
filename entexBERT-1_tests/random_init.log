@@ -1,159 +1,0 @@
-05/22/2026 11:10:20 - WARNING - __main__ -   Process rank: -1, device: cuda, n_gpu: 1, distributed training: False, 16-bits training: False
-05/22/2026 11:10:20 - INFO - transformers.configuration_utils -   loading configuration file /home/asm242/pretrained_models/DNABERT_3/config.json
-05/22/2026 11:10:20 - INFO - transformers.configuration_utils -   Model config BertConfig {
-  "architectures": [
-    "BertForMaskedLM"
-  ],
-  "attention_probs_dropout_prob": 0.1,
-  "auto_map": {
-    "AutoConfig": "configuration_bert.BertConfig",
-    "AutoModel": "dnabert_layer.BertModel",
-    "AutoModelForMaskedLM": "dnabert_layer.BertForMaskedLM",
-    "AutoModelForPreTraining": "dnabert_layer.BertForPreTraining",
-    "AutoModelForSequenceClassification": "dnabert_layer.DNABertForSequenceClassification"
-  },
-  "bos_token_id": 0,
-  "do_sample": false,
-  "eos_token_ids": 0,
-  "finetuning_task": "dnaprom",
-  "hidden_act": "gelu",
-  "hidden_dropout_prob": 0.1,
-  "hidden_size": 768,
-  "id2label": {
-    "0": "LABEL_0",
-    "1": "LABEL_1"
-  },
-  "initializer_range": 0.02,
-  "intermediate_size": 3072,
-  "is_decoder": false,
-  "label2id": {
-    "LABEL_0": 0,
-    "LABEL_1": 1
-  },
-  "layer_norm_eps": 1e-12,
-  "length_penalty": 1.0,
-  "max_length": 20,
-  "max_position_embeddings": 512,
-  "model_type": "bert",
-  "num_attention_heads": 12,
-  "num_beams": 1,
-  "num_hidden_layers": 12,
-  "num_labels": 2,
-  "num_return_sequences": 1,
-  "num_rnn_layer": 1,
-  "output_attentions": false,
-  "output_hidden_states": false,
-  "output_past": true,
-  "pad_token_id": 0,
-  "pruned_heads": {},
-  "repetition_penalty": 1.0,
-  "rnn": "lstm",
-  "rnn_dropout": 0.0,
-  "rnn_hidden": 768,
-  "split": 10,
-  "temperature": 1.0,
-  "top_k": 50,
-  "top_p": 1.0,
-  "torchscript": false,
-  "type_vocab_size": 2,
-  "use_bfloat16": false,
-  "vocab_size": 69
-}
-
-05/22/2026 11:10:21 - INFO - transformers.tokenization_utils -   loading file https://raw.githubusercontent.com/jerryji1993/DNABERT/master/src/transformers/dnabert-config/bert-config-3/vocab.txt from cache at /home/asm242/.cache/torch/transformers/e1e7221d086d0af09215b2c6ef3ded41de274c79ace1930c48dfce242a7b36fa.b24b7bce4d95258cccdbc46b651c8283db3a0f1324fb97567c8b22b19970f82c
-05/22/2026 11:10:21 - INFO - transformers.modeling_utils -   loading weights file /home/asm242/pretrained_models/DNABERT_3/pytorch_model.bin
-05/22/2026 11:10:22 - INFO - transformers.modeling_utils -   Weights of BertForSequenceClassification not initialized from pretrained model: ['classifier.weight', 'classifier.bias']
-05/22/2026 11:10:22 - INFO - transformers.modeling_utils -   Weights from pretrained model not used in BertForSequenceClassification: ['cls.predictions.bias', 'cls.predictions.transform.dense.weight', 'cls.predictions.transform.dense.bias', 'cls.predictions.transform.LayerNorm.weight', 'cls.predictions.transform.LayerNorm.bias', 'cls.predictions.decoder.weight', 'cls.predictions.decoder.bias']
-05/22/2026 11:10:24 - INFO - __main__ -   Training/evaluation parameters Namespace(adam_epsilon=1e-08, attention_probs_dropout_prob=0.1, beta1=0.9, beta2=0.999, cache_dir='', config_name='', data_dir='/home/asm242/entexBERT-2/entexBERT-1_tests/data/shift_exp_10k/offset_0', device=device(type='cuda'), do_ensemble_pred=False, do_eval=False, do_lower_case=False, do_predict=True, do_train=False, do_visualize=False, early_stop=0, eval_all_checkpoints=False, evaluate_during_training=False, fp16=False, fp16_opt_level='O1', gradient_accumulation_steps=1, hidden_dropout_prob=0.1, learning_rate=5e-05, local_rank=-1, logging_steps=500, max_grad_norm=1.0, max_seq_length=257, max_steps=-1, model_name_or_path='/home/asm242/pretrained_models/DNABERT_3', model_type='dna', n_gpu=1, n_process=48, no_cuda=False, num_rnn_layer=2, num_train_epochs=3.0, output_dir='/home/asm242/pretrained_models/DNABERT_3', output_mode='classification', overwrite_cache=False, overwrite_output_dir=False, per_gpu_eval_batch_size=8, per_gpu_pred_batch_size=128, per_gpu_train_batch_size=8, pred_layer=11, predict_dir='/home/asm242/entexBERT-2/entexBERT-1_tests', predict_scan_size=1, result_dir=None, rnn='lstm', rnn_dropout=0.0, rnn_hidden=768, save_steps=500, save_total_limit=None, seed=42, server_ip='', server_port='', should_continue=False, task_name='dnaprom', tokenizer_name='dna3', visualize_data_dir=None, visualize_models=None, visualize_train=False, warmup_percent=0, warmup_steps=0, weight_decay=0.0)
-05/22/2026 11:10:24 - INFO - transformers.tokenization_utils -   Model name '/home/asm242/pretrained_models/DNABERT_3' not found in model shortcut name list (dna3, dna4, dna5, dna6). Assuming '/home/asm242/pretrained_models/DNABERT_3' is a path, a model identifier, or url to a directory containing tokenizer files.
-05/22/2026 11:10:24 - INFO - transformers.tokenization_utils -   Didn't find file /home/asm242/pretrained_models/DNABERT_3/added_tokens.json. We won't load it.
-05/22/2026 11:10:24 - INFO - transformers.tokenization_utils -   loading file /home/asm242/pretrained_models/DNABERT_3/vocab.txt
-05/22/2026 11:10:24 - INFO - transformers.tokenization_utils -   loading file None
-05/22/2026 11:10:24 - INFO - transformers.tokenization_utils -   loading file /home/asm242/pretrained_models/DNABERT_3/special_tokens_map.json
-05/22/2026 11:10:24 - INFO - transformers.tokenization_utils -   loading file /home/asm242/pretrained_models/DNABERT_3/tokenizer_config.json
-05/22/2026 11:10:24 - INFO - __main__ -   Predict using the following checkpoint: /home/asm242/pretrained_models/DNABERT_3
-05/22/2026 11:10:24 - INFO - transformers.configuration_utils -   loading configuration file /home/asm242/pretrained_models/DNABERT_3/config.json
-05/22/2026 11:10:24 - INFO - transformers.configuration_utils -   Model config BertConfig {
-  "architectures": [
-    "BertForMaskedLM"
-  ],
-  "attention_probs_dropout_prob": 0.1,
-  "auto_map": {
-    "AutoConfig": "configuration_bert.BertConfig",
-    "AutoModel": "dnabert_layer.BertModel",
-    "AutoModelForMaskedLM": "dnabert_layer.BertForMaskedLM",
-    "AutoModelForPreTraining": "dnabert_layer.BertForPreTraining",
-    "AutoModelForSequenceClassification": "dnabert_layer.DNABertForSequenceClassification"
-  },
-  "bos_token_id": 0,
-  "do_sample": false,
-  "eos_token_ids": 0,
-  "finetuning_task": null,
-  "hidden_act": "gelu",
-  "hidden_dropout_prob": 0.1,
-  "hidden_size": 768,
-  "id2label": {
-    "0": "LABEL_0",
-    "1": "LABEL_1"
-  },
-  "initializer_range": 0.02,
-  "intermediate_size": 3072,
-  "is_decoder": false,
-  "label2id": {
-    "LABEL_0": 0,
-    "LABEL_1": 1
-  },
-  "layer_norm_eps": 1e-12,
-  "length_penalty": 1.0,
-  "max_length": 20,
-  "max_position_embeddings": 512,
-  "model_type": "bert",
-  "num_attention_heads": 12,
-  "num_beams": 1,
-  "num_hidden_layers": 12,
-  "num_labels": 2,
-  "num_return_sequences": 1,
-  "num_rnn_layer": 1,
-  "output_attentions": false,
-  "output_hidden_states": false,
-  "output_past": true,
-  "pad_token_id": 0,
-  "pruned_heads": {},
-  "repetition_penalty": 1.0,
-  "rnn": "lstm",
-  "rnn_dropout": 0.0,
-  "rnn_hidden": 768,
-  "split": 10,
-  "temperature": 1.0,
-  "top_k": 50,
-  "top_p": 1.0,
-  "torchscript": false,
-  "type_vocab_size": 2,
-  "use_bfloat16": false,
-  "vocab_size": 69
-}
-
-05/22/2026 11:10:24 - INFO - transformers.modeling_utils -   loading weights file /home/asm242/pretrained_models/DNABERT_3/pytorch_model.bin
-05/22/2026 11:10:26 - INFO - transformers.modeling_utils -   Weights of BertForSequenceClassification not initialized from pretrained model: ['classifier.weight', 'classifier.bias']
-05/22/2026 11:10:26 - INFO - transformers.modeling_utils -   Weights from pretrained model not used in BertForSequenceClassification: ['cls.predictions.bias', 'cls.predictions.transform.dense.weight', 'cls.predictions.transform.dense.bias', 'cls.predictions.transform.LayerNorm.weight', 'cls.predictions.transform.LayerNorm.bias', 'cls.predictions.decoder.weight', 'cls.predictions.decoder.bias']
-05/22/2026 11:10:26 - INFO - __main__ -   Loading features from cached file /home/asm242/entexBERT-2/entexBERT-1_tests/data/shift_exp_10k/offset_0/cached_test_257_dnaprom
-05/22/2026 11:10:26 - INFO - __main__ -   ***** Running prediction  *****
-05/22/2026 11:10:26 - INFO - __main__ -     Num examples = 1998
-05/22/2026 11:10:26 - INFO - __main__ -     Batch size = 128
-============================================================
-<class 'transformers.tokenization_dna.DNATokenizer'>
-============================================================
-<class 'transformers.tokenization_dna.DNATokenizer'>
-Predicting:   0%|          | 0/16 [00:00<?, ?it/s]Predicting:   6%|▋         | 1/16 [00:00<00:12,  1.24it/s]Predicting:  12%|█▎        | 2/16 [00:01<00:07,  1.92it/s]Predicting:  19%|█▉        | 3/16 [00:01<00:05,  2.32it/s]Predicting:  25%|██▌       | 4/16 [00:01<00:04,  2.58it/s]Predicting:  31%|███▏      | 5/16 [00:02<00:04,  2.75it/s]Predicting:  38%|███▊      | 6/16 [00:02<00:03,  2.86it/s]Predicting:  44%|████▍     | 7/16 [00:02<00:03,  2.93it/s]Predicting:  50%|█████     | 8/16 [00:03<00:02,  2.99it/s]Predicting:  56%|█████▋    | 9/16 [00:03<00:02,  3.02it/s]Predicting:  62%|██████▎   | 10/16 [00:03<00:01,  3.04it/s]Predicting:  69%|██████▉   | 11/16 [00:04<00:01,  3.06it/s]Predicting:  75%|███████▌  | 12/16 [00:04<00:01,  3.07it/s]Predicting:  81%|████████▏ | 13/16 [00:04<00:00,  3.08it/s]Predicting:  88%|████████▊ | 14/16 [00:04<00:00,  3.08it/s]Predicting:  94%|█████████▍| 15/16 [00:05<00:00,  3.08it/s]Predicting: 100%|██████████| 16/16 [00:05<00:00,  3.50it/s]Predicting: 100%|██████████| 16/16 [00:05<00:00,  2.90it/s]
-/home/asm242/.conda/envs/entexbert_dnabert1/lib/python3.6/site-packages/sklearn/metrics/_classification.py:1248: UndefinedMetricWarning: Precision is ill-defined and being set to 0.0 due to no predicted samples. Use `zero_division` parameter to control this behavior.
-  _warn_prf(average, modifier, msg_start, len(result))
-/home/asm242/.conda/envs/entexbert_dnabert1/lib/python3.6/site-packages/sklearn/metrics/_classification.py:873: RuntimeWarning: invalid value encountered in double_scalars
-  mcc = cov_ytyp / np.sqrt(cov_ytyt * cov_ypyp)
-05/22/2026 11:10:32 - INFO - __main__ -   ***** Pred results  *****
-05/22/2026 11:10:32 - INFO - __main__ -     acc = 0.5155155155155156
-05/22/2026 11:10:32 - INFO - __main__ -     auc = 0.501212589264222
-05/22/2026 11:10:32 - INFO - __main__ -     aupr = 0.48510959306413853
-05/22/2026 11:10:32 - INFO - __main__ -     f1 = 0.0
-05/22/2026 11:10:32 - INFO - __main__ -     mcc = 0.0
-05/22/2026 11:10:32 - INFO - __main__ -     precision = 0.0
-05/22/2026 11:10:32 - INFO - __main__ -     recall = 0.0
