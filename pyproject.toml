@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "entexbert2"
+version = "0.1.0"
+description = "Fine-tuning a Transformer model on EN-TEx data built off a modified DNABERT-2 backbone"
+authors = [
+  {name = "Amy Metrick"}
+]
+readme = "README.md"
+requires-python = ">=3.8"
+
+dependencies = [
+  "biopython",
+  "edlib",
+  "pyBigWig",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
