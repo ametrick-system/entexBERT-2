@@ -723,7 +723,7 @@ def validate_training_args(training_args):
     if training_args.head_hidden_size != -1 and training_args.head_hidden_size <= 0:
         raise ValueError("head_hidden_size must be positive or -1.")
 
-    if training_args.head_activation not in allowed_head_activations:
+    if training_args.head_activation.lower() not in allowed_head_activations:
         raise ValueError(
             f"Unsupported head_activation {training_args.head_activation!r}. "
             f"Choose from {allowed_head_activations}."
@@ -1161,7 +1161,7 @@ def train():
         f"num_aux_tasks={training_args.num_aux_tasks}, "
         f"aux_task_names={training_args.aux_task_names}, "
         f"pooling_mode={training_args.pooling_mode!r}, "
-        f"center_pool_width={training_args.center_pool_width}",
+        f"center_pool_width={training_args.center_pool_width}, "
         f"head_num_layers={training_args.head_num_layers}, "
         f"head_hidden_size={training_args.head_hidden_size}, "
         f"head_activation={training_args.head_activation!r}, "
