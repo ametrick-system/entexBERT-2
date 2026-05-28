@@ -34,10 +34,11 @@ from peft import (
     get_peft_model_state_dict,
 )
 
-######## NEW: IMPORTS ########
+############### NEW: IMPORTS ###############
 from functools import partial
 from scipy.stats import pearsonr, spearmanr
-#############################
+from transformers.modeling_outputs import SequenceClassifierOutput
+############################################
 
 @dataclass
 class ModelArguments:
@@ -83,13 +84,59 @@ class TrainingArguments(transformers.TrainingArguments):
     save_model: bool = field(default=False)
     seed: int = field(default=42)
 
-    ######### NEW: MAIN TASK (with regression support) #########
+    ######################### NEW: MAIN TASK (with regression and MLP support) #######################
     task: str = field(
         default="regression",
         metadata={"help": "Main task type: 'classification' or 'regression'"}
     )
 
-    ################# NEW: LUPI / AUX TASKS ####################
+    main_num_labels: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of output labels for the main head. "
+                "Use 1 for regression, 1 for binary BCE classification, "
+                "2 for binary softmax classification, and >2 for multiclass."
+            )
+        }
+    )
+
+    head_num_layers: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Total number of Linear layers in the main prediction head. "
+                "1 means a simple linear head. >1 means an MLP head."
+            )
+        },
+    )
+
+    head_hidden_size: int = field(
+        default=-1,
+        metadata={
+            "help": (
+                "Hidden size for MLP prediction head. "
+                "If -1, use the backbone hidden size."
+            )
+        },
+    )
+
+    head_activation: str = field(
+        default="gelu",
+        metadata={
+            "help": "Activation function for MLP prediction head: 'gelu', 'relu', 'tanh', or 'silu'."
+        },
+    )
+
+    head_dropout: float = field(
+        default=0.1,
+        metadata={
+            "help": "Dropout probability used inside the MLP prediction head."
+        },
+    )
+    ##################################################################################################
+
+    ############################## NEW: LUPI / AUX TASKS ################################
     num_aux_tasks: int = field(
         default=0,
         metadata={"help": "Number of auxiliary tasks. 0 means no auxiliary supervision."}
@@ -127,9 +174,9 @@ class TrainingArguments(transformers.TrainingArguments):
             "help": "Loss weight for each auxiliary task, one per auxiliary head."
         }
     )
+    #####################################################################################
 
-    ################# NEW: CENTER/MEAN POOLING INTO ENTEXBERT EXTRA LAYER ####################
-
+    ############################## NEW: ENABLE CENTER/MEAN POOLING ###############################
     pooling_mode: str = field(
         default="cls",
         metadata={"help": "How to pool token embeddings: 'cls' or 'center_mean'."}
@@ -139,6 +186,7 @@ class TrainingArguments(transformers.TrainingArguments):
         default=5,
         metadata={"help": "Number of center tokens to mean-pool when pooling_mode='center_mean'."}
     )
+    ###############################################################################################
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -272,7 +320,7 @@ class SupervisedDataset(Dataset):
                         f"Unsupported aux task type '{aux_type}' for aux task '{aux_name}'"
                     )
             aux_labels.append(row_aux)
-        ###################################################################################
+        ########################################################################################
         
         if kmer != -1:
             if torch.distributed.is_available() and torch.distributed.is_initialized(): # NEW: added for robustness in case of using multiple GPUs
@@ -299,7 +347,9 @@ class SupervisedDataset(Dataset):
         self.labels = labels
         self.aux_labels = aux_labels # NEW
 
-        ######### NEW: SET NUM_LABELS TO 1 FOR REGRESSION TASK #############
+        ######### NEW: SET NUM_LABELS TO 1 FOR REGRESSION TASK ##########
+        # Stored only for dataset inspection/debugging
+        # The model head size is controlled by training_args.main_num_labels
         self.num_labels = 1 if task == "regression" else len(set(labels))
 
     def __len__(self):
@@ -309,6 +359,7 @@ class SupervisedDataset(Dataset):
         #### NEW: SUPPORT FOR AUX LABELS ####
         item = {
             "input_ids": self.input_ids[i],
+            "attention_mask": self.attention_mask[i],
             "labels": self.labels[i],
         }
 
@@ -339,6 +390,14 @@ class DataCollatorForSupervisedDataset(object):
             padding_value=self.tokenizer.pad_token_id,
         )
 
+        # NEW: ATTENTION MASK PADDING TO ALLOW ATTENTION MASK TO BE PASSED THROUGH __getitem__
+        attention_mask = [instance["attention_mask"] for instance in instances]
+        attention_mask = torch.nn.utils.rnn.pad_sequence(
+            attention_mask,
+            batch_first=True,
+            padding_value=0,
+        )
+
         # main labels
         labels = [instance["labels"] for instance in instances]
         main_dtype = torch.float if self.main_task == "regression" else torch.long
@@ -347,7 +406,7 @@ class DataCollatorForSupervisedDataset(object):
         batch = dict(
             input_ids=input_ids,
             labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+            attention_mask=attention_mask,
         )
 
         # auxiliary labels
@@ -382,7 +441,7 @@ class DataCollatorForSupervisedDataset(object):
 Manually calculate the accuracy, f1, matthews_correlation, precision, recall with sklearn.
 """
 def calculate_metric_with_sklearn(predictions: np.ndarray, labels: np.ndarray):
-    ##### EDITED TO BE ROBUST TO SHAPES #####
+    ##### EDITED TO BE ROBUST TO DIFFERENT SHAPES #####
     # ensure correct shapes
     predictions = np.squeeze(predictions)
     labels = np.squeeze(labels)
@@ -405,7 +464,7 @@ def calculate_metric_with_sklearn(predictions: np.ndarray, labels: np.ndarray):
     # ensure integer type for classification metrics
     valid_predictions = valid_predictions.astype(int)
     valid_labels = valid_labels.astype(int)
-    ############################################
+    ####################################################
 
     return {
         "accuracy": sklearn.metrics.accuracy_score(valid_labels, valid_predictions),
@@ -439,16 +498,16 @@ def preprocess_logits_for_metrics(
         if logits.ndim > 1 and logits.shape[-1] == 1:
             logits = logits.squeeze(-1)
         return logits
-
-    # elif main_task == "classification":
-    #     # expected shape: [batch, num_labels]
-    #     if logits.ndim == 3:
-    #         logits = logits.reshape(-1, logits.shape[-1])
-    #     return torch.argmax(logits, dim=-1)
     
     elif main_task == "classification":
+        # Sequence-labeling-style logits, if ever present
         if logits.ndim == 3:
             logits = logits.reshape(-1, logits.shape[-1])
+
+        # Single-logit binary classification: make shape [batch] so compute_metrics uses the sigmoid/AUROC path
+        if logits.ndim > 1 and logits.shape[-1] == 1:
+            logits = logits.squeeze(-1)
+
         return logits
 
     else:
@@ -477,10 +536,27 @@ def compute_metrics(main_task: str, eval_pred):
 
     # NEW: REGRESSION METRICS
     if main_task == "regression":
+        labels = np.asarray(labels, dtype=float)
+        predictions = np.asarray(predictions, dtype=float)
+
+        # Ignore NaNs and infs if they appear
+        finite_mask = np.isfinite(labels) & np.isfinite(predictions)
+
+        if finite_mask.sum() == 0:
+            return {
+                "mse": float("nan"),
+                "r2": float("nan"),
+                "pearson": float("nan"),
+                "spearman": float("nan"),
+            }
+
+        labels = labels[finite_mask]
+        predictions = predictions[finite_mask]
+
         mse = sklearn.metrics.mean_squared_error(labels, predictions)
         r2 = sklearn.metrics.r2_score(labels, predictions)
-        
-        # guard against constant arrays / tiny eval sets
+
+        # Guard against constant arrays / tiny eval sets
         if len(labels) > 1 and np.std(labels) > 0 and np.std(predictions) > 0:
             pearson = pearsonr(labels, predictions)[0]
             spearman = spearmanr(labels, predictions)[0]
@@ -494,9 +570,6 @@ def compute_metrics(main_task: str, eval_pred):
             "pearson": pearson,
             "spearman": spearman,
         }
-
-    # elif main_task == "classification":
-    #     return calculate_metric_with_sklearn(predictions, labels)
 
     elif main_task == "classification":
         labels = np.asarray(labels)
@@ -538,18 +611,126 @@ def compute_metrics(main_task: str, eval_pred):
     else:
         raise ValueError(f"Unsupported main task: {main_task}")
 
+############################### NEW: HELPER FUNCTIONS TO CONSTRUCT MLP HEAD ################################
+def get_activation_module(name: str) -> torch.nn.Module:
+    """
+    Return activation module from string name
+    """
+    name = name.lower()
+
+    if name == "gelu":
+        return torch.nn.GELU()
+    elif name == "relu":
+        return torch.nn.ReLU()
+    elif name == "tanh":
+        return torch.nn.Tanh()
+    elif name == "silu":
+        return torch.nn.SiLU()
+    else:
+        raise ValueError(
+            f"Unsupported activation {name!r}. "
+            "Choose from {'gelu', 'relu', 'tanh', 'silu'}."
+        )
+
+def build_prediction_head(
+    input_size: int,
+    output_size: int,
+    num_layers: int = 1,
+    hidden_size: int = -1,
+    activation: str = "gelu",
+    dropout: float = 0.1,
+) -> torch.nn.Module:
+    """
+    Build either a linear prediction head or an MLP prediction head
+
+    num_layers counts total Linear layers.
+      - num_layers=1: Linear(input_size -> output_size)
+      - num_layers=2: Linear(input_size -> hidden_size) + activation/dropout + Linear(hidden_size -> output_size)
+      - num_layers=3+: deeper MLP
+    """
+    if num_layers < 1:
+        raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
+
+    if hidden_size == -1:
+        hidden_size = input_size
+
+    if hidden_size <= 0:
+        raise ValueError(f"hidden_size must be positive or -1, got {hidden_size}.")
+
+    if dropout < 0 or dropout >= 1:
+        raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
+
+    # Original behavior: simple linear head.
+    if num_layers == 1:
+        return torch.nn.Linear(input_size, output_size)
+
+    layers = []
+
+    # First hidden layer
+    layers.append(torch.nn.Linear(input_size, hidden_size))
+    layers.append(get_activation_module(activation))
+    layers.append(torch.nn.Dropout(dropout))
+
+    # Additional hidden layers
+    for _ in range(num_layers - 2):
+        layers.append(torch.nn.Linear(hidden_size, hidden_size))
+        layers.append(get_activation_module(activation))
+        layers.append(torch.nn.Dropout(dropout))
+
+    # Final output layer
+    layers.append(torch.nn.Linear(hidden_size, output_size))
+
+    return torch.nn.Sequential(*layers)
+############################################################################################################
+
 ####### NEW: FUNCTION TO ENSURE ALL TRAINING ARGS ARE VALID #######
 def validate_training_args(training_args):
     allowed_main_tasks = {"classification", "regression"}
     allowed_aux_task_types = {"binary", "multiclass", "regression"}
-
     allowed_pooling_modes = {"cls", "center_mean"}
+    allowed_head_activations = {"gelu", "relu", "tanh", "silu"}
 
     if training_args.task not in allowed_main_tasks:
         raise ValueError(
             f"Unsupported main task {training_args.task!r}. "
             f"Choose from {allowed_main_tasks}."
         )
+
+    if training_args.task == "regression" and training_args.main_num_labels != 1:
+        raise ValueError("For regression, main_num_labels must be 1.")
+
+    if training_args.task == "classification" and training_args.main_num_labels < 1:
+        raise ValueError("For classification, main_num_labels must be >= 1.")
+
+    # Validate pooling regardless of whether LUPI is used.
+    if training_args.pooling_mode not in allowed_pooling_modes:
+        raise ValueError(
+            f"Unsupported pooling_mode {training_args.pooling_mode!r}. "
+            f"Choose from {allowed_pooling_modes}."
+        )
+
+    if training_args.center_pool_width < 1:
+        raise ValueError("center_pool_width must be >= 1.")
+
+    if training_args.pooling_mode == "center_mean" and training_args.center_pool_width % 2 == 0:
+        raise ValueError(
+            "center_pool_width should be odd for symmetric center pooling."
+        )
+
+    if training_args.head_num_layers < 1:
+        raise ValueError("head_num_layers must be >= 1.")
+
+    if training_args.head_hidden_size != -1 and training_args.head_hidden_size <= 0:
+        raise ValueError("head_hidden_size must be positive or -1.")
+
+    if training_args.head_activation not in allowed_head_activations:
+        raise ValueError(
+            f"Unsupported head_activation {training_args.head_activation!r}. "
+            f"Choose from {allowed_head_activations}."
+        )
+
+    if training_args.head_dropout < 0 or training_args.head_dropout >= 1:
+        raise ValueError("head_dropout must be in [0, 1).")
 
     if training_args.num_aux_tasks < 0:
         raise ValueError("num_aux_tasks must be >= 0.")
@@ -615,18 +796,28 @@ def validate_training_args(training_args):
 
         if weight < 0:
             raise ValueError(f"lambda_aux[{i}] must be nonnegative, got {weight}.")
-    
-    if training_args.pooling_mode not in allowed_pooling_modes:
-        raise ValueError(
-            f"Unsupported pooling_mode {training_args.pooling_mode!r}. "
-            f"Choose from {allowed_pooling_modes}."
-        )
 
-    if training_args.center_pool_width < 1:
-        raise ValueError("center_pool_width must be >= 1.")
+####### NEW: FUNCTION TO PRINT NUMBER OF TRAINABLE PARAMETERS #######
+def print_trainable_parameters(model):
+    """
+    Print the number and percentage of trainable parameters.
+    Useful for checking whether full fine-tuning vs. LoRA is configured correctly.
+    """
+    trainable = 0
+    total = 0
 
-# !!! NEW: LupiDNABERT training class !!!
-class LupiDNABERTForSequencePrediction(torch.nn.Module):
+    for _, param in model.named_parameters():
+        total += param.numel()
+        if param.requires_grad:
+            trainable += param.numel()
+
+    print(
+        f"Trainable parameters: {trainable:,} / {total:,} "
+        f"({100 * trainable / total:.2f}%)"
+    )
+
+# !!! NEW: entexBERT-2 training class !!!
+class entexBERT2ForSequencePrediction(torch.nn.Module):
     def __init__(
         self,
         model_name_or_path: str,
@@ -637,8 +828,12 @@ class LupiDNABERTForSequencePrediction(torch.nn.Module):
         aux_task_types: Optional[List[str]] = None,
         aux_num_labels: Optional[List[int]] = None,
         lambda_aux: Optional[List[float]] = None,
-        pooling_mode: str = "cls", # for extra linear entex layer
+        pooling_mode: str = "cls",
         center_pool_width: int = 5,
+        head_num_layers: int = 1,
+        head_hidden_size: int = -1,
+        head_activation: str = "gelu",
+        head_dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -652,6 +847,11 @@ class LupiDNABERTForSequencePrediction(torch.nn.Module):
 
         self.pooling_mode = pooling_mode
         self.center_pool_width = center_pool_width
+
+        self.head_num_layers = head_num_layers
+        self.head_hidden_size = head_hidden_size
+        self.head_activation = head_activation
+        self.head_dropout = head_dropout
 
         if not (
             len(self.aux_task_names)
@@ -676,42 +876,19 @@ class LupiDNABERTForSequencePrediction(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout_prob)
 
         # Main head
-        self.main_head = torch.nn.Linear(hidden_size, main_num_labels)
+        self.main_head = build_prediction_head(
+            input_size=hidden_size,
+            output_size=main_num_labels,
+            num_layers=head_num_layers,
+            hidden_size=head_hidden_size,
+            activation=head_activation,
+            dropout=head_dropout,
+        )
 
         # Auxiliary heads
         self.aux_heads = torch.nn.ModuleDict()
         for name, num_labels in zip(self.aux_task_names, self.aux_num_labels):
             self.aux_heads[name] = torch.nn.Linear(hidden_size, num_labels)
-
-    # def _pool_sequence_representation(self, backbone_outputs):
-    #     """
-    #     Robust pooling across different HF / DNABERT output formats.
-    #     """
-
-    #     # Case 1: standard HF output with pooler
-    #     if hasattr(backbone_outputs, "pooler_output") and backbone_outputs.pooler_output is not None:
-    #         return backbone_outputs.pooler_output
-
-    #     # Case 2: standard HF output with last_hidden_state
-    #     if hasattr(backbone_outputs, "last_hidden_state") and backbone_outputs.last_hidden_state is not None:
-    #         return backbone_outputs.last_hidden_state[:, 0, :]
-
-    #     # Case 3: dict-like output
-    #     if isinstance(backbone_outputs, dict):
-    #         if "pooler_output" in backbone_outputs:
-    #             return backbone_outputs["pooler_output"]
-    #         if "last_hidden_state" in backbone_outputs:
-    #             return backbone_outputs["last_hidden_state"][:, 0, :]
-
-    #     # Case 4: tuple/list (VERY COMMON for DNABERT2)
-    #     if isinstance(backbone_outputs, (tuple, list)):
-    #         first = backbone_outputs[0]
-    #         if torch.is_tensor(first) and first.ndim == 3:
-    #             return first[:, 0, :]
-
-    #     raise ValueError(
-    #         f"Cannot extract sequence representation. Output type: {type(backbone_outputs)}"
-    #     )
     
     def _pool_sequence_representation(self, backbone_outputs, attention_mask=None):
         """
@@ -745,22 +922,28 @@ class LupiDNABERTForSequencePrediction(torch.nn.Module):
             if self.center_pool_width % 2 == 0:
                 raise ValueError("center_pool_width should be odd for symmetric center pooling.")
 
-            seq_len = sequence_output.size(1)
-            center = seq_len // 2
+            batch_size, max_seq_len, hidden_size = sequence_output.shape
             half = self.center_pool_width // 2
 
-            start = max(0, center - half)
-            end = min(seq_len, center + half + 1)
+            pooled_outputs = []
 
-            pooled = sequence_output[:, start:end, :]
+            for b in range(batch_size):
+                if attention_mask is not None:
+                    # Number of non-padding tokens for this example
+                    valid_len = int(attention_mask[b].sum().item())
+                else:
+                    valid_len = max_seq_len
 
-            # optional mask-aware averaging
-            if attention_mask is not None:
-                local_mask = attention_mask[:, start:end].unsqueeze(-1).float()
-                denom = local_mask.sum(dim=1).clamp(min=1.0)
-                return (pooled * local_mask).sum(dim=1) / denom
+                valid_len = max(valid_len, 1) # To be extra safe :)
 
-            return pooled.mean(dim=1)
+                center = valid_len // 2
+                start = max(0, center - half)
+                end = min(valid_len, center + half + 1)
+
+                pooled_b = sequence_output[b, start:end, :].mean(dim=0)
+                pooled_outputs.append(pooled_b)
+
+            return torch.stack(pooled_outputs, dim=0)
 
         else:
             raise ValueError(f"Unsupported pooling_mode: {self.pooling_mode}")
@@ -846,8 +1029,8 @@ class LupiDNABERTForSequencePrediction(torch.nn.Module):
             total_loss = main_loss
             loss_dict["main_loss"] = main_loss.detach()
 
-        # Auxiliary losses
-        if aux_labels is not None:
+        # Auxiliary losses (for training ONLY)
+        if aux_labels is not None and self.training:
             if len(aux_labels) != len(self.aux_task_names):
                 raise ValueError(
                     f"Expected {len(self.aux_task_names)} auxiliary label tensors, "
@@ -872,15 +1055,10 @@ class LupiDNABERTForSequencePrediction(torch.nn.Module):
                 weighted_aux_loss = weight * aux_loss
                 total_loss = weighted_aux_loss if total_loss is None else total_loss + weighted_aux_loss
 
-        # For Trainer compatibility:
-        # - "loss" is used for training
-        # - "logits" is used for metrics/eval
-        output = {
-            "loss": total_loss,
-            "logits": logits,
-        }
-
-        return output
+        return SequenceClassifierOutput(
+            loss=total_loss,
+            logits=logits,
+        )
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -941,13 +1119,11 @@ def train():
     # main head output dimension
     if training_args.task == "regression":
         main_num_labels = 1
-    elif training_args.task == "classification":
-        main_num_labels = train_dataset.num_labels
     else:
-        raise ValueError(f"Unsupported main task: {training_args.task}")
+        main_num_labels = training_args.main_num_labels
 
-    # load custom multitask model
-    model = LupiDNABERTForSequencePrediction(
+    # load entexBERT-2 model
+    model = entexBERT2ForSequencePrediction(
         model_name_or_path=model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         main_task=training_args.task,
@@ -958,6 +1134,10 @@ def train():
         lambda_aux=training_args.lambda_aux,
         pooling_mode=training_args.pooling_mode,
         center_pool_width=training_args.center_pool_width,
+        head_num_layers=training_args.head_num_layers,
+        head_hidden_size=training_args.head_hidden_size,
+        head_activation=training_args.head_activation,
+        head_dropout=training_args.head_dropout,
     )
 
     # configure LoRA on the backbone only
@@ -973,13 +1153,19 @@ def train():
         )
         model.backbone = get_peft_model(model.backbone, lora_config)
         model.backbone.print_trainable_parameters()
+    
+    print_trainable_parameters(model) # NEW: print trainable parameters in full model after LoRA wrapping
 
     print(
-        f"[sanity check] main task={training_args.task!r}, "
+        f"main task={training_args.task!r}, "
         f"num_aux_tasks={training_args.num_aux_tasks}, "
         f"aux_task_names={training_args.aux_task_names}, "
         f"pooling_mode={training_args.pooling_mode!r}, "
-        f"center_pool_width={training_args.center_pool_width}"
+        f"center_pool_width={training_args.center_pool_width}",
+        f"head_num_layers={training_args.head_num_layers}, "
+        f"head_hidden_size={training_args.head_hidden_size}, "
+        f"head_activation={training_args.head_activation!r}, "
+        f"head_dropout={training_args.head_dropout}"
     )
 
     # define trainer
