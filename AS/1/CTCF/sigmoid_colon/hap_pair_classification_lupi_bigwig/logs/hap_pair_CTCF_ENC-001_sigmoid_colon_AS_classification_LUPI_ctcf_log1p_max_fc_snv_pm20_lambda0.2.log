@@ -1,0 +1,243 @@
+========================================
+Starting experiment: hap_pair_CTCF_ENC-001_sigmoid_colon_AS_classification_LUPI_ctcf_log1p_max_fc_snv_pm20_lambda0.2
+Date: Fri May 29 14:45:41 EDT 2026
+Host: r102u10n01.mccleary.ycrc.yale.edu
+Project dir: /home/asm242/entexBERT-2
+Experiment dir: /home/asm242/entexBERT-2/AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig
+========================================
+
+Checking input files...
+ERROR: Missing dataset script:
+/home/asm242/entexBERT-2/src/entexbert2/scripts/make_as_classification_lupi_bigwig_dataset.py
+========================================
+Starting experiment: hap_pair_CTCF_ENC-001_sigmoid_colon_AS_classification_LUPI_ctcf_log1p_max_fc_snv_pm20_lambda0.2
+Date: Fri May 29 14:46:11 EDT 2026
+Host: r102u10n01.mccleary.ycrc.yale.edu
+Project dir: /home/asm242/entexBERT-2
+Experiment dir: /home/asm242/entexBERT-2/AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig
+========================================
+
+Checking input files...
+All required files found.
+
+GPU status:
+Fri May 29 14:46:11 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 570.195.03             Driver Version: 570.195.03     CUDA Version: 12.8     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA RTX A5000               On  |   00000000:B1:00.0 Off |                  Off |
+| 30%   25C    P8             23W /  230W |       1MiB /  24564MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+Python/package sanity check:
+Python: /home/asm242/.conda/envs/eb2/bin/python
+Imported entexbert2 from: /home/asm242/entexBERT-2/src/entexbert2/__init__.py
+
+========================================
+Step 1: Building hap_pair AS classification + BigWig LUPI dataset
+========================================
+Loading reference FASTA...
+
+Building AS classification + BigWig LUPI dataset
+Main label: imbalance_significance
+Aux label:  ctcf_log1p_max_fc_snv_pm20
+BigWig:     /home/asm242/entex_data/ENC-001/CTCF_sigmoid_colon_fold_change_over_control.bigWig
+Tissue:     sigmoid_colon
+Input mode: hap_pair
+Saved 1082 total examples to /home/asm242/entexBERT-2/AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/input
+{'train.csv': 865, 'dev.csv': 108, 'test.csv': 109}
+
+Main label summary:
+count    1082.000000
+mean        0.500000
+std         0.500231
+min         0.000000
+25%         0.000000
+50%         0.500000
+75%         1.000000
+max         1.000000
+Name: label, dtype: float64
+
+Main label counts:
+label
+0    541
+1    541
+Name: count, dtype: int64
+
+Aux label summary: ctcf_log1p_max_fc_snv_pm20
+count    1082.000000
+mean        2.310965
+std         1.671806
+min         0.005833
+25%         0.571781
+50%         2.357287
+75%         3.772578
+max         5.713650
+Name: ctcf_log1p_max_fc_snv_pm20, dtype: float64
+
+Done.
+Rows: 1082
+
+Main label counts:
+imbalance_significance
+0    541
+1    541
+Name: count, dtype: int64
+
+Aux label summary: ctcf_log1p_max_fc_snv_pm20
+count    1082.000000
+mean        2.310965
+std         1.671806
+min         0.005833
+25%         0.571781
+50%         2.357287
+75%         3.772578
+max         5.713650
+Name: ctcf_log1p_max_fc_snv_pm20, dtype: float64
+
+Dataset files:
+total 1.1M
+-rw-r--r-- 1 asm242 gerstein 111K May 29 14:46 dev.csv
+-rw-r--r-- 1 asm242 gerstein 112K May 29 14:46 test.csv
+-rw-r--r-- 1 asm242 gerstein 886K May 29 14:46 train.csv
+
+========================================
+Step 1.5: Checking duplicate hap-pair leakage across splits
+========================================
+Rows and unique hap-pairs per split:
+  train: 865 unique pairs / 865 rows
+  dev: 108 unique pairs / 108 rows
+  test: 109 unique pairs / 109 rows
+train_dev duplicate hap-pairs across splits: 0
+train_test duplicate hap-pairs across splits: 0
+dev_test duplicate hap-pairs across splits: 0
+No exact duplicate hap-pair inputs found across splits.
+
+Label counts by split:
+
+train:
+label
+0    425
+1    440
+Name: count, dtype: int64
+
+dev:
+label
+0    61
+1    47
+Name: count, dtype: int64
+
+test:
+label
+0    55
+1    54
+Name: count, dtype: int64
+
+Aux label summary by split:
+
+train:
+count    865.000000
+mean       2.328361
+std        1.673251
+min        0.005833
+25%        0.571781
+50%        2.426301
+75%        3.790680
+max        5.713650
+Name: ctcf_log1p_max_fc_snv_pm20, dtype: float64
+
+dev:
+count    108.000000
+mean       2.497324
+std        1.660715
+min        0.024127
+25%        0.754341
+50%        2.628202
+75%        4.059663
+max        5.437257
+Name: ctcf_log1p_max_fc_snv_pm20, dtype: float64
+
+test:
+count    109.000000
+mean       1.988266
+std        1.643889
+min        0.023091
+25%        0.283885
+50%        1.780636
+75%        3.251367
+max        5.315086
+Name: ctcf_log1p_max_fc_snv_pm20, dtype: float64
+
+========================================
+Step 2: Plotting dataset distributions
+========================================
+Saved plots to /home/asm242/entexBERT-2/AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/figures
+
+Figure files:
+total 181K
+-rw-r--r-- 1 asm242 gerstein 104K May 29 14:46 label_distribution.png
+-rw-r--r-- 1 asm242 gerstein  77K May 29 14:46 sequence_length_distribution.png
+
+========================================
+Step 3: Training entexBERT-2 hap_pair AS classification model with BigWig LUPI
+========================================
+/home/asm242/.conda/envs/eb2/lib/python3.8/site-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+WARNING:root:Perform sequence-pair prediction...
+WARNING:root:Perform sequence-pair prediction...
+WARNING:root:Perform sequence-pair prediction...
+/home/asm242/.cache/huggingface/modules/transformers_modules/zhihan1996/DNABERT-2-117M/7bce263b15377fc15361f52cfab88f8b586abda0/bert_layers.py:126: UserWarning: Unable to import Triton; defaulting MosaicBERT attention implementation to pytorch (this will reduce throughput when using this model).
+  warnings.warn(
+Some weights of the model checkpoint at zhihan1996/DNABERT-2-117M were not used when initializing BertModel: ['cls.predictions.decoder.weight', 'cls.predictions.decoder.bias', 'cls.predictions.transform.dense.weight', 'cls.predictions.transform.LayerNorm.weight', 'cls.predictions.transform.dense.bias', 'cls.predictions.transform.LayerNorm.bias']
+- This IS expected if you are initializing BertModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing BertModel from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+Some weights of BertModel were not initialized from the model checkpoint at zhihan1996/DNABERT-2-117M and are newly initialized: ['bert.pooler.dense.bias', 'bert.pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Trainable parameters: 117,070,851 / 117,070,851 (100.00%)
+main task='classification', num_aux_tasks=1, aux_task_names=['ctcf_log1p_max_fc_snv_pm20'], pooling_mode='cls', center_pool_width=5, head_num_layers=1, head_hidden_size=-1, head_activation='gelu', head_dropout=0.1
+  0%|          | 0/275 [00:00<?, ?it/s]  0%|          | 1/275 [00:00<02:10,  2.10it/s]  1%|          | 2/275 [00:00<01:10,  3.89it/s]  1%|          | 3/275 [00:00<00:53,  5.10it/s]  1%|▏         | 4/275 [00:00<00:44,  6.05it/s]  2%|▏         | 5/275 [00:00<00:40,  6.69it/s]  2%|▏         | 6/275 [00:01<00:37,  7.22it/s]  3%|▎         | 7/275 [00:01<00:35,  7.54it/s]  3%|▎         | 8/275 [00:01<00:34,  7.82it/s]  3%|▎         | 9/275 [00:01<00:33,  7.96it/s]  4%|▎         | 10/275 [00:01<00:32,  8.12it/s]  4%|▍         | 11/275 [00:01<00:32,  8.24it/s]  4%|▍         | 12/275 [00:01<00:31,  8.29it/s]  5%|▍         | 13/275 [00:01<00:31,  8.31it/s]  5%|▌         | 14/275 [00:02<00:31,  8.37it/s]  5%|▌         | 15/275 [00:02<00:30,  8.41it/s]  6%|▌         | 16/275 [00:02<00:30,  8.42it/s]  6%|▌         | 17/275 [00:02<00:30,  8.45it/s]  7%|▋         | 18/275 [00:02<00:30,  8.46it/s]  7%|▋         | 19/275 [00:02<00:30,  8.43it/s]  7%|▋         | 20/275 [00:02<00:30,  8.43it/s]  8%|▊         | 21/275 [00:02<00:30,  8.41it/s]  8%|▊         | 22/275 [00:02<00:30,  8.38it/s]  8%|▊         | 23/275 [00:03<00:30,  8.35it/s]  9%|▊         | 24/275 [00:03<00:29,  8.38it/s]  9%|▉         | 25/275 [00:03<00:29,  8.36it/s]  9%|▉         | 26/275 [00:03<00:29,  8.39it/s] 10%|▉         | 27/275 [00:03<00:29,  8.37it/s] 10%|█         | 28/275 [00:03<00:29,  8.37it/s] 11%|█         | 29/275 [00:03<00:29,  8.38it/s] 11%|█         | 30/275 [00:03<00:29,  8.38it/s] 11%|█▏        | 31/275 [00:04<00:29,  8.41it/s] 12%|█▏        | 32/275 [00:04<00:28,  8.42it/s] 12%|█▏        | 33/275 [00:04<00:28,  8.43it/s] 12%|█▏        | 34/275 [00:04<00:28,  8.42it/s] 13%|█▎        | 35/275 [00:04<00:28,  8.41it/s] 13%|█▎        | 36/275 [00:04<00:28,  8.40it/s] 13%|█▎        | 37/275 [00:04<00:28,  8.39it/s] 14%|█▍        | 38/275 [00:04<00:28,  8.41it/s] 14%|█▍        | 39/275 [00:04<00:27,  8.44it/s] 15%|█▍        | 40/275 [00:05<00:27,  8.42it/s] 15%|█▍        | 41/275 [00:05<00:27,  8.40it/s] 15%|█▌        | 42/275 [00:05<00:27,  8.43it/s] 16%|█▌        | 43/275 [00:05<00:27,  8.45it/s] 16%|█▌        | 44/275 [00:05<00:27,  8.44it/s] 16%|█▋        | 45/275 [00:05<00:27,  8.43it/s] 17%|█▋        | 46/275 [00:05<00:27,  8.41it/s] 17%|█▋        | 47/275 [00:05<00:27,  8.42it/s] 17%|█▋        | 48/275 [00:06<00:27,  8.38it/s] 18%|█▊        | 49/275 [00:06<00:27,  8.35it/s] 18%|█▊        | 50/275 [00:06<00:26,  8.34it/s]                                                 18%|█▊        | 50/275 [00:06<00:26,  8.34it/s] 19%|█▊        | 51/275 [00:06<00:26,  8.36it/s] 19%|█▉        | 52/275 [00:06<00:26,  8.40it/s] 19%|█▉        | 53/275 [00:06<00:26,  8.41it/s] 20%|█▉        | 54/275 [00:06<00:26,  8.40it/s] 20%|██        | 56/275 [00:06<00:22,  9.64it/s] 21%|██        | 57/275 [00:07<00:23,  9.28it/s] 21%|██        | 58/275 [00:07<00:23,  9.05it/s] 21%|██▏       | 59/275 [00:07<00:24,  8.84it/s] 22%|██▏       | 60/275 [00:07<00:24,  8.69it/s] 22%|██▏       | 61/275 [00:07<00:24,  8.59it/s] 23%|██▎       | 62/275 [00:07<00:24,  8.57it/s] 23%|██▎       | 63/275 [00:07<00:24,  8.50it/s] 23%|██▎       | 64/275 [00:07<00:24,  8.45it/s] 24%|██▎       | 65/275 [00:08<00:24,  8.42it/s] 24%|██▍       | 66/275 [00:08<00:24,  8.46it/s] 24%|██▍       | 67/275 [00:08<00:24,  8.41it/s] 25%|██▍       | 68/275 [00:08<00:24,  8.42it/s] 25%|██▌       | 69/275 [00:08<00:24,  8.42it/s] 25%|██▌       | 70/275 [00:08<00:24,  8.39it/s] 26%|██▌       | 71/275 [00:08<00:24,  8.38it/s] 26%|██▌       | 72/275 [00:08<00:24,  8.43it/s] 27%|██▋       | 73/275 [00:08<00:23,  8.44it/s] 27%|██▋       | 74/275 [00:09<00:23,  8.42it/s] 27%|██▋       | 75/275 [00:09<00:23,  8.45it/s] 28%|██▊       | 76/275 [00:09<00:23,  8.43it/s] 28%|██▊       | 77/275 [00:09<00:23,  8.40it/s] 28%|██▊       | 78/275 [00:09<00:23,  8.37it/s] 29%|██▊       | 79/275 [00:09<00:23,  8.39it/s] 29%|██▉       | 80/275 [00:09<00:23,  8.35it/s] 29%|██▉       | 81/275 [00:09<00:23,  8.36it/s] 30%|██▉       | 82/275 [00:10<00:23,  8.33it/s] 30%|███       | 83/275 [00:10<00:22,  8.38it/s] 31%|███       | 84/275 [00:10<00:22,  8.40it/s] 31%|███       | 85/275 [00:10<00:22,  8.41it/s] 31%|███▏      | 86/275 [00:10<00:22,  8.41it/s] 32%|███▏      | 87/275 [00:10<00:22,  8.37it/s] 32%|███▏      | 88/275 [00:10<00:22,  8.36it/s] 32%|███▏      | 89/275 [00:10<00:22,  8.36it/s] 33%|███▎      | 90/275 [00:10<00:22,  8.35it/s] 33%|███▎      | 91/275 [00:11<00:21,  8.38it/s] 33%|███▎      | 92/275 [00:11<00:21,  8.36it/s] 34%|███▍      | 93/275 [00:11<00:21,  8.38it/s] 34%|███▍      | 94/275 [00:11<00:21,  8.41it/s] 35%|███▍      | 95/275 [00:11<00:21,  8.39it/s] 35%|███▍      | 96/275 [00:11<00:21,  8.43it/s] 35%|███▌      | 97/275 [00:11<00:21,  8.46it/s] 36%|███▌      | 98/275 [00:11<00:21,  8.41it/s] 36%|███▌      | 99/275 [00:12<00:20,  8.46it/s] 36%|███▋      | 100/275 [00:12<00:20,  8.42it/s]                                                  36%|███▋      | 100/275 [00:12<00:20,  8.42it/s]{'loss': 1.76, 'learning_rate': 4.8e-05, 'epoch': 0.91}
+{'loss': 1.1795, 'learning_rate': 3.933333333333333e-05, 'epoch': 1.82}
+
+  0%|          | 0/7 [00:00<?, ?it/s][A
+ 71%|███████▏  | 5/7 [00:00<00:00, 44.22it/s][A                                                 
+                                             [A 36%|███▋      | 100/275 [00:12<00:20,  8.42it/s]
+100%|██████████| 7/7 [00:00<00:00, 44.22it/s][A
+                                             [A 37%|███▋      | 101/275 [00:14<01:51,  1.55it/s] 37%|███▋      | 102/275 [00:14<01:24,  2.06it/s] 37%|███▋      | 103/275 [00:14<01:04,  2.66it/s] 38%|███▊      | 104/275 [00:14<00:51,  3.35it/s] 38%|███▊      | 105/275 [00:14<00:41,  4.08it/s] 39%|███▊      | 106/275 [00:14<00:35,  4.81it/s] 39%|███▉      | 107/275 [00:14<00:30,  5.52it/s] 39%|███▉      | 108/275 [00:14<00:27,  6.15it/s] 40%|███▉      | 109/275 [00:15<00:24,  6.68it/s] 40%|████      | 111/275 [00:15<00:19,  8.36it/s] 41%|████      | 112/275 [00:15<00:19,  8.39it/s] 41%|████      | 113/275 [00:15<00:19,  8.37it/s] 41%|████▏     | 114/275 [00:15<00:19,  8.36it/s] 42%|████▏     | 115/275 [00:15<00:19,  8.36it/s] 42%|████▏     | 116/275 [00:15<00:18,  8.37it/s] 43%|████▎     | 117/275 [00:15<00:18,  8.40it/s] 43%|████▎     | 118/275 [00:16<00:18,  8.36it/s] 43%|████▎     | 119/275 [00:16<00:18,  8.34it/s] 44%|████▎     | 120/275 [00:16<00:18,  8.36it/s] 44%|████▍     | 121/275 [00:16<00:18,  8.35it/s] 44%|████▍     | 122/275 [00:16<00:18,  8.34it/s] 45%|████▍     | 123/275 [00:16<00:18,  8.36it/s] 45%|████▌     | 124/275 [00:16<00:18,  8.37it/s] 45%|████▌     | 125/275 [00:16<00:17,  8.35it/s] 46%|████▌     | 126/275 [00:16<00:17,  8.34it/s] 46%|████▌     | 127/275 [00:17<00:17,  8.31it/s] 47%|████▋     | 128/275 [00:17<00:17,  8.31it/s] 47%|████▋     | 129/275 [00:17<00:17,  8.33it/s] 47%|████▋     | 130/275 [00:17<00:17,  8.35it/s] 48%|████▊     | 131/275 [00:17<00:17,  8.40it/s] 48%|████▊     | 132/275 [00:17<00:17,  8.37it/s] 48%|████▊     | 133/275 [00:17<00:17,  8.35it/s] 49%|████▊     | 134/275 [00:17<00:16,  8.33it/s] 49%|████▉     | 135/275 [00:18<00:16,  8.35it/s] 49%|████▉     | 136/275 [00:18<00:16,  8.35it/s] 50%|████▉     | 137/275 [00:18<00:16,  8.38it/s] 50%|█████     | 138/275 [00:18<00:16,  8.40it/s] 51%|█████     | 139/275 [00:18<00:16,  8.41it/s] 51%|█████     | 140/275 [00:18<00:16,  8.42it/s] 51%|█████▏    | 141/275 [00:18<00:16,  8.37it/s] 52%|█████▏    | 142/275 [00:18<00:15,  8.39it/s] 52%|█████▏    | 143/275 [00:18<00:15,  8.40it/s] 52%|█████▏    | 144/275 [00:19<00:15,  8.40it/s] 53%|█████▎    | 145/275 [00:19<00:15,  8.39it/s] 53%|█████▎    | 146/275 [00:19<00:15,  8.36it/s] 53%|█████▎    | 147/275 [00:19<00:15,  8.39it/s] 54%|█████▍    | 148/275 [00:19<00:15,  8.38it/s] 54%|█████▍    | 149/275 [00:19<00:15,  8.35it/s] 55%|█████▍    | 150/275 [00:19<00:14,  8.35it/s]                                                  55%|█████▍    | 150/275 [00:19<00:14,  8.35it/s] 55%|█████▍    | 151/275 [00:19<00:14,  8.38it/s] 55%|█████▌    | 152/275 [00:20<00:14,  8.35it/s] 56%|█████▌    | 153/275 [00:20<00:14,  8.32it/s] 56%|█████▌    | 154/275 [00:20<00:13,  8.70it/s] 56%|█████▋    | 155/275 [00:20<00:13,  8.59it/s] 57%|█████▋    | 156/275 [00:20<00:14,  8.48it/s] 57%|█████▋    | 157/275 [00:20<00:13,  8.43it/s] 57%|█████▋    | 158/275 [00:20<00:13,  8.40it/s] 58%|█████▊    | 159/275 [00:20<00:13,  8.42it/s] 58%|█████▊    | 160/275 [00:21<00:13,  8.38it/s] 59%|█████▊    | 161/275 [00:21<00:13,  8.36it/s] 59%|█████▉    | 162/275 [00:21<00:13,  8.34it/s] 59%|█████▉    | 163/275 [00:21<00:13,  8.33it/s] 60%|█████▉    | 164/275 [00:21<00:13,  8.35it/s] 60%|██████    | 166/275 [00:21<00:10, 10.09it/s] 61%|██████    | 167/275 [00:21<00:11,  9.60it/s] 61%|██████    | 168/275 [00:21<00:11,  9.28it/s] 61%|██████▏   | 169/275 [00:22<00:11,  8.98it/s] 62%|██████▏   | 170/275 [00:22<00:11,  8.83it/s] 62%|██████▏   | 171/275 [00:22<00:11,  8.70it/s] 63%|██████▎   | 172/275 [00:22<00:11,  8.61it/s] 63%|██████▎   | 173/275 [00:22<00:11,  8.55it/s] 63%|██████▎   | 174/275 [00:22<00:11,  8.49it/s] 64%|██████▎   | 175/275 [00:22<00:11,  8.44it/s] 64%|██████▍   | 176/275 [00:22<00:11,  8.39it/s] 64%|██████▍   | 177/275 [00:22<00:11,  8.37it/s] 65%|██████▍   | 178/275 [00:23<00:11,  8.35it/s] 65%|██████▌   | 179/275 [00:23<00:11,  8.33it/s] 65%|██████▌   | 180/275 [00:23<00:11,  8.34it/s] 66%|██████▌   | 181/275 [00:23<00:11,  8.32it/s] 66%|██████▌   | 182/275 [00:23<00:11,  8.34it/s] 67%|██████▋   | 183/275 [00:23<00:11,  8.33it/s] 67%|██████▋   | 184/275 [00:23<00:10,  8.32it/s] 67%|██████▋   | 185/275 [00:23<00:10,  8.35it/s] 68%|██████▊   | 186/275 [00:24<00:10,  8.34it/s] 68%|██████▊   | 187/275 [00:24<00:10,  8.37it/s] 68%|██████▊   | 188/275 [00:24<00:10,  8.40it/s] 69%|██████▊   | 189/275 [00:24<00:10,  8.36it/s] 69%|██████▉   | 190/275 [00:24<00:10,  8.38it/s] 69%|██████▉   | 191/275 [00:24<00:10,  8.40it/s] 70%|██████▉   | 192/275 [00:24<00:09,  8.38it/s] 70%|███████   | 193/275 [00:24<00:09,  8.40it/s] 71%|███████   | 194/275 [00:25<00:09,  8.37it/s] 71%|███████   | 195/275 [00:25<00:09,  8.34it/s] 71%|███████▏  | 196/275 [00:25<00:09,  8.38it/s] 72%|███████▏  | 197/275 [00:25<00:09,  8.35it/s] 72%|███████▏  | 198/275 [00:25<00:09,  8.37it/s] 72%|███████▏  | 199/275 [00:25<00:09,  8.34it/s] 73%|███████▎  | 200/275 [00:25<00:09,  8.32it/s]                                                  73%|███████▎  | 200/275 [00:25<00:09,  8.32it/s]{'eval_loss': 0.6651793122291565, 'eval_accuracy': 0.6666666666666666, 'eval_f1': 0.6387959866220736, 'eval_matthews_correlation': 0.3100136370471913, 'eval_precision': 0.669878508588186, 'eval_recall': 0.6414370422043949, 'eval_auroc': 0.6238228113010116, 'eval_runtime': 0.1988, 'eval_samples_per_second': 543.308, 'eval_steps_per_second': 35.214, 'epoch': 1.82}
+{'loss': 1.0835, 'learning_rate': 2.8222222222222223e-05, 'epoch': 2.73}
+{'loss': 1.005, 'learning_rate': 1.7555555555555556e-05, 'epoch': 3.64}
+
+  0%|          | 0/7 [00:00<?, ?it/s][A
+ 71%|███████▏  | 5/7 [00:00<00:00, 44.07it/s][A                                                 
+                                             [A 73%|███████▎  | 200/275 [00:25<00:09,  8.32it/s]
+100%|██████████| 7/7 [00:00<00:00, 44.07it/s][A
+                                             [A 73%|███████▎  | 201/275 [00:27<00:45,  1.64it/s] 73%|███████▎  | 202/275 [00:27<00:33,  2.16it/s] 74%|███████▍  | 203/275 [00:27<00:25,  2.78it/s] 74%|███████▍  | 204/275 [00:27<00:20,  3.49it/s] 75%|███████▍  | 205/275 [00:27<00:16,  4.24it/s] 75%|███████▍  | 206/275 [00:28<00:13,  4.98it/s] 75%|███████▌  | 207/275 [00:28<00:11,  5.67it/s] 76%|███████▌  | 208/275 [00:28<00:10,  6.28it/s] 76%|███████▌  | 209/275 [00:28<00:09,  6.77it/s] 76%|███████▋  | 210/275 [00:28<00:09,  7.16it/s] 77%|███████▋  | 211/275 [00:28<00:08,  7.46it/s] 77%|███████▋  | 212/275 [00:28<00:08,  7.72it/s] 77%|███████▋  | 213/275 [00:28<00:07,  7.89it/s] 78%|███████▊  | 214/275 [00:29<00:07,  8.00it/s] 78%|███████▊  | 215/275 [00:29<00:07,  8.09it/s] 79%|███████▊  | 216/275 [00:29<00:07,  8.20it/s] 79%|███████▉  | 217/275 [00:29<00:07,  8.23it/s] 79%|███████▉  | 218/275 [00:29<00:06,  8.26it/s] 80%|███████▉  | 219/275 [00:29<00:06,  8.27it/s] 80%|████████  | 221/275 [00:29<00:05,  9.61it/s] 81%|████████  | 222/275 [00:29<00:05,  9.25it/s] 81%|████████  | 223/275 [00:30<00:05,  9.00it/s] 81%|████████▏ | 224/275 [00:30<00:05,  8.80it/s] 82%|████████▏ | 225/275 [00:30<00:05,  8.72it/s] 82%|████████▏ | 226/275 [00:30<00:05,  8.59it/s] 83%|████████▎ | 227/275 [00:30<00:05,  8.54it/s] 83%|████████▎ | 228/275 [00:30<00:05,  8.46it/s] 83%|████████▎ | 229/275 [00:30<00:05,  8.41it/s] 84%|████████▎ | 230/275 [00:30<00:05,  8.44it/s] 84%|████████▍ | 231/275 [00:30<00:05,  8.41it/s] 84%|████████▍ | 232/275 [00:31<00:05,  8.42it/s] 85%|████████▍ | 233/275 [00:31<00:04,  8.42it/s] 85%|████████▌ | 234/275 [00:31<00:04,  8.41it/s] 85%|████████▌ | 235/275 [00:31<00:04,  8.40it/s] 86%|████████▌ | 236/275 [00:31<00:04,  8.37it/s] 86%|████████▌ | 237/275 [00:31<00:04,  8.37it/s] 87%|████████▋ | 238/275 [00:31<00:04,  8.40it/s] 87%|████████▋ | 239/275 [00:31<00:04,  8.36it/s] 87%|████████▋ | 240/275 [00:32<00:04,  8.33it/s] 88%|████████▊ | 241/275 [00:32<00:04,  8.33it/s] 88%|████████▊ | 242/275 [00:32<00:03,  8.30it/s] 88%|████████▊ | 243/275 [00:32<00:03,  8.36it/s] 89%|████████▊ | 244/275 [00:32<00:03,  8.32it/s] 89%|████████▉ | 245/275 [00:32<00:03,  8.31it/s] 89%|████████▉ | 246/275 [00:32<00:03,  8.33it/s] 90%|████████▉ | 247/275 [00:32<00:03,  8.32it/s] 90%|█████████ | 248/275 [00:33<00:03,  8.31it/s] 91%|█████████ | 249/275 [00:33<00:03,  8.29it/s] 91%|█████████ | 250/275 [00:33<00:03,  8.32it/s]                                                  91%|█████████ | 250/275 [00:33<00:03,  8.32it/s] 91%|█████████▏| 251/275 [00:33<00:02,  8.32it/s] 92%|█████████▏| 252/275 [00:33<00:02,  8.35it/s] 92%|█████████▏| 253/275 [00:33<00:02,  8.32it/s] 92%|█████████▏| 254/275 [00:33<00:02,  8.31it/s] 93%|█████████▎| 255/275 [00:33<00:02,  8.30it/s] 93%|█████████▎| 256/275 [00:33<00:02,  8.29it/s] 93%|█████████▎| 257/275 [00:34<00:02,  8.27it/s] 94%|█████████▍| 258/275 [00:34<00:02,  8.31it/s] 94%|█████████▍| 259/275 [00:34<00:01,  8.34it/s] 95%|█████████▍| 260/275 [00:34<00:01,  8.33it/s] 95%|█████████▍| 261/275 [00:34<00:01,  8.29it/s] 95%|█████████▌| 262/275 [00:34<00:01,  8.28it/s] 96%|█████████▌| 263/275 [00:34<00:01,  8.34it/s] 96%|█████████▌| 264/275 [00:34<00:01,  8.33it/s] 96%|█████████▋| 265/275 [00:35<00:01,  8.31it/s] 97%|█████████▋| 266/275 [00:35<00:01,  8.34it/s] 97%|█████████▋| 267/275 [00:35<00:00,  8.32it/s] 97%|█████████▋| 268/275 [00:35<00:00,  8.35it/s] 98%|█████████▊| 269/275 [00:35<00:00,  8.36it/s] 98%|█████████▊| 270/275 [00:35<00:00,  8.39it/s] 99%|█████████▊| 271/275 [00:35<00:00,  8.35it/s] 99%|█████████▉| 272/275 [00:35<00:00,  8.37it/s] 99%|█████████▉| 273/275 [00:36<00:00,  8.32it/s]100%|█████████▉| 274/275 [00:36<00:00,  8.31it/s]                                                 100%|██████████| 275/275 [00:36<00:00,  8.31it/s]100%|██████████| 275/275 [00:36<00:00,  7.52it/s]
+{'eval_loss': 0.6342943906784058, 'eval_accuracy': 0.6666666666666666, 'eval_f1': 0.6493506493506493, 'eval_matthews_correlation': 0.31081727480494015, 'eval_precision': 0.6623524933384088, 'eval_recall': 0.6487617718869898, 'eval_auroc': 0.7021276595744681, 'eval_runtime': 0.199, 'eval_samples_per_second': 542.841, 'eval_steps_per_second': 35.184, 'epoch': 3.64}
+{'loss': 0.8829, 'learning_rate': 6.4444444444444445e-06, 'epoch': 4.55}
+{'train_runtime': 36.565, 'train_samples_per_second': 118.283, 'train_steps_per_second': 7.521, 'train_loss': 1.1547233789617366, 'epoch': 5.0}
+  0%|          | 0/7 [00:00<?, ?it/s] 71%|███████▏  | 5/7 [00:00<00:00, 45.16it/s]100%|██████████| 7/7 [00:00<00:00, 42.16it/s]
+
+========================================
+Experiment complete!
+Date: Fri May 29 14:47:24 EDT 2026
+Run name: hap_pair_CTCF_ENC-001_sigmoid_colon_AS_classification_LUPI_ctcf_log1p_max_fc_snv_pm20_lambda0.2
+Dataset dir: /home/asm242/entexBERT-2/AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/input
+Output dir: /home/asm242/entexBERT-2/AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output
+Figure dir: /home/asm242/entexBERT-2/AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/figures
+Log file: /home/asm242/entexBERT-2/AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/logs/hap_pair_CTCF_ENC-001_sigmoid_colon_AS_classification_LUPI_ctcf_log1p_max_fc_snv_pm20_lambda0.2.log
+========================================
+
+Final eval results:
+{"eval_loss": 0.6378201842308044, "eval_accuracy": 0.5963302752293578, "eval_f1": 0.5921768707482993, "eval_matthews_correlation": 0.1945457813212078, "eval_precision": 0.5991258741258741, "eval_recall": 0.5954545454545455, "eval_auroc": 0.6341750841750842, "eval_runtime": 0.1937, "eval_samples_per_second": 562.755, "eval_steps_per_second": 36.14, "epoch": 5.0}

@@ -12,6 +12,16 @@ AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9500/pytorch_m
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9600/optimizer.pt
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9600/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification/output/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-100/optimizer.pt
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-100/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-200/optimizer.pt
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-200/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_noLUPI/output/checkpoint-100/optimizer.pt
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_noLUPI/output/checkpoint-100/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_noLUPI/output/checkpoint-200/optimizer.pt
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_noLUPI/output/checkpoint-200/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/hap_pair_classification_noLUPI/output/pytorch_model.bin
 AS/1/CTCF/sigmoid_colon/output/checkpoint-100/optimizer.pt
 AS/1/CTCF/sigmoid_colon/output/checkpoint-100/pytorch_model.bin
 AS/1/CTCF/sigmoid_colon/output/checkpoint-3200/optimizer.pt
