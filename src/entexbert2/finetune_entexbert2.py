@@ -1065,6 +1065,7 @@ def train():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     validate_training_args(training_args) # NEW
+    training_args.label_names = ["labels"] # NEW
 
     # load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -1177,6 +1178,7 @@ def train():
                                    train_dataset=train_dataset,
                                    eval_dataset=val_dataset,
                                    data_collator=data_collator)
+
     trainer.train()
 
     if training_args.save_model:

@@ -44,8 +44,6 @@ SIGNAL_MODE="max"
 SIGNAL_REGION="snv_radius"
 SIGNAL_RADIUS_BP=20
 TARGET_TRANSFORM="log1p"
-
-# For locus-level BigWig signal prediction, ref_single is the cleanest default
 INPUT_MODE="ref_single"
 
 SPLIT_TRAIN=0.8
@@ -66,13 +64,12 @@ REF_FASTA="$HOME/reference_genome/hg38.fa"
 CHROM_SIZES="$HOME/reference_genome/hg38.chrom.sizes"
 
 # BigWig target track: fold-change-over-control for this target/tissue
-BIGWIG="$HOME/entex_data/${DONOR_NUMBER}/${ASSAY_NICKNAME}_${TISSUE}_fold_change_over_control.bigWig"
+BIGWIG="$HOME/entex_data/${DONOR}/${ASSAY_NICKNAME}_${TISSUE}_fold_change_over_control.bigWig"
 
 ########################################
 # Output locations
 ########################################
 
-# Match your shown folder organization: AS/1/CTCF/sigmoid_colon
 EXPERIMENT_DIR="$PROJECT_DIR/AS/${DONOR_NUMBER}/${ASSAY_NICKNAME}/${TISSUE}"
 
 DATA_DIR="${EXPERIMENT_DIR}/input"
@@ -118,6 +115,7 @@ WARMUP_STEPS=50
 LOGGING_STEPS=50
 EVAL_STEPS=100
 SAVE_STEPS=100
+
 
 ########################################
 # Sanity checks
@@ -205,7 +203,7 @@ ls -lh "$DATA_DIR"
 
 echo
 echo "========================================"
-echo "Step 2: Plotting dataset distributions"
+echo "Plotting dataset distributions..."
 echo "========================================"
 
 if [[ -f "$PROJECT_DIR/src/entexbert2/scripts/plot_dataset_distribution.py" ]]; then
@@ -227,7 +225,7 @@ ls -lh "$FIGURE_DIR" || true
 
 echo
 echo "========================================"
-echo "Step 3: Training entexBERT-2 regression model"
+echo "Training entexBERT-2 regression model..."
 echo "========================================"
 
 python -m entexbert2.finetune_entexbert2 \

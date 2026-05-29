@@ -1,3 +1,10 @@
+AS/1/CTCF/sigmoid_colon/output/checkpoint-100/optimizer.pt
+AS/1/CTCF/sigmoid_colon/output/checkpoint-100/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/output/checkpoint-3200/optimizer.pt
+AS/1/CTCF/sigmoid_colon/output/checkpoint-3200/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/output/checkpoint-3300/optimizer.pt
+AS/1/CTCF/sigmoid_colon/output/checkpoint-3300/pytorch_model.bin
+AS/1/CTCF/sigmoid_colon/output/pytorch_model.bin
 *.pyc
 __pycache__/
 src/entexbert2.egg-info/

@@ -16,6 +16,8 @@ dependencies = [
   "biopython",
   "edlib",
   "pyBigWig",
+  "pyfaidx",
+  "matplotlib",
 ]
 
 [tool.setuptools.packages.find]
