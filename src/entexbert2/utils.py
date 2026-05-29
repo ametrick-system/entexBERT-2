@@ -96,11 +96,17 @@ def split_and_write_csvs(
     split_ratio=(0.8, 0.1, 0.1),
     seed: int = 42,
     skip_ambiguous: bool = True,
+    group_cols: Optional[List[str]] = None,
 ):
     """
-    Write train/dev/test CSVs for entexBERT-2
+    Write train/dev/test CSVs for entexBERT-2.
+
+    If group_cols is provided, all rows with the same group key are assigned
+    to the same split. This prevents duplicate sequence/window leakage across
+    train/dev/test.
     """
     aux_cols = aux_cols or []
+    group_cols = group_cols or []
 
     if not np.isclose(sum(split_ratio), 1.0):
         raise ValueError(f"split_ratio must sum to 1.0, got {split_ratio}.")
@@ -112,7 +118,7 @@ def split_and_write_csvs(
     else:
         input_cols = ["sequence"]
 
-    required = input_cols + [label_col] + aux_cols
+    required = input_cols + [label_col] + aux_cols + group_cols
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns for CSV writing: {missing}")
@@ -129,39 +135,79 @@ def split_and_write_csvs(
         else:
             out = out[~out["sequence"].str.contains("N", regex=False)].copy()
 
-    out = out.sample(frac=1, random_state=seed).reset_index(drop=True)
-
     if out.empty:
         raise ValueError("No examples remain after filtering ambiguous sequences.")
 
-    total = len(out)
-    n_train = int(split_ratio[0] * total)
-    n_dev = int(split_ratio[1] * total)
+    rng = np.random.default_rng(seed)
 
-    splits = {
-        "train.csv": out.iloc[:n_train],
-        "dev.csv": out.iloc[n_train:n_train + n_dev],
-        "test.csv": out.iloc[n_train + n_dev:],
-    }
+    if group_cols:
+        out["_split_group"] = out[group_cols].astype(str).agg("|".join, axis=1)
+
+        unique_groups = out["_split_group"].drop_duplicates().to_numpy()
+        rng.shuffle(unique_groups)
+
+        n_groups = len(unique_groups)
+        n_train_groups = int(split_ratio[0] * n_groups)
+        n_dev_groups = int(split_ratio[1] * n_groups)
+
+        train_groups = set(unique_groups[:n_train_groups])
+        dev_groups = set(unique_groups[n_train_groups:n_train_groups + n_dev_groups])
+        test_groups = set(unique_groups[n_train_groups + n_dev_groups:])
+
+        splits = {
+            "train.csv": out[out["_split_group"].isin(train_groups)].copy(),
+            "dev.csv": out[out["_split_group"].isin(dev_groups)].copy(),
+            "test.csv": out[out["_split_group"].isin(test_groups)].copy(),
+        }
+
+        for split_df in splits.values():
+            split_df.drop(columns=["_split_group"], inplace=True)
+
+        print(f"Group-aware split using group_cols={group_cols}")
+        print(f"Unique groups: {n_groups}")
+        print({
+            "train_groups": len(train_groups),
+            "dev_groups": len(dev_groups),
+            "test_groups": len(test_groups),
+        })
+
+    else:
+        out = out.sample(frac=1, random_state=seed).reset_index(drop=True)
+
+        total = len(out)
+        n_train = int(split_ratio[0] * total)
+        n_dev = int(split_ratio[1] * total)
+
+        splits = {
+            "train.csv": out.iloc[:n_train].copy(),
+            "dev.csv": out.iloc[n_train:n_train + n_dev].copy(),
+            "test.csv": out.iloc[n_train + n_dev:].copy(),
+        }
+
+    # Do not write group columns to final Trainer CSVs unless they are also input/aux columns.
+    final_cols = input_cols + ["label"] + aux_cols
 
     os.makedirs(output_dir, exist_ok=True)
 
     for filename, split_df in splits.items():
+        split_df = split_df[final_cols].copy()
         split_df.to_csv(os.path.join(output_dir, filename), index=False)
 
-    print(f"Saved {total} examples to {output_dir}")
+    print(f"Saved {sum(len(v) for v in splits.values())} total examples to {output_dir}")
     print({name: len(split_df) for name, split_df in splits.items()})
 
-    print("\nMain label summary:")
-    print(out["label"].describe())
+    combined = pd.concat([split_df[final_cols] for split_df in splits.values()], ignore_index=True)
 
-    if out["label"].nunique() <= 20:
+    print("\nMain label summary:")
+    print(combined["label"].describe())
+
+    if combined["label"].nunique() <= 20:
         print("\nMain label counts:")
-        print(out["label"].value_counts().sort_index())
+        print(combined["label"].value_counts().sort_index())
 
     for aux_col in aux_cols:
         print(f"\nAux label summary: {aux_col}")
-        print(out[aux_col].describe())
+        print(combined[aux_col].describe())
 
 ######################
 # AS Experiment Utils
@@ -552,6 +598,61 @@ def summarize_overlaps(overlaps, qstart, qend, mode: str):
 
     raise ValueError(f"Unsupported overlap mode: {mode}")
 
+def summarize_duplicate_as_windows(
+    df: pd.DataFrame,
+    label_col: str = "imbalance_significance",
+    group_cols: Optional[List[str]] = None,
+):
+    """
+    Print a summary of duplicate sequence/window groups and label conflicts.
+
+    For all-tissue AS classification, duplicates often arise because the same
+    SNV/window appears in multiple tissues.
+    """
+    if group_cols is None:
+        group_cols = [
+            "chr",
+            "bed_start",
+            "bed_end",
+            "ref_allele",
+            "hap1_allele",
+            "hap2_allele",
+        ]
+
+    missing = [c for c in group_cols + [label_col] if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns for duplicate summary: {missing}")
+
+    tmp = df.copy()
+    tmp["_group_key"] = tmp[group_cols].astype(str).agg("|".join, axis=1)
+
+    grouped = tmp.groupby("_group_key")[label_col].agg(
+        n_rows="count",
+        n_unique_labels="nunique",
+        mean_label="mean",
+        min_label="min",
+        max_label="max",
+    )
+
+    duplicate_groups = grouped[grouped["n_rows"] > 1]
+    conflicting_groups = grouped[grouped["n_unique_labels"] > 1]
+
+    print("\nDuplicate AS/window summary")
+    print(f"Rows: {len(tmp)}")
+    print(f"Unique groups: {len(grouped)}")
+    print(f"Duplicate groups: {len(duplicate_groups)}")
+    print(f"Rows in duplicate groups: {int(duplicate_groups['n_rows'].sum()) if len(duplicate_groups) else 0}")
+    print(f"Conflicting-label groups: {len(conflicting_groups)}")
+    print(f"Rows in conflicting-label groups: {int(conflicting_groups['n_rows'].sum()) if len(conflicting_groups) else 0}")
+
+    if len(conflicting_groups) > 0:
+        print("\nExample conflicting groups:")
+        print(conflicting_groups.head(10))
+
+    tmp.drop(columns=["_group_key"], inplace=True)
+
+    return grouped
+
 def build_as_prediction_dataset(
     input_tsv: str,
     output_dir: str,
@@ -569,6 +670,7 @@ def build_as_prediction_dataset(
     seed: int = 42,
     chunksize: int = 100000,
     skip_ambiguous: bool = True,
+    group_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
     End-to-end AS dataset builder for entexBERT-2.
@@ -590,6 +692,14 @@ def build_as_prediction_dataset(
     df = balance_as_table(df, balance_spec)
     df = add_snv_windows(df, window_spec)
     df = add_label_columns(df, primary_label=primary_label, aux_labels=aux_labels)
+
+    if group_cols is not None:
+        summarize_duplicate_as_windows(
+            df,
+            label_col=primary_label.name,
+            group_cols=group_cols,
+        )
+
     df = add_sequence_inputs(df, ref_fasta=ref_fasta, input_mode=input_mode)
 
     split_and_write_csvs(
@@ -601,6 +711,7 @@ def build_as_prediction_dataset(
         split_ratio=split_ratio,
         seed=seed,
         skip_ambiguous=skip_ambiguous,
+        group_cols=group_cols,
     )
 
     return df
