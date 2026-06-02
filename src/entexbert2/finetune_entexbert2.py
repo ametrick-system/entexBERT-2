@@ -11,7 +11,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 ##########################################
 
-Last modified: 5/28/2026 by Amy Metrick
+Last modified: 6/2/2026 by Amy Metrick
 '''
 
 import os
@@ -1058,8 +1058,6 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         return SequenceClassifierOutput(
             loss=total_loss,
             logits=logits,
-            hidden_states=getattr(backbone_outputs, "hidden_states", None),
-            attentions=getattr(backbone_outputs, "attentions", None),
         )
 
 def train():
