@@ -1058,6 +1058,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         return SequenceClassifierOutput(
             loss=total_loss,
             logits=logits,
+            hidden_states=getattr(backbone_outputs, "hidden_states", None),
+            attentions=getattr(backbone_outputs, "attentions", None),
         )
 
 def train():
