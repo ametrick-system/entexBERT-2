@@ -11,7 +11,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 ##########################################
 
-Last modified: 6/2/2026 by Amy Metrick
+Last modified: 6/3/2026 by Amy Metrick
 '''
 
 import os
@@ -997,12 +997,16 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         attention_mask=None,
         labels=None,
         aux_labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
         **kwargs,
     ):
         backbone_outputs = self.backbone(
             input_ids=input_ids,
             attention_mask=attention_mask,
             return_dict=True,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
             **kwargs,
         )
 
@@ -1055,9 +1059,23 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 weighted_aux_loss = weight * aux_loss
                 total_loss = weighted_aux_loss if total_loss is None else total_loss + weighted_aux_loss
 
+        hidden_states = getattr(backbone_outputs, "hidden_states", None)
+        attentions = getattr(backbone_outputs, "attentions", None)
+
+        # Robust fallback for tuple-style outputs
+        if isinstance(backbone_outputs, (tuple, list)):
+            for item in backbone_outputs:
+                if isinstance(item, (tuple, list)) and len(item) > 0 and torch.is_tensor(item[0]):
+                    if item[0].ndim == 3:
+                        hidden_states = item
+                    elif item[0].ndim == 4:
+                        attentions = item
+
         return SequenceClassifierOutput(
             loss=total_loss,
             logits=logits,
+            hidden_states=hidden_states,
+            attentions=attentions,
         )
 
 def train():
