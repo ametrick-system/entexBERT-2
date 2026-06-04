@@ -1,0 +1,12 @@
+{
+  "attention_csv": "/home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/hap_pair_classification/analysis/test/attention_profiles/cls_layer11_allheads_n100/attention_profiles_long.csv",
+  "output_dir": "/home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/hap_pair_classification/analysis/test/attention_profiles/cls_layer11_allheads_n100/linear_flank_corrected_pm100",
+  "value": "hap1_plus_hap2",
+  "window_bp": 256,
+  "flank_inner_bp": 100,
+  "flank_outer_bp": 256,
+  "baseline_scope": "per_category",
+  "categories": "TP,FP,TN,FN",
+  "title_suffix": "source=cls, layers=11, heads=all, n/category=100",
+  "dpi": 300
+}

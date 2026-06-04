@@ -1,0 +1,23 @@
+{
+  "checkpoint_dir": "/home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/hap_pair_classification/output",
+  "examples_csv": "/home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/hap_pair_classification/analysis/test/representative_examples/representative_examples_all.csv",
+  "output_dir": "/home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/hap_pair_classification/analysis/test/attention_profiles/cls_layer8_allheads_n100",
+  "model_name_or_path": "/home/asm242/entexBERT-2/DNABERT-2-117M-attention",
+  "model_max_length": 512,
+  "left_bp": 256,
+  "n_per_category": 100,
+  "categories": "TP,FP,TN,FN",
+  "layers": "8",
+  "heads": "all",
+  "source_token": "cls",
+  "source_token_index": null,
+  "source_base_pos": null,
+  "input_mode": "hap_pair",
+  "pooling_mode": "cls",
+  "head_num_layers": 1,
+  "head_hidden_size": -1,
+  "head_activation": "gelu",
+  "head_dropout": 0.1,
+  "device": "cuda",
+  "model_file": "/home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/hap_pair_classification/output/checkpoint-8600/pytorch_model.bin"
+}
