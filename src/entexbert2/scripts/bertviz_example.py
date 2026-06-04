@@ -225,15 +225,15 @@ def main():
     with open(output_dir / f"{args.category}_rank{args.rank}_head_view_final_layer.html", "w") as f:
         f.write(html.data)
 
-    # Head view: middle layers only, often useful for motif/comparison behavior.
-    mid_layers = [5, 6, 7]
+    # Head view: all layers
+    all_layers = list(range(len(attentions)))
     html = head_view(
         attentions,
         tokens,
-        include_layers=mid_layers,
+        include_layers=all_layers,
         html_action="return",
     )
-    with open(output_dir / f"{args.category}_rank{args.rank}_head_view_mid_layers.html", "w") as f:
+    with open(output_dir / f"{args.category}_rank{args.rank}_head_view_all_layers.html", "w") as f:
         f.write(html.data)
 
     print(f"\nSaved BertViz outputs to: {output_dir}")
