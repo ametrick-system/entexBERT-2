@@ -2,27 +2,20 @@ python - <<'PY'
 import torch
 import transformers
 
-from entexbert2.finetune_entexbert2 import entexBERT2ForSequencePrediction
-
-model_name = "zhihan1996/DNABERT-2-117M"
+MODEL_PATH = "DNABERT-2-117M-attention"
 
 tokenizer = transformers.AutoTokenizer.from_pretrained(
-    model_name,
+    MODEL_PATH,
     trust_remote_code=True,
     model_max_length=512,
 )
 
-model = entexBERT2ForSequencePrediction(
-    model_name_or_path=model_name,
-    main_task="classification",
-    main_num_labels=2,
+model = transformers.AutoModel.from_pretrained(
+    MODEL_PATH,
+    trust_remote_code=True,
 )
 
 model.eval()
-
-# Force config flags too, in case the custom DNABERT-2 model reads config
-model.backbone.config.output_attentions = True
-model.backbone.config.output_hidden_states = True
 
 seq1 = "A" * 256 + "C" + "G" * 256
 seq2 = "A" * 256 + "T" + "G" * 256
@@ -37,35 +30,29 @@ inputs = tokenizer(
 )
 
 with torch.no_grad():
-    backbone_outputs = model.backbone(
+    outputs = model(
         **inputs,
-        return_dict=False,
+        return_dict=True,
         output_attentions=True,
         output_hidden_states=True,
     )
 
-print("Backbone output type:", type(backbone_outputs))
-print("Tuple length:", len(backbone_outputs))
+print("Output type:", type(outputs))
+print("last_hidden_state:", outputs.last_hidden_state.shape)
+print("pooler_output:", None if outputs.pooler_output is None else outputs.pooler_output.shape)
 
-for i, item in enumerate(backbone_outputs):
-    print(f"\nItem {i}: type={type(item)}")
+print("hidden_states is None:", outputs.hidden_states is None)
+if outputs.hidden_states is not None:
+    print("num hidden states:", len(outputs.hidden_states))
+    print("hidden_states[0]:", outputs.hidden_states[0].shape)
+    print("hidden_states[-1]:", outputs.hidden_states[-1].shape)
 
-    if torch.is_tensor(item):
-        print("  tensor shape:", tuple(item.shape))
+print("attentions is None:", outputs.attentions is None)
+if outputs.attentions is not None:
+    print("num attention layers:", len(outputs.attentions))
+    print("attention[0]:", outputs.attentions[0].shape)
+    print("attention[-1]:", outputs.attentions[-1].shape)
 
-    elif isinstance(item, (tuple, list)):
-        print("  nested length:", len(item))
-
-        if len(item) > 0:
-            first = item[0]
-            print("  first nested item type:", type(first))
-
-            if torch.is_tensor(first):
-                print("  first nested item shape:", tuple(first.shape))
-
-            if len(item) > 1 and torch.is_tensor(item[-1]):
-                print("  last nested item shape:", tuple(item[-1].shape))
-
-    else:
-        print("  value:", item)
+    row_sums = outputs.attentions[-1][0, 0].sum(dim=-1)
+    print("last layer/head 0 row sums, first 10:", row_sums[:10])
 PY
