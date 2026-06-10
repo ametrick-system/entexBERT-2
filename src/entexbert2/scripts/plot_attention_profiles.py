@@ -14,14 +14,14 @@ import transformers
 
 from entexbert2.finetune_entexbert2 import entexBERT2ForSequencePrediction
 
-# -------------------------
+# -----------------
 # Argument parsing
-# -------------------------
+# -----------------
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "Compute and plot DNABERT-2 / entexBERT-2 attention profiles. "
-            "Supports hap-pair or single-sequence input, chosen source token, "
+            "Compute and plot entexBERT-2 attention profiles. "
+            "Supports sequence-pair or single-sequence input, chosen source token, "
             "chosen layers/heads, exact ALiBi removal, zooming, and profile correction."
         )
     )
@@ -33,21 +33,21 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         required=True,
-        help="Path to patched local DNABERT-2 model directory.",
+        help="Path to local inference DNABERT-2 model directory (with attention extracted from each layer)",
     )
 
     # Input/data options
     parser.add_argument(
         "--input_mode",
-        default="hap_pair",
-        choices=["hap_pair", "ref_single"],
+        default="ref_single",
+        choices=["ref_single", "hap_pair", "ref_hap1_pair", "ref_hap2_pair"],
     )
     parser.add_argument("--model_max_length", type=int, default=512)
     parser.add_argument(
         "--left_bp",
         type=int,
         default=256,
-        help="SNV position within the raw input sequence. Usually left_bp.",
+        help="Left offset coordinate of sequence element of interest (e.g. SNV or ChIP-seq peak) within the raw input sequence",
     )
 
     parser.add_argument(
@@ -59,7 +59,7 @@ def parse_args():
         "--n_per_category",
         type=int,
         default=100,
-        help="Top N examples per category.",
+        help="Top N examples per confusion category.",
     )
     parser.add_argument(
         "--deduplicate_inputs",
@@ -84,8 +84,10 @@ def parse_args():
         ],
         help=(
             "Token from which attention is taken. "
-            "For hap_pair, use cls/hap1_snv/hap2_snv/token_index/hap1_position/hap2_position. "
-            "For ref_single, use cls/snv/ref_snv/token_index/ref_position."
+            "For ref_single, choose from cls/snv/ref_snv/token_index/ref_position; "
+            "For hap_pair, choose from cls/hap1_snv/hap2_snv/token_index/hap1_position/hap2_position; "
+            "For ref_hap1_pair choose from cls/hap1_snv/ref_snv/token_index/hap1_position/ref_position; "
+            "For ref_hap2_pair choose from cls/hap2_snv/ref_snv/token_index/hap2_position/ref_position."
         ),
     )
     parser.add_argument(
@@ -124,8 +126,7 @@ def parse_args():
         "--remove_alibi",
         action="store_true",
         help=(
-            "Exactly remove ALiBi from attention probabilities before averaging. "
-            "This reverses the known head-specific distance bias in log-space."
+            "Exactly remove head-specific ALiBi linear distance penalties from attention scores before averaging."
         ),
     )
 
@@ -185,7 +186,6 @@ def parse_args():
     )
 
     return parser.parse_args()
-
 
 # -------------------------
 # Helpers
