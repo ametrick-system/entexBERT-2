@@ -31,6 +31,13 @@ AS/1/CTCF/sigmoid_colon/output/checkpoint-3200/pytorch_model.bin
 AS/1/CTCF/sigmoid_colon/output/checkpoint-3300/optimizer.pt
 AS/1/CTCF/sigmoid_colon/output/checkpoint-3300/pytorch_model.bin
 AS/1/CTCF/sigmoid_colon/output/pytorch_model.bin
+AS/1/H3K27ac/all_tissues/ref_single_classification/output/checkpoint-3400/optimizer.pt
+AS/1/H3K27ac/all_tissues/ref_single_classification/output/checkpoint-3400/pytorch_model.bin
+AS/1/H3K27ac/all_tissues/ref_single_classification/output/checkpoint-9700/optimizer.pt
+AS/1/H3K27ac/all_tissues/ref_single_classification/output/checkpoint-9700/pytorch_model.bin
+AS/1/H3K27ac/all_tissues/ref_single_classification/output/checkpoint-9800/optimizer.pt
+AS/1/H3K27ac/all_tissues/ref_single_classification/output/checkpoint-9800/pytorch_model.bin
+AS/1/H3K27ac/all_tissues/ref_single_classification/output/pytorch_model.bin
 DNABERT-2-117M-attention/pytorch_model.bin
 *.pyc
 __pycache__/
