@@ -1011,6 +1011,15 @@ def main():
     load_model_weights(model, model_file, device)
     model.eval()
 
+    # dtype guard for ALiBi-removal numerical stability
+    param_dtype = next(model.parameters()).dtype
+    print(f"[dtype check] model parameters: {param_dtype}")
+    if args.remove_alibi and param_dtype != torch.float32:
+        raise RuntimeError(
+            f"remove_alibi requires fp32 for numerically valid recovery; got {param_dtype}. "
+            f"Reload the model in float32 (avoid torch_dtype=float16/bf16 and autocast)."
+        )
+
     all_rows = []
     source_rows = []
 

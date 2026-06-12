@@ -3422,3 +3422,73 @@ Saved /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_1
 
 Done.
 Output directory: /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)
+========================================
+Starting experiment: ref_single_CTCF_ENC-001_all_tissues_AS_classification
+Date: Fri Jun 12 13:10:13 EDT 2026
+Host: r102u17n01.mccleary.ycrc.yale.edu
+Project dir: /home/asm242/entexBERT-2
+Experiment dir: /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128
+========================================
+
+=============================
+Plotting Attention Profile...
+=============================
+./ref_ctcf_all_256.sh: line 126: NUM_EX: unbound variable
+========================================
+Starting experiment: ref_single_CTCF_ENC-001_all_tissues_AS_classification
+Date: Fri Jun 12 13:10:44 EDT 2026
+Host: r102u17n01.mccleary.ycrc.yale.edu
+Project dir: /home/asm242/entexBERT-2
+Experiment dir: /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128
+========================================
+
+=============================
+Plotting Attention Profile...
+=============================
+/home/asm242/.cache/huggingface/modules/transformers_modules/DNABERT-2-117M-attention/bert_layers.py:127: UserWarning: Unable to import Triton; defaulting MosaicBERT attention implementation to pytorch (this will reduce throughput when using this model).
+  warnings.warn(
+Some weights of the model checkpoint at /home/asm242/entexBERT-2/DNABERT-2-117M-attention were not used when initializing BertModel: ['cls.predictions.transform.LayerNorm.bias', 'cls.predictions.decoder.bias', 'cls.predictions.transform.LayerNorm.weight', 'cls.predictions.transform.dense.weight', 'cls.predictions.decoder.weight', 'cls.predictions.transform.dense.bias']
+- This IS expected if you are initializing BertModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+- This IS NOT expected if you are initializing BertModel from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
+Some weights of BertModel were not initialized from the model checkpoint at /home/asm242/entexBERT-2/DNABERT-2-117M-attention and are newly initialized: ['bert.pooler.dense.bias', 'bert.pooler.dense.weight']
+You should probably TRAIN this model on a down-stream task to be able to use it for predictions and inference.
+Loading examples...
+TP: using 100 examples
+FP: using 100 examples
+TN: using 100 examples
+FN: using 100 examples
+Loading tokenizer...
+Loading model...
+Loaded weights from: /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-3800/pytorch_model.bin
+Missing keys: 0
+Unexpected keys: 0
+[dtype check] model parameters: torch.float32
+Computing attention profiles...
+  processed 25/400
+  processed 50/400
+  processed 75/400
+  processed 100/400
+  processed 125/400
+  processed 150/400
+  processed 175/400
+  processed 200/400
+  processed 225/400
+  processed 250/400
+  processed 275/400
+  processed 300/400
+  processed 325/400
+  processed 350/400
+  processed 375/400
+  processed 400/400
+Saved /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)/attention_profiles_long.csv
+Saved /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)/attention_source_tokens.csv
+
+Plotting value: ref
+Saved /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)/ref_mean_profiles.csv
+Saved /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)/ref_raw_alibi_removed_layers_11_heads_all_source_cls_pm128.png
+Saved /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)/ref_corrected_profiles.csv
+Saved /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)/ref_baseline_params.csv
+Saved /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)/ref_window_summary.csv
+
+Done.
+Output directory: /home/asm242/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_128_128/analysis/attention_profiles/full_cls_layers(11)_heads(all)_alibi_removed_left(128)right(128)
