@@ -1,5 +1,6 @@
 import os
 import math
+import hashlib
 import pandas as pd
 import numpy as np
 import pyBigWig
@@ -34,10 +35,20 @@ class SNVWindowSpec:
 
     - left_bp: number of nucleotides to the left of the SNV to include in the window
     - right_bp: number of nucleotides to the right of the SNV to include in the window
+    - snv_offset_mode: "fixed" (SNV always at offset left_bp) or "uniform" (SNV offset
+      jittered uniformly within +/- jitter_max_bp of left_bp, per example)
+    - jitter_max_bp: max +/- jitter of the SNV offset within the window (uniform mode only).
+      Must be <= min(left_bp, right_bp) so the SNV always stays inside the fixed-length window.
+
+    Window length is always fixed at left_bp + 1 + right_bp; jitter only slides the window
+    relative to the SNV, it does not change the length. The realized per-example offset is
+    recorded downstream as anchor_offset_seq1[/seq2].
     """
     left_bp: int
     right_bp: int
     chrom_sizes_path: Optional[str] = None
+    snv_offset_mode: str = "fixed"
+    jitter_max_bp: int = 0
 
 @dataclass
 class BalanceSpec:
@@ -97,34 +108,53 @@ def split_and_write_csvs(
     seed: int = 42,
     skip_ambiguous: bool = True,
     group_cols: Optional[List[str]] = None,
+    meta_cols: Optional[List[str]] = None,
+    split_mode: str = "train_dev_test",
+    exclude_loci: Optional[set] = None,
 ):
     """
-    Write train/dev/test CSVs for entexBERT-2.
+    Write entexBERT-2 dataset CSVs.
 
-    If group_cols is provided, all rows with the same group key are assigned
-    to the same split. This prevents duplicate sequence/window leakage across
-    train/dev/test.
+    For each split, writes TWO files:
+      - <split>.csv       : minimal Trainer input (sequence(s), label, aux only)
+      - <split>.meta.csv  : rich superset (minimal columns + meta_cols + a 'split' column),
+                            consumed by analysis/eval/plotting. Row-aligned to <split>.csv.
+
+    Splitting:
+      - split_mode == "train_dev_test": group-aware split if group_cols is provided
+        (rows sharing a group key go to one split, preventing window leakage), else a
+        plain row-level shuffle split.
+      - split_mode == "test_only": no split; all rows written to test.csv / test.meta.csv.
+
+    exclude_loci: optional set of locus_id values to drop before writing (used to build a
+    cross-individual test set that excludes a reference model's train+dev loci).
     """
     aux_cols = aux_cols or []
     group_cols = group_cols or []
+    meta_cols = meta_cols or []
 
-    if not np.isclose(sum(split_ratio), 1.0):
+    if split_mode not in {"train_dev_test", "test_only"}:
+        raise ValueError(f"Unsupported split_mode: {split_mode!r}")
+
+    if split_mode == "train_dev_test" and not np.isclose(sum(split_ratio), 1.0):
         raise ValueError(f"split_ratio must sum to 1.0, got {split_ratio}.")
 
     paired_modes = {"hap_pair", "ref_hap1_pair", "ref_hap2_pair"}
+    input_cols = ["sequence1", "sequence2"] if input_mode in paired_modes else ["sequence"]
 
-    if input_mode in paired_modes:
-        input_cols = ["sequence1", "sequence2"]
-    else:
-        input_cols = ["sequence"]
+    # Columns we need to carry through, de-duplicated and order-preserved.
+    requested = input_cols + [label_col] + aux_cols + group_cols + meta_cols
+    required = list(dict.fromkeys(requested))
 
-    required = input_cols + [label_col] + aux_cols + group_cols
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns for CSV writing: {missing}")
 
     out = df[required].copy()
     out = out.rename(columns={label_col: "label"})
+
+    # meta_cols may reference label_col under its original name; after rename use "label".
+    meta_cols = ["label" if c == label_col else c for c in meta_cols]
 
     if skip_ambiguous:
         if input_mode in paired_modes:
@@ -135,12 +165,24 @@ def split_and_write_csvs(
         else:
             out = out[~out["sequence"].str.contains("N", regex=False)].copy()
 
+    if exclude_loci:
+        if "locus_id" not in out.columns:
+            raise ValueError("exclude_loci requires a 'locus_id' column (add it via meta_cols).")
+        before = len(out)
+        out = out[~out["locus_id"].isin(set(exclude_loci))].copy()
+        print(f"exclude_loci: removed {before - len(out)} of {before} rows "
+              f"({len(set(exclude_loci))} excluded loci).")
+
     if out.empty:
-        raise ValueError("No examples remain after filtering ambiguous sequences.")
+        raise ValueError("No examples remain after filtering.")
 
     rng = np.random.default_rng(seed)
 
-    if group_cols:
+    if split_mode == "test_only":
+        splits = {"test.csv": out.copy()}
+        print(f"test_only mode: {len(out)} examples -> test.csv")
+
+    elif group_cols:
         out["_split_group"] = out[group_cols].astype(str).agg("|".join, axis=1)
 
         unique_groups = out["_split_group"].drop_duplicates().to_numpy()
@@ -184,14 +226,24 @@ def split_and_write_csvs(
             "test.csv": out.iloc[n_train + n_dev:].copy(),
         }
 
-    # Do not write group columns to final Trainer CSVs unless they are also input/aux columns.
+    # Minimal Trainer CSV columns vs. rich metadata CSV columns.
     final_cols = input_cols + ["label"] + aux_cols
+    meta_out_cols = list(dict.fromkeys(final_cols + meta_cols + ["split"]))
 
     os.makedirs(output_dir, exist_ok=True)
 
     for filename, split_df in splits.items():
-        split_df = split_df[final_cols].copy()
-        split_df.to_csv(os.path.join(output_dir, filename), index=False)
+        split_name = filename[:-len(".csv")]
+        split_df = split_df.copy()
+        split_df["split"] = split_name
+
+        # Minimal training file
+        split_df[final_cols].to_csv(os.path.join(output_dir, filename), index=False)
+
+        # Rich, row-aligned metadata sidecar
+        meta_present = [c for c in meta_out_cols if c in split_df.columns]
+        meta_name = filename.replace(".csv", ".meta.csv")
+        split_df[meta_present].to_csv(os.path.join(output_dir, meta_name), index=False)
 
     print(f"Saved {sum(len(v) for v in splits.values())} total examples to {output_dir}")
     print({name: len(split_df) for name, split_df in splits.items()})
@@ -395,30 +447,107 @@ def balance_as_table(
 def add_snv_windows(
     df: pd.DataFrame,
     window_spec: SNVWindowSpec,
+    seed: int = 42,
 ) -> pd.DataFrame:
     """
-    Add bed_start, bed_end, and SNV location columns for SNV-containing sequence windows
+    Add bed_start, bed_end, SNV, and snv_window_offset columns for SNV-centered windows.
+
+    Window length is always fixed at left_bp + 1 + right_bp. The SNV is placed at offset
+    `snv_window_offset` within the window:
+      - snv_offset_mode == "fixed":   offset is always left_bp.
+      - snv_offset_mode == "uniform": offset is drawn uniformly per example from
+                                      [left_bp - jitter_max_bp, left_bp + jitter_max_bp],
+                                      then clamped to whatever the contig boundaries allow.
+
+    Rows whose fixed-length window cannot fit within the contig (or, in fixed mode, whose
+    single allowed offset is infeasible at a boundary) are dropped, with a count reported.
     """
     df = df.copy()
 
     chrom_sizes = load_chrom_sizes(window_spec.chrom_sizes_path)
 
+    left_bp = window_spec.left_bp
+    right_bp = window_spec.right_bp
+    window_len = left_bp + 1 + right_bp
+
+    mode = getattr(window_spec, "snv_offset_mode", "fixed")
+    jitter = int(getattr(window_spec, "jitter_max_bp", 0) or 0)
+
+    if mode not in {"fixed", "uniform"}:
+        raise ValueError(f"Unsupported snv_offset_mode: {mode!r}")
+
+    if mode == "uniform":
+        if jitter < 0:
+            raise ValueError("jitter_max_bp must be non-negative.")
+        if jitter > min(left_bp, right_bp):
+            raise ValueError(
+                f"jitter_max_bp={jitter} exceeds min(left_bp, right_bp)="
+                f"{min(left_bp, right_bp)}; the SNV could fall outside the window."
+            )
+
     df["SNV"] = df["ref_start"].astype(int)
-    df["bed_start"] = (df["SNV"] - window_spec.left_bp).clip(lower=0)
-    df["bed_end"] = df["SNV"] + window_spec.right_bp + 1
 
-    if chrom_sizes:
-        df["bed_end"] = [
-            min(end, chrom_sizes.get(chrom, end))
-            for chrom, end in zip(df["chr"], df["bed_end"])
-        ]
+    rng = np.random.default_rng(seed)
 
-    # Ensure fixed length windows
-    expected_len = window_spec.left_bp + 1 + window_spec.right_bp
-    valid = (df["bed_end"] - df["bed_start"]) == expected_len
-    df = df[valid].copy()
+    # Desired offset band (before boundary clamping). In fixed mode this is a single value.
+    band_lo = left_bp - jitter if mode == "uniform" else left_bp
+    band_hi = left_bp + jitter if mode == "uniform" else left_bp
 
-    return df.reset_index(drop=True)
+    offsets = np.empty(len(df), dtype=np.int64)
+    bed_starts = np.empty(len(df), dtype=np.int64)
+    bed_ends = np.empty(len(df), dtype=np.int64)
+    keep = np.zeros(len(df), dtype=bool)
+
+    chroms = df["chr"].to_numpy()
+    snvs = df["SNV"].to_numpy()
+
+    for i in range(len(df)):
+        snv = int(snvs[i])
+        csize = chrom_sizes.get(chroms[i]) if chrom_sizes else None
+
+        # Feasible offset range so the whole fixed-length window fits in the contig:
+        #   bed_start = snv - o >= 0           -> o <= snv
+        #   bed_end   = snv - o + window_len <= csize  -> o >= snv + window_len - csize
+        # plus keep the SNV inside the window: 0 <= o <= window_len - 1.
+        o_lo = max(band_lo, 0)
+        o_hi = min(band_hi, window_len - 1, snv)
+        if csize is not None:
+            o_lo = max(o_lo, snv + window_len - csize)
+
+        if o_lo > o_hi:
+            keep[i] = False
+            offsets[i] = -1
+            bed_starts[i] = -1
+            bed_ends[i] = -1
+            continue
+
+        if mode == "uniform":
+            o = int(rng.integers(o_lo, o_hi + 1))
+        else:
+            o = left_bp  # fixed; guaranteed within [o_lo, o_hi] by the check above
+
+        offsets[i] = o
+        bed_starts[i] = snv - o
+        bed_ends[i] = snv - o + window_len
+        keep[i] = True
+
+    df["bed_start"] = bed_starts
+    df["bed_end"] = bed_ends
+    df["snv_window_offset"] = offsets
+
+    n_drop = int((~keep).sum())
+    if n_drop:
+        print(
+            f"add_snv_windows: dropped {n_drop} of {len(df)} windows that did not fit "
+            f"the contig at the requested offset (mode={mode}, jitter={jitter})."
+        )
+
+    df = df[keep].reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError("No windows remain after fitting fixed-length windows to contigs.")
+
+    return df
 
 def add_label_columns(
     df: pd.DataFrame,
@@ -470,11 +599,22 @@ def add_sequence_inputs(
     input_mode: str = "ref_single",
 ) -> pd.DataFrame:
     """
-    Add sequence columns according to input_mode
+    Add sequence columns according to input_mode, plus per-sequence anchor/extent metadata.
 
     Requires ref_fasta to support:
         str(ref_fasta[chrom][start:end])
     as pyfaidx.Fasta does
+
+    Metadata columns added (0-based, in the stored sequence-string space):
+        anchor_offset_seq1, feat_start_seq1, feat_end_seq1   (always)
+        anchor_offset_seq2, feat_start_seq2, feat_end_seq2   (paired modes only)
+        feature_type                                         ("snv")
+
+    NOTE (substitution-only engine): make_haplotype_sequence currently enforces single-base
+    alleles, so every sequence has identical length and the anchor offset is the same in seq1
+    and seq2. The per-sequence columns are computed independently so that adding indel support
+    later (length-changing haplotypes) only requires changing how each sequence's offset/extent
+    is derived, not the downstream contract.
     """
 
     single_modes = {"ref_single", "hap1_single", "hap2_single"}
@@ -488,6 +628,9 @@ def add_sequence_inputs(
     sequences = []
     sequence1s = []
     sequence2s = []
+
+    anchor1s, fstart1s, fend1s = [], [], []
+    anchor2s, fstart2s, fend2s = [], [], []
 
     for _, row in df.iterrows():
         chrom = row["chr"]
@@ -524,38 +667,75 @@ def add_sequence_inputs(
                     f"This likely indicates a coordinate convention issue."
                 )
 
-        hap1_seq = make_haplotype_sequence(ref_seq, snv_offset, row["hap1_allele"])
-        hap2_seq = make_haplotype_sequence(ref_seq, snv_offset, row["hap2_allele"])
+        hap1_allele = str(row["hap1_allele"]).upper()
+        hap2_allele = str(row["hap2_allele"]).upper()
+
+        hap1_seq = make_haplotype_sequence(ref_seq, snv_offset, hap1_allele)
+        hap2_seq = make_haplotype_sequence(ref_seq, snv_offset, hap2_allele)
+
+        # Per-sequence offset/extent. Substitution-only for now, so the anchor offset is
+        # snv_offset in every sequence; extent length is the length of that sequence's allele.
+        def offset_extent(allele):
+            return snv_offset, snv_offset, snv_offset + max(1, len(allele))
 
         if input_mode == "ref_single":
             sequences.append(ref_seq)
+            a1, s1, e1 = offset_extent(ref_allele)
 
         elif input_mode == "hap1_single":
             sequences.append(hap1_seq)
+            a1, s1, e1 = offset_extent(hap1_allele)
 
         elif input_mode == "hap2_single":
             sequences.append(hap2_seq)
+            a1, s1, e1 = offset_extent(hap2_allele)
 
         elif input_mode == "hap_pair":
             sequence1s.append(hap1_seq)
             sequence2s.append(hap2_seq)
+            a1, s1, e1 = offset_extent(hap1_allele)
+            a2, s2, e2 = offset_extent(hap2_allele)
 
         elif input_mode == "ref_hap1_pair":
             sequence1s.append(ref_seq)
             sequence2s.append(hap1_seq)
+            a1, s1, e1 = offset_extent(ref_allele)
+            a2, s2, e2 = offset_extent(hap1_allele)
 
         elif input_mode == "ref_hap2_pair":
             sequence1s.append(ref_seq)
             sequence2s.append(hap2_seq)
+            a1, s1, e1 = offset_extent(ref_allele)
+            a2, s2, e2 = offset_extent(hap2_allele)
 
         else:
             raise ValueError(f"Unsupported input_mode: {input_mode}")
+
+        anchor1s.append(a1)
+        fstart1s.append(s1)
+        fend1s.append(e1)
+
+        if input_mode in paired_modes:
+            anchor2s.append(a2)
+            fstart2s.append(s2)
+            fend2s.append(e2)
 
     if input_mode in single_modes:
         df["sequence"] = sequences
     elif input_mode in paired_modes:
         df["sequence1"] = sequence1s
         df["sequence2"] = sequence2s
+
+    df["anchor_offset_seq1"] = anchor1s
+    df["feat_start_seq1"] = fstart1s
+    df["feat_end_seq1"] = fend1s
+
+    if input_mode in paired_modes:
+        df["anchor_offset_seq2"] = anchor2s
+        df["feat_start_seq2"] = fstart2s
+        df["feat_end_seq2"] = fend2s
+
+    df["feature_type"] = "snv"
 
     return df
 
@@ -653,6 +833,30 @@ def summarize_duplicate_as_windows(
 
     return grouped
 
+def add_locus_and_example_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a jitter-invariant locus_id and a unique, content-based example_id.
+
+    - locus_id = sha1(chr|SNV)[:16]: the grouping / leakage / cross-individual-exclusion key.
+      All rows for the same SNV locus -- across tissues and across jitter draws -- share it.
+    - example_id = "<chr>:<SNV>:<tissue>:<occurrence>": unique per row within a
+      (donor, assay) dataset, stable and content-based.
+    """
+    df = df.copy()
+
+    df["locus_id"] = [
+        hashlib.sha1(f"{c}|{int(s)}".encode()).hexdigest()[:16]
+        for c, s in zip(df["chr"], df["SNV"])
+    ]
+
+    tissue = df["tissue"].astype(str) if "tissue" in df.columns else pd.Series(["NA"] * len(df), index=df.index)
+    base = df["chr"].astype(str) + ":" + df["SNV"].astype(str) + ":" + tissue
+    occ = base.groupby(base).cumcount().astype(str)
+    df["example_id"] = base + ":" + occ
+
+    return df
+
+
 def build_as_prediction_dataset(
     input_tsv: str,
     output_dir: str,
@@ -671,14 +875,24 @@ def build_as_prediction_dataset(
     chunksize: int = 100000,
     skip_ambiguous: bool = True,
     group_cols: Optional[List[str]] = None,
+    split_mode: str = "train_dev_test",
+    exclude_loci: Optional[set] = None,
 ) -> pd.DataFrame:
     """
     End-to-end AS dataset builder for entexBERT-2.
 
-    Produces train/dev/test CSVs and returns the final dataframe.
+    Writes minimal Trainer CSVs plus rich .meta.csv sidecars and returns the final dataframe.
+
+    Leakage prevention is ON by default: if group_cols is None, rows are grouped by locus_id
+    (jitter-invariant) so the same SNV locus never straddles train/dev/test. Pass group_cols=[]
+    to explicitly disable grouping.
     """
     balance_spec = balance_spec or BalanceSpec(strategy="none")
     aux_labels = aux_labels or []
+
+    # Default: group by locus_id for all tasks (fixes prior leakage in non-grouped builds).
+    if group_cols is None:
+        group_cols = ["locus_id"]
 
     df = load_as_table(
         input_tsv=input_tsv,
@@ -690,17 +904,29 @@ def build_as_prediction_dataset(
     )
 
     df = balance_as_table(df, balance_spec)
-    df = add_snv_windows(df, window_spec)
+    df = add_snv_windows(df, window_spec, seed=seed)
     df = add_label_columns(df, primary_label=primary_label, aux_labels=aux_labels)
+    df = add_sequence_inputs(df, ref_fasta=ref_fasta, input_mode=input_mode)
+    df = add_locus_and_example_ids(df)
 
-    if group_cols is not None:
+    if group_cols:
         summarize_duplicate_as_windows(
             df,
             label_col=primary_label.name,
             group_cols=group_cols,
         )
 
-    df = add_sequence_inputs(df, ref_fasta=ref_fasta, input_mode=input_mode)
+    # Rich metadata carried into the .meta.csv sidecars.
+    paired = input_mode in {"hap_pair", "ref_hap1_pair", "ref_hap2_pair"}
+    meta_cols = [
+        "example_id", "locus_id", "feature_type",
+        "anchor_offset_seq1", "feat_start_seq1", "feat_end_seq1",
+    ]
+    if paired:
+        meta_cols += ["anchor_offset_seq2", "feat_start_seq2", "feat_end_seq2"]
+    meta_cols += ["chr", "SNV", "ref_allele", "hap1_allele", "hap2_allele",
+                  "tissue", "donor", "assay"]
+    meta_cols = [c for c in meta_cols if c in df.columns]
 
     split_and_write_csvs(
         df=df,
@@ -712,6 +938,9 @@ def build_as_prediction_dataset(
         seed=seed,
         skip_ambiguous=skip_ambiguous,
         group_cols=group_cols,
+        meta_cols=meta_cols,
+        split_mode=split_mode,
+        exclude_loci=exclude_loci,
     )
 
     return df

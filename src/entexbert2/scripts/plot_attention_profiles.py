@@ -22,7 +22,7 @@ def parse_args():
         description=(
             "Compute and plot entexBERT-2 attention profiles. "
             "Supports sequence-pair or single-sequence input, chosen source token, "
-            "chosen layers/heads, exact ALiBi removal, zooming, and profile correction."
+            "chosen layers/heads, exact ALiBi removal, and zooming."
         )
     )
 
@@ -36,6 +36,23 @@ def parse_args():
         help="Path to local inference DNABERT-2 model directory (with attention extracted from each layer)",
     )
 
+    # Task / output head (must match the fine-tuned checkpoint)
+    parser.add_argument(
+        "--task",
+        default="classification",
+        choices=["classification", "regression"],
+        help="Prediction task of the fine-tuned checkpoint. Must match training.",
+    )
+    parser.add_argument(
+        "--main_num_labels",
+        type=int,
+        default=2,
+        help=(
+            "Output dim of the main head. classification: 1 (BCE single-logit) or >=2 (CE); "
+            "regression: 1. Must match training."
+        ),
+    )
+
     # Input/data options
     parser.add_argument(
         "--input_mode",
@@ -43,28 +60,42 @@ def parse_args():
         choices=["ref_single", "hap_pair", "ref_hap1_pair", "ref_hap2_pair"],
     )
     parser.add_argument("--model_max_length", type=int, default=512)
+
+    parser.add_argument(
+        "--coordinate_source",
+        default="per_example",          # <- the fork below
+        choices=["per_example", "global"],
+        help=(
+            "per_example: read alignment offset(s) from per-row columns "
+            "(anchor_offset_seq1[/_seq2]; optional feat_start/end_seq1[/_seq2], feature_type), "
+            "0-based, in stored-string space. "
+            "global: use --left_bp for every example."
+        ),
+    )
+    
     parser.add_argument(
         "--left_bp",
         type=int,
         default=256,
-        help="Left offset coordinate of sequence element of interest (e.g. SNV or ChIP-seq peak) within the raw input sequence",
+        help="Left offset coordinate of sequence element of interest (e.g. SNV or ChIP-seq peak) "
+             "within the raw input sequence; use ONLY when all sequence examples have the same GLOBAL offset",
     )
 
     parser.add_argument(
         "--categories",
         default="TP,FP,TN,FN",
-        help="Comma-separated confusion categories to include.",
+        help="Comma-separated confusion categories to include (for binary classification tasks ONLY).",
     )
     parser.add_argument(
         "--n_per_category",
         type=int,
         default=100,
-        help="Top N examples per confusion category.",
+        help="Top N examples per confusion category (for binary classification tasks ONLY).",
     )
     parser.add_argument(
         "--deduplicate_inputs",
         action="store_true",
-        help="Drop duplicate sequence inputs within each category before selecting top N.",
+        help="Drop duplicate sequence inputs within each category before selecting top N (for binary classification tasks ONLY).",
     )
 
     # Attention source/options
@@ -145,32 +176,7 @@ def parse_args():
         default=100,
         help="Plot only +/- this many bp around SNV. Use -1 for full sequence.",
     )
-    parser.add_argument(
-        "--profile_correction",
-        default="none",
-        choices=[
-            "none",
-            "position_mean",
-            "linear_flank_per_category",
-            "linear_flank_global",
-        ],
-        help=(
-            "Optional correction applied after mapping attention to base positions. "
-            "This is separate from exact ALiBi removal."
-        ),
-    )
-    parser.add_argument(
-        "--flank_inner_bp",
-        type=int,
-        default=50,
-        help="Inner edge of flank region for linear flank correction.",
-    )
-    parser.add_argument(
-        "--flank_outer_bp",
-        type=int,
-        default=100,
-        help="Outer edge of flank region for linear flank correction.",
-    )
+
     parser.add_argument("--dpi", type=int, default=300)
 
     # Model/training args that must match fine-tuning run

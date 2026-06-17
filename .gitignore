@@ -1,3 +1,4 @@
+*.pyc
 AS/1/CTCF/all_tissues/hap_pair_classification/analysis/test/bertviz_examples/TP_rank1_head_view_all_layers.html
 AS/1/CTCF/all_tissues/hap_pair_classification/analysis/test/bertviz_examples/TP_rank1_model_view.html
 AS/1/CTCF/all_tissues/hap_pair_classification/output/checkpoint-8600/optimizer.pt
@@ -7,13 +8,6 @@ AS/1/CTCF/all_tissues/hap_pair_classification/output/checkpoint-9500/pytorch_mod
 AS/1/CTCF/all_tissues/hap_pair_classification/output/checkpoint-9600/optimizer.pt
 AS/1/CTCF/all_tissues/hap_pair_classification/output/checkpoint-9600/pytorch_model.bin
 AS/1/CTCF/all_tissues/hap_pair_classification/output/pytorch_model.bin
-AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-3800/optimizer.pt
-AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-3800/pytorch_model.bin
-AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-9500/optimizer.pt
-AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-9500/pytorch_model.bin
-AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-9600/optimizer.pt
-AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-9600/pytorch_model.bin
-AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-1800/optimizer.pt
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-1800/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9500/optimizer.pt
@@ -21,6 +15,13 @@ AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9500/pytorch_m
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9600/optimizer.pt
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9600/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification/output/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-3800/optimizer.pt
+AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-3800/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-9500/optimizer.pt
+AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-9500/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-9600/optimizer.pt
+AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/checkpoint-9600/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_single_classification_128_128/output/pytorch_model.bin
 AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-100/optimizer.pt
 AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-100/pytorch_model.bin
 AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-200/optimizer.pt
@@ -46,6 +47,5 @@ AS/1/H3K27ac/all_tissues/ref_single_classification/output/checkpoint-9800/optimi
 AS/1/H3K27ac/all_tissues/ref_single_classification/output/checkpoint-9800/pytorch_model.bin
 AS/1/H3K27ac/all_tissues/ref_single_classification/output/pytorch_model.bin
 DNABERT-2-117M-attention/pytorch_model.bin
-*.pyc
 __pycache__/
 src/entexbert2.egg-info/
