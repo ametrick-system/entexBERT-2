@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 import transformers
 
-from entexbert2.finetune_entexbert2 import entexBERT2ForSequencePrediction
+from entexbert2 import model_io
 
 # -----------------
 # Argument parsing
@@ -22,7 +22,7 @@ def parse_args():
         description=(
             "Compute and plot entexBERT-2 attention profiles. "
             "Supports sequence-pair or single-sequence input, chosen source token, "
-            "chosen layers/heads, exact ALiBi removal, and zooming."
+            "chosen layers/heads, exact ALiBi removal, zooming, and profile correction."
         )
     )
 
@@ -36,23 +36,6 @@ def parse_args():
         help="Path to local inference DNABERT-2 model directory (with attention extracted from each layer)",
     )
 
-    # Task / output head (must match the fine-tuned checkpoint)
-    parser.add_argument(
-        "--task",
-        default="classification",
-        choices=["classification", "regression"],
-        help="Prediction task of the fine-tuned checkpoint. Must match training.",
-    )
-    parser.add_argument(
-        "--main_num_labels",
-        type=int,
-        default=2,
-        help=(
-            "Output dim of the main head. classification: 1 (BCE single-logit) or >=2 (CE); "
-            "regression: 1. Must match training."
-        ),
-    )
-
     # Input/data options
     parser.add_argument(
         "--input_mode",
@@ -60,42 +43,32 @@ def parse_args():
         choices=["ref_single", "hap_pair", "ref_hap1_pair", "ref_hap2_pair"],
     )
     parser.add_argument("--model_max_length", type=int, default=512)
-
-    parser.add_argument(
-        "--coordinate_source",
-        default="per_example",          # <- the fork below
-        choices=["per_example", "global"],
-        help=(
-            "per_example: read alignment offset(s) from per-row columns "
-            "(anchor_offset_seq1[/_seq2]; optional feat_start/end_seq1[/_seq2], feature_type), "
-            "0-based, in stored-string space. "
-            "global: use --left_bp for every example."
-        ),
-    )
-    
     parser.add_argument(
         "--left_bp",
         type=int,
         default=256,
-        help="Left offset coordinate of sequence element of interest (e.g. SNV or ChIP-seq peak) "
-             "within the raw input sequence; use ONLY when all sequence examples have the same GLOBAL offset",
+        help=(
+            "Fallback offset of the element of interest (e.g. SNV) within the input sequence. "
+            "Used only when the examples CSV lacks the per-example anchor_offset_seq1 column "
+            "(e.g. centered runs). Jittered runs override this per example."
+        ),
     )
 
     parser.add_argument(
         "--categories",
         default="TP,FP,TN,FN",
-        help="Comma-separated confusion categories to include (for binary classification tasks ONLY).",
+        help="Comma-separated confusion categories to include.",
     )
     parser.add_argument(
         "--n_per_category",
         type=int,
         default=100,
-        help="Top N examples per confusion category (for binary classification tasks ONLY).",
+        help="Top N examples per confusion category.",
     )
     parser.add_argument(
         "--deduplicate_inputs",
         action="store_true",
-        help="Drop duplicate sequence inputs within each category before selecting top N (for binary classification tasks ONLY).",
+        help="Drop duplicate sequence inputs within each category before selecting top N.",
     )
 
     # Attention source/options
@@ -133,7 +106,7 @@ def parse_args():
         default=None,
         help=(
             "Used with --source_token ref_position/hap1_position/hap2_position. "
-            "Defaults to --left_bp."
+            "Defaults to the per-example SNV offset."
         ),
     )
 
@@ -176,10 +149,36 @@ def parse_args():
         default=100,
         help="Plot only +/- this many bp around SNV. Use -1 for full sequence.",
     )
-
+    parser.add_argument(
+        "--profile_correction",
+        default="none",
+        choices=[
+            "none",
+            "position_mean",
+            "linear_flank_per_category",
+            "linear_flank_global",
+        ],
+        help=(
+            "Optional correction applied after mapping attention to base positions. "
+            "This is separate from exact ALiBi removal."
+        ),
+    )
+    parser.add_argument(
+        "--flank_inner_bp",
+        type=int,
+        default=50,
+        help="Inner edge of flank region for linear flank correction.",
+    )
+    parser.add_argument(
+        "--flank_outer_bp",
+        type=int,
+        default=100,
+        help="Outer edge of flank region for linear flank correction.",
+    )
     parser.add_argument("--dpi", type=int, default=300)
 
-    # Model/training args that must match fine-tuning run
+    # Model/training args retained for CLI compatibility. The actual head/task config is now
+    # read from run_config.json via model_io, so these are accepted but not used to build the model.
     parser.add_argument("--pooling_mode", default="cls")
     parser.add_argument("--head_num_layers", type=int, default=1)
     parser.add_argument("--head_hidden_size", type=int, default=-1)
@@ -192,6 +191,7 @@ def parse_args():
     )
 
     return parser.parse_args()
+
 
 # -------------------------
 # Helpers
@@ -278,7 +278,7 @@ def remove_alibi_from_attention_probs(
         p_j = softmax(content_j - slope_h * abs(j - source_idx))
 
     Therefore:
-        content_softmax_j ∝ p_j * exp(slope_h * abs(j - source_idx))
+        content_softmax_j is proportional to p_j * exp(slope_h * abs(j - source_idx))
 
     This must be done per head before averaging heads.
     """
@@ -308,65 +308,6 @@ def remove_alibi_from_attention_probs(
     )
 
     return torch.softmax(debiased_logits, dim=-1)
-
-
-def find_best_or_final_model_file(checkpoint_dir):
-    checkpoint_dir = Path(checkpoint_dir)
-
-    trainer_state_path = checkpoint_dir / "trainer_state.json"
-    if trainer_state_path.exists():
-        with open(trainer_state_path) as f:
-            state = json.load(f)
-
-        best_ckpt = state.get("best_model_checkpoint")
-        if best_ckpt is not None:
-            best_ckpt = Path(best_ckpt)
-            for fname in ["model.safetensors", "pytorch_model.bin"]:
-                candidate = best_ckpt / fname
-                if candidate.exists():
-                    return candidate
-
-    for fname in ["model.safetensors", "pytorch_model.bin"]:
-        candidate = checkpoint_dir / fname
-        if candidate.exists():
-            return candidate
-
-    checkpoint_paths = []
-    for p in checkpoint_dir.glob("checkpoint-*"):
-        match = re.search(r"checkpoint-(\d+)$", str(p))
-        if match:
-            checkpoint_paths.append((int(match.group(1)), p))
-
-    if checkpoint_paths:
-        checkpoint_paths.sort()
-        latest = checkpoint_paths[-1][1]
-        for fname in ["model.safetensors", "pytorch_model.bin"]:
-            candidate = latest / fname
-            if candidate.exists():
-                return candidate
-
-    raise FileNotFoundError(f"Could not find model weights in {checkpoint_dir}")
-
-
-def load_model_weights(model, model_file, device):
-    model_file = Path(model_file)
-
-    if model_file.name.endswith(".safetensors"):
-        from safetensors.torch import load_file
-        state_dict = load_file(str(model_file), device=str(device))
-    else:
-        state_dict = torch.load(str(model_file), map_location=device)
-
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-
-    print(f"Loaded weights from: {model_file}")
-    print(f"Missing keys: {len(missing)}")
-    print(f"Unexpected keys: {len(unexpected)}")
-
-    if missing:
-        print("First missing keys:", missing[:10])
-    if unexpected:
-        print("First unexpected keys:", unexpected[:10])
 
 
 def select_examples(df, args):
@@ -418,8 +359,8 @@ def find_token_containing_position(sequence_ids, offsets, target_sequence_id, ba
     return hits[0] if hits else None
 
 
-def get_source_token_index(args, sequence_ids, offsets):
-    snv_pos = args.left_bp
+def get_source_token_index(args, sequence_ids, offsets, snv_offset):
+    snv_pos = snv_offset
     base_pos = args.source_base_pos if args.source_base_pos is not None else snv_pos
 
     if args.source_token == "cls":
@@ -537,7 +478,22 @@ def compute_attention_profile_for_example(model, tokenizer, row, args, device):
     offsets = encoding["offset_mapping"][0].tolist()
     sequence_ids = encoding.sequence_ids(0)
 
-    source_idx = get_source_token_index(args, sequence_ids, offsets)
+    # Per-example SNV offset (jitter-aware). The dataset engine records the realized offset
+    # of the variant within each stored sequence; analyze.py carries it through to the
+    # examples CSV. Falls back to --left_bp for centered runs whose CSV lacks the column.
+    if "anchor_offset_seq1" in row and pd.notna(row["anchor_offset_seq1"]):
+        snv_offset_seq1 = int(row["anchor_offset_seq1"])
+    else:
+        snv_offset_seq1 = args.left_bp
+
+    if "anchor_offset_seq2" in row and pd.notna(row["anchor_offset_seq2"]):
+        snv_offset_seq2 = int(row["anchor_offset_seq2"])
+    else:
+        snv_offset_seq2 = snv_offset_seq1
+
+    src_offset = snv_offset_seq2 if args.source_token in {"hap2_snv", "hap2_position"} else snv_offset_seq1
+
+    source_idx = get_source_token_index(args, sequence_ids, offsets, src_offset)
 
     if source_idx < 0 or source_idx >= len(tokens):
         raise ValueError(f"source_idx={source_idx} out of range for {len(tokens)} tokens")
@@ -618,9 +574,11 @@ def compute_attention_profile_for_example(model, tokenizer, row, args, device):
         "num_heads": int(n_total_heads),
         "selected_layers": ",".join(map(str, layer_indices)),
         "selected_heads": ",".join(map(str, head_indices)),
-        "prob_positive_recomputed": float(probs[1]),
+        "prob_positive_recomputed": float(probs[1]) if probs.numel() > 1 else float(probs[0]),
         "logit_0": float(outputs.logits[0, 0].detach().cpu()),
-        "logit_1": float(outputs.logits[0, 1].detach().cpu()),
+        "logit_1": float(outputs.logits[0, 1].detach().cpu()) if outputs.logits.shape[-1] > 1 else float("nan"),
+        "snv_offset_seq1": int(snv_offset_seq1),
+        "snv_offset_seq2": int(snv_offset_seq2),
     }
 
     if args.input_mode == "hap_pair":
@@ -637,6 +595,9 @@ def compute_attention_profile_for_example(model, tokenizer, row, args, device):
 
 
 def add_profile_rows(all_rows, example_id, row, profile_name, scores, args, info):
+    # Each profile is aligned to its own sequence's per-example SNV offset.
+    snv_off = info["snv_offset_seq2"] if profile_name == "hap2" else info["snv_offset_seq1"]
+
     for pos, value in enumerate(scores):
         all_rows.append({
             "example_id": example_id,
@@ -645,7 +606,7 @@ def add_profile_rows(all_rows, example_id, row, profile_name, scores, args, info
             "pred_label": int(row["pred_label"]),
             "profile": profile_name,
             "position": pos,
-            "position_relative_to_snv": pos - args.left_bp,
+            "position_relative_to_snv": pos - snv_off,
             "attention": float(value),
             "source_token_index": info["source_token_index"],
             "source_token": info["source_token"],
@@ -1000,31 +961,15 @@ def main():
         use_fast=True,
     )
 
-    print("Loading model...")
-    model = entexBERT2ForSequencePrediction(
-        model_name_or_path=args.model_name_or_path,
-        main_task="classification",
-        main_num_labels=2,
-        pooling_mode=args.pooling_mode,
-        head_num_layers=args.head_num_layers,
-        head_hidden_size=args.head_hidden_size,
-        head_activation=args.head_activation,
-        head_dropout=args.head_dropout,
+    print("Loading model (task/head from run_config.json)...")
+    run_config = model_io.apply_overrides(
+        model_io.load_run_config(args.checkpoint_dir),
+        {"model_name_or_path": args.model_name_or_path},  # the attention-extraction backbone
     )
-
-    model_file = find_best_or_final_model_file(args.checkpoint_dir)
-    model.to(device)
-    load_model_weights(model, model_file, device)
+    model = model_io.build_model(run_config, device=str(device))
+    weights_path = model_io.find_weights_file(args.checkpoint_dir)
+    model_io.load_model_weights(model, weights_path)
     model.eval()
-
-    # dtype guard for ALiBi-removal numerical stability
-    param_dtype = next(model.parameters()).dtype
-    print(f"[dtype check] model parameters: {param_dtype}")
-    if args.remove_alibi and param_dtype != torch.float32:
-        raise RuntimeError(
-            f"remove_alibi requires fp32 for numerically valid recovery; got {param_dtype}. "
-            f"Reload the model in float32 (avoid torch_dtype=float16/bf16 and autocast)."
-        )
 
     all_rows = []
     source_rows = []
@@ -1039,7 +984,7 @@ def main():
             device=device,
         )
 
-        example_id = row.get("example_index", local_idx)
+        example_id = row.get("example_id", row.get("example_index", local_idx))
 
         for profile_name, scores in profiles.items():
             add_profile_rows(
@@ -1125,7 +1070,7 @@ def main():
         )
 
     config = vars(args)
-    config["model_file"] = str(model_file)
+    config["model_file"] = str(weights_path)
 
     with open(output_dir / "attention_profile_config.json", "w") as f:
         json.dump(config, f, indent=2)

@@ -364,7 +364,10 @@ def parse_args():
                    choices=["per_class", "correct_incorrect", "confusion_cells"])
     p.add_argument("--n_per_category", type=int, default=100)
     p.add_argument("--n_quantiles", type=int, default=4)
-    p.add_argument("--deduplicate_inputs", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--deduplicate_inputs", dest="deduplicate_inputs", action="store_true", default=True,
+                   help="Drop duplicate input sequences before selecting top-N per category (default: on).")
+    p.add_argument("--no_deduplicate_inputs", dest="deduplicate_inputs", action="store_false",
+                   help="Disable deduplication of input sequences.")
     # pca
     p.add_argument("--pca_components", type=int, default=10)
     p.add_argument("--max_pca_examples", type=int, default=20000)
@@ -411,9 +414,16 @@ def main():
     idx, coords, evr = run_pca(embeddings, args.pca_components, args.max_pca_examples)
     pca_df = pd.DataFrame(coords, columns=[f"PC{i+1}" for i in range(coords.shape[1])])
     pca_df["target"] = np.asarray(target)[idx]
-    if "example_id" in df.columns:
-        pca_df["example_id"] = df["example_id"].to_numpy()[idx]
+    # Attach the per-example id and prediction category so pca.csv is self-sufficient
+    # for the PCA plots (no join back to predictions.csv needed for future runs).
+    for col in ("example_id", "confusion_category", "pred_label", "pred_class", "true_class"):
+        if col in df.columns:
+            pca_df[col] = df[col].to_numpy()[idx]
     pca_df.to_csv(os.path.join(args.output_dir, "pca.csv"), index=False)
+    pd.DataFrame({
+        "component": [f"PC{i+1}" for i in range(len(evr))],
+        "explained_variance_ratio": np.round(np.asarray(evr, dtype=float), 6),
+    }).to_csv(os.path.join(args.output_dir, "pca_explained_variance.csv"), index=False)
     print("PCA explained variance ratio:", np.round(evr, 4).tolist())
 
     # categories + selection
