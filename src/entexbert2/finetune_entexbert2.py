@@ -11,7 +11,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 ##########################################
 
-Last modified: 6/3/2026 by Amy Metrick
+Last modified: 6/18/2026 by Amy Metrick
 '''
 
 import os
@@ -1202,6 +1202,29 @@ def train():
     if training_args.save_model:
         trainer.save_state()
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
+
+        # Persist architecture/task config so analysis + plotting rebuild the exact model
+        run_config = {
+            "model_name_or_path": model_args.model_name_or_path,
+            "use_lora": model_args.use_lora,
+            "cache_dir": training_args.cache_dir,
+            "model_max_length": training_args.model_max_length,
+            "task": training_args.task,
+            "main_num_labels": training_args.main_num_labels,
+            "pooling_mode": training_args.pooling_mode,
+            "center_pool_width": training_args.center_pool_width,
+            "head_num_layers": training_args.head_num_layers,
+            "head_hidden_size": training_args.head_hidden_size,
+            "head_activation": training_args.head_activation,
+            "head_dropout": training_args.head_dropout,
+            "num_aux_tasks": training_args.num_aux_tasks,
+            "aux_task_names": training_args.aux_task_names,
+            "aux_task_types": training_args.aux_task_types,
+            "aux_num_labels": training_args.aux_num_labels,
+            "run_name": training_args.run_name,
+        }
+        with open(os.path.join(training_args.output_dir, "run_config.json"), "w") as f:
+            json.dump(run_config, f, indent=2)
 
     # get the evaluation results from trainer
     if training_args.eval_and_save_results:
