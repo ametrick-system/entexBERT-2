@@ -81,6 +81,13 @@ AS/1/H3K27ac/all_tissues/ref_single_classification_256_256/output/checkpoint-970
 AS/1/H3K27ac/all_tissues/ref_single_classification_256_256/output/checkpoint-9800/optimizer.pt
 AS/1/H3K27ac/all_tissues/ref_single_classification_256_256/output/checkpoint-9800/pytorch_model.bin
 AS/1/H3K27ac/all_tissues/ref_single_classification_256_256/output/pytorch_model.bin
+AS/1/POLR2A/all_tissues/ref_single_classification_256_256/output/checkpoint-1700/optimizer.pt
+AS/1/POLR2A/all_tissues/ref_single_classification_256_256/output/checkpoint-1700/pytorch_model.bin
+AS/1/POLR2A/all_tissues/ref_single_classification_256_256/output/checkpoint-3000/optimizer.pt
+AS/1/POLR2A/all_tissues/ref_single_classification_256_256/output/checkpoint-3000/pytorch_model.bin
+AS/1/POLR2A/all_tissues/ref_single_classification_256_256/output/checkpoint-3100/optimizer.pt
+AS/1/POLR2A/all_tissues/ref_single_classification_256_256/output/checkpoint-3100/pytorch_model.bin
+AS/1/POLR2A/all_tissues/ref_single_classification_256_256/output/pytorch_model.bin
 DNABERT-2-117M-attention/pytorch_model.bin
 __pycache__/
 src/entexbert2.egg-info/
