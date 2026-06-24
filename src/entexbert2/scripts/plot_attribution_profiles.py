@@ -58,13 +58,26 @@ def parse_args():
     p.add_argument("--no_deduplicate_inputs", dest="deduplicate_inputs", action="store_false")
 
     p.add_argument("--method", default="both", choices=["ism", "ig", "both"])
-    p.add_argument("--ism_mode", default="both", choices=["snv", "window", "both"])
+    p.add_argument("--ism_mode", default="both", choices=["snv", "window", "kmer", "both", "all"],
+                   help="snv/window = single-base; kmer = sliding k-bp ablation (redundancy probe); "
+                        "both = snv+window; all = snv+window+kmer.")
     p.add_argument("--ism_window_bp", type=int, default=100,
-                   help="Half-width of the windowed-ISM region around the SNV.")
+                   help="Half-width of the windowed-ISM / k-mer region around the SNV.")
     p.add_argument("--ism_reduce", default="max", choices=["max", "mean"],
                    help="Reduce the 3 alternate-base effects per position to one importance.")
     p.add_argument("--n_controls", type=int, default=25,
                    help="Random non-SNV positions per example for the SNV-vs-background comparison.")
+
+    # k-mer / motif-width ablation (length-preserving substitution; NO indels)
+    p.add_argument("--kmer_sizes", default="3,6,10,15",
+                   help="Comma-separated k-mer widths to sweep for --ism_mode kmer/all.")
+    p.add_argument("--kmer_replacement", default="dinuc", choices=["dinuc", "mono", "random"],
+                   help="How to ablate a k-mer block: dinuc/mono shuffle (on-manifold, composition-"
+                        "preserving) or random bases (off-manifold).")
+    p.add_argument("--kmer_n_shuffles", type=int, default=3,
+                   help="Ablations averaged per position (reduces single-shuffle noise).")
+    p.add_argument("--kmer_stride", type=int, default=1,
+                   help="Step between ablated centers across the window (>1 to cut cost).")
 
     p.add_argument("--score_mode", default="margin", choices=["margin", "pos_logit", "prob_pos"],
                    help="Scalar the attribution is computed against. margin = logit1 - logit0.")
@@ -238,6 +251,117 @@ def ism_snv_importance(ref_seq, snv_pos, score_fn, alt_base=None, n_controls=25,
 
 
 # -------------------------------------------------------------------
+# k-mer / motif-width ablation (length-preserving; NO indels)
+# -------------------------------------------------------------------
+def mono_shuffle(block, rng):
+    """Permute the bases in the block (preserves single-base composition)."""
+    chars = list(block)
+    rng.shuffle(chars)
+    return "".join(chars)
+
+
+def random_replace(block, rng):
+    """Replace with i.i.d. uniform ACGT (off-manifold; changes composition)."""
+    return "".join(rng.choice(BASES, size=len(block)))
+
+
+def dinuc_shuffle(block, rng):
+    """
+    Dinucleotide-preserving shuffle (Altschul-Erikson / Eulerian-walk), keeping the
+    first and last base fixed and preserving all adjacent-pair (dinucleotide) counts.
+    Falls back to mono_shuffle for blocks too short to shuffle meaningfully.
+    """
+    s = block.upper()
+    if len(s) <= 3:
+        return s  # too constrained to dinuc-shuffle with fixed ends; identity preserves counts
+    first, last = s[0], s[-1]
+    verts = set(s)
+    # adjacency multiset
+    edges = {v: [] for v in verts}
+    for a, b in zip(s[:-1], s[1:]):
+        edges[a].append(b)
+
+    # Find a "last edge" per vertex (!= last) so that following last-edges always
+    # reaches `last` without a cycle (an arborescence into `last`). Retry on failure.
+    for _attempt in range(50):
+        for v in verts:
+            rng.shuffle(edges[v])
+        last_edge = {v: edges[v][-1] for v in verts if v != last and edges[v]}
+        ok = True
+        for v in verts:
+            if v == last:
+                continue
+            seen, cur = set(), v
+            while cur != last:
+                if cur in seen or cur not in last_edge:
+                    ok = False
+                    break
+                seen.add(cur)
+                cur = last_edge[cur]
+            if not ok:
+                break
+        if ok:
+            break
+    else:
+        return s  # no valid arborescence found; identity preserves dinucleotide counts
+
+    # Per-vertex traversal order: shuffled edges with the reserved last-edge at the end.
+    order = {}
+    for v in verts:
+        lst = list(edges[v])
+        if v != last and v in last_edge:
+            lst.remove(last_edge[v])
+            lst.append(last_edge[v])
+        order[v] = lst
+
+    result = [first]
+    idx = {v: 0 for v in verts}
+    cur = first
+    for _ in range(len(s) - 1):
+        if idx[cur] >= len(order[cur]):
+            return s  # defensive; identity preserves dinucleotide counts
+        nxt = order[cur][idx[cur]]
+        idx[cur] += 1
+        result.append(nxt)
+        cur = nxt
+    return "".join(result)
+
+
+REPLACERS = {"dinuc": dinuc_shuffle, "mono": mono_shuffle, "random": random_replace}
+
+
+def kmer_ablation_window(ref_seq, snv_pos, window_bp, k, score_fn, replace_fn,
+                         n_shuffles, stride, rng, ref_score=None):
+    """Slide a length-k ablated block across the window; importance at each center =
+    mean |Delta score| over n_shuffles ablations. Centers are anchored on the SNV so
+    relative position 0 is always sampled. Pure orchestration (injected score_fn)."""
+    n = len(ref_seq)
+    if ref_score is None:
+        ref_score = float(score_fn([ref_seq])[0])
+
+    half = window_bp
+    centers = sorted(set(
+        c for c in range(snv_pos - half, snv_pos + half + 1, stride) if 0 <= c < n
+    ) | {snv_pos})
+
+    mut_seqs, owners = [], []
+    for c in centers:
+        start = c - k // 2
+        start = max(0, min(start, n - k)) if n >= k else 0
+        end = min(n, start + k)
+        for _ in range(n_shuffles):
+            new_block = replace_fn(ref_seq[start:end], rng)
+            mut_seqs.append(ref_seq[:start] + new_block + ref_seq[end:])
+            owners.append(c)
+
+    scores = score_fn(mut_seqs) if mut_seqs else np.array([])
+    by_c = {c: [] for c in centers}
+    for c, sc in zip(owners, scores):
+        by_c[c].append(abs(float(sc) - ref_score))
+    return {c: (float(np.mean(by_c[c])) if by_c[c] else 0.0) for c in centers}
+
+
+# -------------------------------------------------------------------
 # Integrated Gradients (companion). Token-level; baseline is per-token embedding.
 # -------------------------------------------------------------------
 def _find_word_embedding(backbone):
@@ -365,6 +489,31 @@ def plot_snv_vs_background(snv_df, out_path, dpi):
     print(f"Saved {out_path}")
 
 
+def plot_kmer_snv_vs_background(bar_df, out_path, dpi):
+    ks = sorted(bar_df["kmer_size"].unique())
+    cats = sorted(bar_df["confusion_category"].unique())
+    fig, axes = plt.subplots(1, len(ks), figsize=(3.6 * len(ks), 4), sharey=True)
+    if len(ks) == 1:
+        axes = [axes]
+    x = np.arange(len(cats))
+    for ax, k in zip(axes, ks):
+        sub = bar_df[bar_df.kmer_size == k].set_index("confusion_category")
+        snv = [sub.loc[c, "snv_kmer_mean"] if c in sub.index else np.nan for c in cats]
+        bg = [sub.loc[c, "background_kmer_mean"] if c in sub.index else np.nan for c in cats]
+        ax.bar(x - 0.2, snv, width=0.4, label="SNV-centered k-mer")
+        ax.bar(x + 0.2, bg, width=0.4, label="size-matched background")
+        ax.set_xticks(x)
+        ax.set_xticklabels(cats)
+        ax.set_title(f"k={k}")
+    axes[0].set_ylabel("mean |Δ score| (k-mer ablation)")
+    axes[-1].legend(fontsize=8)
+    fig.suptitle("k-mer ablation: SNV-centered vs size-matched background")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi)
+    plt.close(fig)
+    print(f"Saved {out_path}")
+
+
 # -------------------------------------------------------------------
 # Main
 # -------------------------------------------------------------------
@@ -393,8 +542,13 @@ def main():
 
     do_ism = args.method in ("ism", "both")
     do_ig = args.method in ("ig", "both")
+    want_window = args.ism_mode in ("window", "both", "all")
+    want_snv = args.ism_mode in ("snv", "both", "all")
+    want_kmer = args.ism_mode in ("kmer", "all")
+    kmer_sizes = [int(x) for x in str(args.kmer_sizes).split(",") if x.strip()]
+    replace_fn = REPLACERS[args.kmer_replacement]
 
-    ism_window_rows, snv_rows, ig_rows = [], [], []
+    ism_window_rows, snv_rows, ig_rows, kmer_rows = [], [], [], []
 
     for local_idx, row in sel.iterrows():
         seq = str(row["sequence"])
@@ -406,7 +560,7 @@ def main():
         cat = row["confusion_category"]
         ref_score = float(score_fn([seq])[0])
 
-        if do_ism and args.ism_mode in ("window", "both"):
+        if do_ism and want_window:
             imp, _ = ism_window_importance(seq, snv_off, args.ism_window_bp, score_fn,
                                            reduce=args.ism_reduce, ref_score=ref_score)
             for pos, val in imp.items():
@@ -414,7 +568,7 @@ def main():
                     "example_id": ex_id, "confusion_category": cat,
                     "position_relative_to_snv": pos - snv_off, "ism_importance": val})
 
-        if do_ism and args.ism_mode in ("snv", "both"):
+        if do_ism and want_snv:
             res = ism_snv_importance(seq, snv_off, score_fn, alt_base=example_alt_base(row),
                                      n_controls=args.n_controls, window_bp=args.ism_window_bp,
                                      rng=rng, ref_score=ref_score)
@@ -424,6 +578,16 @@ def main():
                 "snv_true_alt_delta": res["snv_true_alt_delta"],
                 "control_mean_abs_delta": res["control_mean_abs_delta"],
                 "control_n": res["control_n"], "ref_score": res["ref_score"]})
+
+        if do_ism and want_kmer:
+            for k in kmer_sizes:
+                prof = kmer_ablation_window(seq, snv_off, args.ism_window_bp, k, score_fn,
+                                            replace_fn, args.kmer_n_shuffles, args.kmer_stride,
+                                            rng, ref_score=ref_score)
+                for c, val in prof.items():
+                    kmer_rows.append({
+                        "example_id": ex_id, "confusion_category": cat, "kmer_size": k,
+                        "position_relative_to_snv": c - snv_off, "kmer_importance": val})
 
         if do_ig:
             ig_tok, offsets, sequence_ids, _ = integrated_gradients_tokens(
@@ -461,6 +625,43 @@ def main():
         plot_snv_vs_background(s, os.path.join(args.output_dir, "ism_snv_vs_background.png"), args.dpi)
         print("\nISM SNV-vs-background summary:")
         print(summ.to_string(index=False))
+
+    if kmer_rows:
+        kdf = pd.DataFrame(kmer_rows)
+        kdf.to_csv(os.path.join(args.output_dir, "ism_kmer_long.csv"), index=False)
+
+        # one realigned profile per k
+        for k in sorted(kdf["kmer_size"].unique()):
+            sub = kdf[kdf["kmer_size"] == k]
+            m = mean_profile(sub.rename(columns={"kmer_importance": "v"}), "v", args.plot_window_bp)
+            m.to_csv(os.path.join(args.output_dir, f"ism_kmer_k{k}_mean.csv"), index=False)
+            plot_profile(m, "v",
+                         f"k-mer ablation importance (k={k}, {args.kmer_replacement}, "
+                         f"{args.kmer_n_shuffles} shuffles)",
+                         os.path.join(args.output_dir, f"ism_kmer_k{k}_profile.png"), args.dpi)
+
+        # SNV-centered k-mer vs size-matched background (centers whose block can't overlap the SNV),
+        # derived from the same profile: SNV = importance at relative 0; background = mean over |rel| >= k.
+        bar_rows = []
+        for (cat, k), g in kdf.groupby(["confusion_category", "kmer_size"]):
+            per_ex_snv, per_ex_bg = [], []
+            for _ex, gex in g.groupby("example_id"):
+                at0 = gex.loc[gex["position_relative_to_snv"] == 0, "kmer_importance"]
+                far = gex.loc[gex["position_relative_to_snv"].abs() >= k, "kmer_importance"]
+                if len(at0):
+                    per_ex_snv.append(float(at0.mean()))
+                if len(far):
+                    per_ex_bg.append(float(far.mean()))
+            bar_rows.append({
+                "confusion_category": cat, "kmer_size": k,
+                "snv_kmer_mean": float(np.mean(per_ex_snv)) if per_ex_snv else float("nan"),
+                "background_kmer_mean": float(np.mean(per_ex_bg)) if per_ex_bg else float("nan"),
+                "n": len(per_ex_snv)})
+        bar_df = pd.DataFrame(bar_rows).sort_values(["kmer_size", "confusion_category"])
+        bar_df.to_csv(os.path.join(args.output_dir, "ism_kmer_snv_vs_background.csv"), index=False)
+        plot_kmer_snv_vs_background(bar_df, os.path.join(args.output_dir, "ism_kmer_snv_vs_background.png"), args.dpi)
+        print("\nk-mer SNV-vs-background (mean |Delta| at SNV vs non-overlapping background):")
+        print(bar_df.to_string(index=False))
 
     if ig_rows:
         g = pd.DataFrame(ig_rows)
