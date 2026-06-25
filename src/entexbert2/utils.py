@@ -116,6 +116,8 @@ def split_and_write_csvs(
     split_mode: str = "train_dev_test",
     exclude_loci: Optional[set] = None,
     dedup_sequences_across_splits: bool = True,
+    balance_spec: Optional["BalanceSpec"] = None,
+    balance_split: str = "all",
 ):
     """
     Write entexBERT-2 dataset CSVs.
@@ -259,6 +261,20 @@ def split_and_write_csvs(
         if total_dropped:
             print(f"cross-split dedup: removed {total_dropped} cross-split duplicate-sequence rows total.")
 
+    # Optionally balance ONLY the train split; dev/test stay at natural prevalence.
+    # (Runs after dedup so we balance the final training rows. The label column is "label"
+    # here, so we point the spec at it.)
+    if (split_mode == "train_dev_test" and balance_split == "train"
+            and balance_spec is not None and balance_spec.strategy != "none"
+            and "train.csv" in splits and not splits["train.csv"].empty):
+        from dataclasses import replace as _dc_replace
+        train_df = splits["train.csv"]
+        before, before_pos = len(train_df), int((train_df["label"] == 1).sum())
+        splits["train.csv"] = balance_as_table(train_df, _dc_replace(balance_spec, label_col="label"))
+        after = len(splits["train.csv"]); after_pos = int((splits["train.csv"]["label"] == 1).sum())
+        print(f"train-only balance ({balance_spec.strategy}): train {before} -> {after} rows "
+              f"(pos {before_pos} -> {after_pos}); dev/test left at natural prevalence.")
+
     # Minimal Trainer CSV columns vs. rich metadata CSV columns.
     final_cols = input_cols + ["label"] + aux_cols
     meta_out_cols = list(dict.fromkeys(final_cols + meta_cols + ["split"]))
@@ -384,9 +400,20 @@ def load_as_table(
         usecols=usecols,
         chunksize=chunksize,
     ):
-        mask = (chunk["assay"] == assay) & (chunk["donor"] == donor)
+        # assay: a single value; "ALL"/None to pool every assay for the donor;
+        # or a comma-separated string / list to pool a chosen subset.
+        donor_mask = chunk["donor"] == donor
+        if assay is None or (isinstance(assay, str) and assay.strip().upper() == "ALL"):
+            mask = donor_mask
+        elif isinstance(assay, (list, tuple, set)):
+            mask = donor_mask & chunk["assay"].isin(list(assay))
+        elif isinstance(assay, str) and "," in assay:
+            wanted = [a.strip() for a in assay.split(",") if a.strip()]
+            mask = donor_mask & chunk["assay"].isin(wanted)
+        else:
+            mask = donor_mask & (chunk["assay"] == assay)
 
-        if tissue is not None:
+        if tissue is not None and str(tissue).strip().upper() != "ALL":
             mask &= chunk["tissue"].eq(tissue)
 
         sub = chunk[mask].copy()
@@ -1056,6 +1083,7 @@ def build_dataset(
     window_spec: SNVWindowSpec,
     input_mode: str = "hap_pair",
     balance_spec: Optional[BalanceSpec] = None,
+    balance_split: str = "all",
     aux_labels: Optional[List[LabelSpec]] = None,
     split_ratio=(0.8, 0.1, 0.1),
     seed: int = 42,
@@ -1087,7 +1115,10 @@ def build_dataset(
         )
 
     df = row_source.load()
-    df = balance_as_table(df, balance_spec)
+    if balance_split == "all":
+        df = balance_as_table(df, balance_spec)
+    elif balance_split != "train":
+        raise ValueError(f"balance_split must be 'all' or 'train', got {balance_split!r}.")
     df = add_snv_windows(df, window_spec, seed=seed)
 
     # Compose-time label validation (post-windowing, so window columns are available).
@@ -1139,6 +1170,8 @@ def build_dataset(
         split_mode=split_mode,
         exclude_loci=exclude_loci,
         dedup_sequences_across_splits=dedup_sequences_across_splits,
+        balance_spec=balance_spec,
+        balance_split=balance_split,
     )
 
     return df

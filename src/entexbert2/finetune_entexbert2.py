@@ -5,13 +5,14 @@ found at https://github.com/MAGICS-LAB/DNABERT_2/blob/main/finetune/train.py
 This modified version supports:
 - Continuous label prediction via a linear regression head
 - Incorporation of auxiliary tasks during training following the LUPI framework
+- A Multi-Layer Perceptron head with several options for between-layer non-linearities
 
 All modifications to the original script are wrapped in comments in the following format:
 ### NEW: [description of modification] ###
 ...
 ##########################################
 
-Last modified: 6/18/2026 by Amy Metrick
+Last modified: 6/25/2026 by Amy Metrick
 '''
 
 import os
@@ -34,11 +35,12 @@ from peft import (
     get_peft_model_state_dict,
 )
 
-############### NEW: IMPORTS ###############
+####################### NEW IMPORTS ##############################
+import pandas as pd
 from functools import partial
 from scipy.stats import pearsonr, spearmanr
 from transformers.modeling_outputs import SequenceClassifierOutput
-############################################
+###################################################################
 
 @dataclass
 class ModelArguments:
@@ -82,6 +84,14 @@ class TrainingArguments(transformers.TrainingArguments):
     dataloader_pin_memory: bool = field(default=False)
     eval_and_save_results: bool = field(default=True)
     save_model: bool = field(default=False)
+    ######################## NEW: CLASS WEIGHTING FOR IMBALANCED DATASETS #########################
+    class_weights: str = field(
+        default="none",
+        metadata={"help": "Main classification-loss class weighting: 'none', 'balanced' "
+                  "(inverse-frequency from train.csv), or explicit comma-separated per-class "
+                  "weights e.g. '1.0,10.0'."},
+    )
+    ###############################################################################################
     seed: int = field(default=42)
 
     ######################### NEW: MAIN TASK (with regression and MLP support) #######################
@@ -587,8 +597,10 @@ def compute_metrics(main_task: str, eval_pred):
 
                 if len(np.unique(labels)) == 2:
                     metrics["auroc"] = sklearn.metrics.roc_auc_score(labels, pos_probs)
+                    metrics["auprc"] = sklearn.metrics.average_precision_score(labels, pos_probs)
                 else:
                     metrics["auroc"] = 0.0
+                    metrics["auprc"] = 0.0
 
             return metrics
 
@@ -600,8 +612,10 @@ def compute_metrics(main_task: str, eval_pred):
 
             if len(np.unique(labels)) == 2:
                 metrics["auroc"] = sklearn.metrics.roc_auc_score(labels, pos_probs)
+                metrics["auprc"] = sklearn.metrics.average_precision_score(labels, pos_probs)
             else:
                 metrics["auroc"] = 0.0
+                metrics["auprc"] = 0.0
 
             return metrics
 
@@ -839,6 +853,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
 
         self.main_task = main_task
         self.main_num_labels = main_num_labels
+        self.class_weights = None # optional torch.Tensor, set in main() for weighted loss
 
         self.aux_task_names = aux_task_names or []
         self.aux_task_types = aux_task_types or []
@@ -963,10 +978,16 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 if logits.ndim > 1 and logits.shape[-1] == 1:
                     logits = logits.squeeze(-1)
                 labels = labels.float()
-                return torch.nn.functional.binary_cross_entropy_with_logits(logits, labels)
+                pos_weight = None
+                if self.class_weights is not None and self.class_weights.numel() == 2:
+                    cw = self.class_weights.to(logits.device)
+                    pos_weight = cw[1] / cw[0]
+                return torch.nn.functional.binary_cross_entropy_with_logits(
+                    logits, labels, pos_weight=pos_weight)
 
             # Multiclass classification
-            return torch.nn.functional.cross_entropy(logits, labels)
+            weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
+            return torch.nn.functional.cross_entropy(logits, labels, weight=weight)
 
         else:
             raise ValueError(f"Unsupported main task: {self.main_task}")
@@ -1158,6 +1179,26 @@ def train():
         head_activation=training_args.head_activation,
         head_dropout=training_args.head_dropout,
     )
+
+    # Optional class weighting for the main classification loss
+    # (full natural-prevalence training without majority-class collapse)
+    # Computed from the TRAIN split only
+    if training_args.task == "classification" and str(training_args.class_weights).lower() != "none":
+        spec = str(training_args.class_weights).lower()
+        n_classes = main_num_labels if main_num_labels > 1 else 2
+        train_labels = pd.read_csv(os.path.join(data_args.data_path, "train.csv"))["label"].astype(int)
+        if spec == "balanced":
+            counts = (train_labels.value_counts()
+                      .reindex(range(n_classes), fill_value=0).to_numpy(dtype=float))
+            n = float(len(train_labels))
+            w = np.where(counts > 0, n / (n_classes * np.maximum(counts, 1.0)), 0.0)
+        else:
+            w = np.array([float(x) for x in spec.split(",")], dtype=float)
+            if len(w) != n_classes:
+                raise ValueError(f"--class_weights {spec!r} has {len(w)} values; expected {n_classes}.")
+        model.class_weights = torch.tensor(w, dtype=torch.float)
+        print(f"Main-loss class weights: {model.class_weights.tolist()} (spec={spec!r}, "
+              f"counts={train_labels.value_counts().to_dict()})")
 
     # configure LoRA on the backbone only
     if model_args.use_lora:

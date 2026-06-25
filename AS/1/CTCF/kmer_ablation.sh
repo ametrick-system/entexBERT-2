@@ -1,4 +1,4 @@
-OUT="$HOME/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_256_256_jitter50"
+OUT="$HOME/entexBERT-2/AS/1/CTCF/all_tissues/ref_single_classification_256_256_jitter50_baltrain"
 
 python $HOME/entexBERT-2/src/entexbert2/scripts/plot_attribution_profiles.py \
   --checkpoint_dir $OUT/output \

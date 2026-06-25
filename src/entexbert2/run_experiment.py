@@ -305,6 +305,9 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         label_col=bcfg.get("label_col", "imbalance_significance"),
         random_state=seed,
     )
+    balance_split = bcfg.get("apply_to", "all")  # "all" = balance before split; "train" = train only
+    if balance_split not in {"all", "train"}:
+        raise ValueError(f"balance.apply_to must be 'all' or 'train', got {balance_split!r}.")
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
 
@@ -338,6 +341,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         window_spec=window_spec,
         input_mode=input_mode,
         balance_spec=balance_spec,
+        balance_split=balance_split,
         aux_labels=aux_labels,
         split_ratio=split_ratio,
         seed=seed,

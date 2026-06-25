@@ -66,10 +66,11 @@ def detect_input_mode(columns):
 # Per-example predictions
 # ---------------------------------------------------------------------------
 
-def compute_predictions(task, num_labels, logits, labels):
+def compute_predictions(task, num_labels, logits, labels, threshold=0.5):
     """
     logits: np.ndarray [N, C] (C=1 for regression / single-logit binary).
     labels: np.ndarray [N] (float for regression, int otherwise).
+    threshold: decision threshold for binary pred_label (default 0.5).
     Returns a dict of new columns + a hidden 'rep_score' (higher = more representative).
     """
     flavor = task_flavor(task, num_labels)
@@ -87,7 +88,7 @@ def compute_predictions(task, num_labels, logits, labels):
             prob_pos = _sigmoid(logits[:, 0])
         else:
             prob_pos = _softmax(logits)[:, 1]
-        pred_label = (prob_pos >= 0.5).astype(int)
+        pred_label = (prob_pos >= threshold).astype(int)
         true = labels.astype(int)
         cat = np.where(
             (true == 1) & (pred_label == 1), "TP",
@@ -107,6 +108,40 @@ def compute_predictions(task, num_labels, logits, labels):
         out["correct"] = (pred_class == labels.astype(int)).astype(int)
 
     return out
+
+
+def pick_threshold(prob, labels, mode="f1"):
+    """
+    Choose a binary decision threshold on (prob, labels) by maximizing F1 or Youden's J.
+    Used to derive the operating point from the DEV set so TP/FP/TN/FN on the (imbalanced,
+    natural-prevalence) test set aren't all swept to negative by a fixed 0.5 cut.
+    Returns (threshold, dev_score).
+    """
+    prob = np.asarray(prob, dtype=float)
+    y = np.asarray(labels, dtype=int)
+    if len(np.unique(y)) < 2:
+        print("  pick_threshold: dev set has a single class; falling back to 0.5.")
+        return 0.5, float("nan")
+
+    if mode == "f1":
+        prec, rec, thr = skm.precision_recall_curve(y, prob)
+        if len(thr) == 0:
+            return 0.5, float("nan")
+        f1 = np.where((prec + rec) > 0, 2 * prec * rec / (prec + rec + 1e-12), 0.0)
+        f1t = f1[:-1]  # precision_recall_curve: thr has len = len(prec) - 1
+        i = int(np.argmax(f1t))
+        return float(thr[i]), float(f1t[i])
+
+    if mode == "youden":
+        fpr, tpr, thr = skm.roc_curve(y, prob)
+        j = tpr - fpr
+        i = int(np.argmax(j))
+        t = float(thr[i])
+        if not np.isfinite(t):  # roc_curve may emit +inf as the first threshold
+            t = 1.0
+        return t, float(j[i])
+
+    raise ValueError(f"unknown threshold mode {mode!r} (use 'f1' or 'youden').")
 
 
 # ---------------------------------------------------------------------------
@@ -357,6 +392,13 @@ def parse_args():
     p.add_argument("--num_labels", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--device", default="cuda")
+    # binary decision threshold for TP/FP/TN/FN (matters at natural prevalence)
+    p.add_argument("--threshold", default="0.5",
+                   help="Binary decision threshold: a float (e.g. 0.5), or 'f1'/'youden' to "
+                        "derive it from the dev set (max-F1 or Youden's J).")
+    p.add_argument("--dev_csv", default=None,
+                   help="Dev CSV for --threshold f1/youden. If omitted and data_csv ends in "
+                        "'test.csv', the sibling 'dev.csv' is used.")
     # selection
     p.add_argument("--selection_mode", default="auto",
                    choices=["auto", "confusion", "value_extremes", "residual_extremes", "quantile_bins"])
@@ -400,11 +442,42 @@ def main():
     if flavor == "multiclass":
         df["true_class"] = labels.astype(int)
 
-    pred = compute_predictions(task, num_labels, logits, labels)
+    # Resolve the binary decision threshold (only meaningful for binary).
+    threshold, thr_source = 0.5, "fixed_0.5"
+    ts = str(args.threshold).strip().lower()
+    if flavor == "binary":
+        if ts in ("f1", "youden"):
+            dev_csv = args.dev_csv
+            if dev_csv is None and args.data_csv.endswith("test.csv"):
+                dev_csv = args.data_csv[:-len("test.csv")] + "dev.csv"
+            if not dev_csv or not os.path.exists(dev_csv):
+                raise ValueError(f"--threshold {ts} needs a dev set; pass --dev_csv "
+                                 f"(inferred {dev_csv!r} not found).")
+            dev_df = load_data(dev_csv)
+            dtexts = ([[a, b] for a, b in zip(dev_df["sequence1"], dev_df["sequence2"])]
+                      if input_mode == "pair" else dev_df["sequence"].astype(str).tolist())
+            dev_logits, _, _ = run_inference(args.checkpoint_dir, dtexts,
+                                             args.batch_size, args.device, overrides)
+            dev_prob = (_sigmoid(dev_logits[:, 0]) if dev_logits.shape[1] == 1
+                        else _softmax(dev_logits)[:, 1])
+            threshold, score = pick_threshold(dev_prob, dev_df["label"].astype(int).to_numpy(), ts)
+            thr_source = f"dev_{ts}"
+            print(f"Dev-derived threshold ({ts}): {threshold:.4f} (dev score={score:.4f}) from {dev_csv}")
+        else:
+            threshold = float(ts)
+            thr_source = f"fixed_{threshold:g}"
+            print(f"Using fixed decision threshold: {threshold:.4f}")
+    elif ts in ("f1", "youden"):
+        print(f"NOTE: --threshold {ts} ignored for non-binary task ({flavor}).")
+
+    pred = compute_predictions(task, num_labels, logits, labels, threshold=threshold)
     for k, v in pred.items():
         df[k] = v
 
     metrics = compute_metrics(task, num_labels, labels, pred)
+    if flavor == "binary":
+        metrics["decision_threshold"] = float(threshold)
+        metrics["threshold_source"] = thr_source
     with open(os.path.join(args.output_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     print("Metrics:", json.dumps(metrics, indent=2))
