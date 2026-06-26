@@ -145,6 +145,10 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
         head_activation=run_config["head_activation"],
         head_dropout=run_config["head_dropout"],
     )
+    # Twin contrast mode (signed = head(alt)-head(ref); symmetric_abs = head(|pool(alt)-pool(ref)|)).
+    # Set as an attribute so logits_and_embeddings mirrors training even if the constructor
+    # predates this field.
+    model.contrast_mode = run_config.get("contrast_mode", "signed")
     return model.to(device)
 
 
@@ -175,17 +179,32 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def logits_and_embeddings(model, input_ids, attention_mask):
+def logits_and_embeddings(model, input_ids, attention_mask,
+                          input_ids_alt=None, attention_mask_alt=None):
     """
-    Run the backbone, pool with the model's own _pool_sequence_representation, and apply the
-    main head. Returns (logits, pooled_embedding). In eval mode dropout is identity, so this
-    matches the trained forward path exactly.
+    Score a sequence with the model's own backbone + pooling + head (eval mode -> dropout is
+    identity, so this matches the trained forward exactly).
+
+    TWIN / score-and-subtract: if alt inputs are given (ref_alt_pair), the prediction is the
+    SIGNED contrast head(alt) - head(ref), and the returned embedding is the contrast
+    pool(alt) - pool(ref) -- the representation the head's prediction is actually based on.
+    Single-sequence inference (alt=None) is unchanged.
     """
-    backbone_outputs = model.backbone(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        return_dict=True,
-    )
-    pooled = model._pool_sequence_representation(backbone_outputs, attention_mask=attention_mask)
-    logits = model.main_head(pooled)
+    def _score(ids, mask):
+        backbone_outputs = model.backbone(input_ids=ids, attention_mask=mask, return_dict=True)
+        pooled = model._pool_sequence_representation(backbone_outputs, attention_mask=mask)
+        return model.main_head(pooled), pooled
+
+    logits, pooled = _score(input_ids, attention_mask)
+    if input_ids_alt is not None:
+        logits_alt, pooled_alt = _score(input_ids_alt, attention_mask_alt)
+        if getattr(model, "contrast_mode", "signed") == "symmetric_abs":
+            # Symmetric contrast for a symmetric target (e.g. significance): the prediction is
+            # head(|pool(alt) - pool(ref)|), and the embedding is that symmetric contrast vector.
+            contrast = torch.abs(pooled_alt - pooled)
+            logits = model.main_head(contrast)
+            pooled = contrast
+        else:
+            logits = logits_alt - logits
+            pooled = pooled_alt - pooled
     return logits, pooled

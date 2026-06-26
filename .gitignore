@@ -8,6 +8,14 @@ AS/1/CTCF/all_tissues/hap_pair_classification/output/checkpoint-9500/pytorch_mod
 AS/1/CTCF/all_tissues/hap_pair_classification/output/checkpoint-9600/optimizer.pt
 AS/1/CTCF/all_tissues/hap_pair_classification/output/checkpoint-9600/pytorch_model.bin
 AS/1/CTCF/all_tissues/hap_pair_classification/output/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/input/train.csv
+AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/input/train.meta.csv
+AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3000/optimizer.pt
+AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3000/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3200/optimizer.pt
+AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3200/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3400/optimizer.pt
+AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3400/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-1800/optimizer.pt
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-1800/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9500/optimizer.pt
@@ -57,6 +65,9 @@ AS/1/CTCF/all_tissues/ref_single_classification_256_256_jitter50_baltrain/output
 AS/1/CTCF/all_tissues/ref_single_classification_256_256_jitter50_baltrain/output/checkpoint-9400/optimizer.pt
 AS/1/CTCF/all_tissues/ref_single_classification_256_256_jitter50_baltrain/output/checkpoint-9400/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification_256_256_jitter50_baltrain/output/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_single_control_256_256_jitter50_logtotal/output/checkpoint-1500/optimizer.pt
+AS/1/CTCF/all_tissues/ref_single_control_256_256_jitter50_logtotal/output/checkpoint-1500/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_single_control_256_256_jitter50_logtotal/output/pytorch_model.bin
 AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-100/optimizer.pt
 AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-100/pytorch_model.bin
 AS/1/CTCF/sigmoid_colon/hap_pair_classification_lupi_bigwig/output/checkpoint-200/optimizer.pt

@@ -144,6 +144,65 @@ def pick_threshold(prob, labels, mode="f1"):
     raise ValueError(f"unknown threshold mode {mode!r} (use 'f1' or 'youden').")
 
 
+def regression_as_call_eval(args, input_mode, overrides, test_df, test_pred):
+    """
+    Post-hoc bridge: map a SIGNED regression prediction back to the binary AS call.
+    Thresholds |prediction| (predicted allelic-effect magnitude, since imbalance_significance
+    is unsigned) against imbalance_significance, with the threshold chosen on DEV by max-F1.
+    Lets a regression run be compared to the classifier and the ASB benchmarks on one number.
+    Returns a metrics dict, or None if the AS column or dev set is unavailable.
+    """
+    sig_col = "imbalance_significance"
+    if sig_col not in test_df.columns:
+        print(f"  regression->AS-call: no '{sig_col}' column in test CSV; skipping "
+              f"(rebuild dataset so meta carries it).")
+        return None
+    dev_csv = args.dev_csv
+    if dev_csv is None and args.data_csv.endswith("test.csv"):
+        dev_csv = args.data_csv[:-len("test.csv")] + "dev.csv"
+    if not dev_csv or not os.path.exists(dev_csv):
+        print(f"  regression->AS-call: dev set not found ({dev_csv!r}); skipping.")
+        return None
+    dev_df = load_data(dev_csv)
+    if sig_col not in dev_df.columns:
+        print(f"  regression->AS-call: dev lacks '{sig_col}'; skipping.")
+        return None
+
+    # Threshold on dev: |pred| that best separates the AS call (max-F1).
+    dtexts = ([[a, b] for a, b in zip(dev_df["sequence1"], dev_df["sequence2"])]
+              if input_mode == "pair" else dev_df["sequence"].astype(str).tolist())
+    dev_logits, _, _ = run_inference(args.checkpoint_dir, dtexts,
+                                     args.batch_size, args.device, overrides)
+    dev_mag = np.abs(np.asarray(dev_logits, dtype=float).reshape(len(dev_df), -1)[:, 0])
+    dev_sig = dev_df[sig_col].astype(int).to_numpy()
+    thr, dev_f1 = pick_threshold(dev_mag, dev_sig, "f1")
+
+    test_mag = np.abs(np.asarray(test_pred["pred_value"], dtype=float))
+    test_sig = test_df[sig_col].astype(int).to_numpy()
+    call = (test_mag >= thr).astype(int)
+    out = {
+        "n_examples": int(len(test_sig)),
+        "n_pos": int(test_sig.sum()),
+        "prevalence": float(test_sig.mean()) if len(test_sig) else float("nan"),
+        "magnitude_threshold": float(thr),
+        "threshold_source": "dev_f1_on_abs_pred",
+        "dev_f1": float(dev_f1),
+    }
+    if len(np.unique(test_sig)) == 2:
+        out["auprc"] = float(skm.average_precision_score(test_sig, test_mag))
+        out["auroc"] = float(skm.roc_auc_score(test_sig, test_mag))
+        out["f1"] = float(skm.f1_score(test_sig, call, zero_division=0))
+        out["precision"] = float(skm.precision_score(test_sig, call, zero_division=0))
+        out["recall"] = float(skm.recall_score(test_sig, call, zero_division=0))
+        tn, fp, fn, tp = skm.confusion_matrix(test_sig, call, labels=[0, 1]).ravel()
+        out["confusion"] = {"tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp)}
+        print(f"  regression->AS-call: |pred| vs {sig_col}  AUPRC={out['auprc']:.4f} "
+              f"AUROC={out['auroc']:.4f} (prevalence={out['prevalence']:.4f}, thr={thr:.4f})")
+    else:
+        print(f"  regression->AS-call: test {sig_col} is single-class; AUPRC/AUROC undefined.")
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -345,13 +404,31 @@ def run_inference(checkpoint_dir, texts, batch_size, device, overrides):
     model, tokenizer, run_config = model_io.load_model_and_tokenizer(
         checkpoint_dir, device=device, overrides=overrides)
 
+    # Pair inputs (ref_alt_pair) are lists [ref, alt]; tokenize the two windows SEPARATELY and
+    # score-and-subtract (TWIN), matching training -- never [SEP]-concatenate, which buries the
+    # single-base allelic difference.
+    is_pair = len(texts) > 0 and isinstance(texts[0], (list, tuple))
+    mml = run_config.get("model_max_length", 512)
+
     all_logits, all_emb = [], []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
-        enc = tokenizer(batch, return_tensors="pt", padding="longest",
-                        max_length=run_config.get("model_max_length", 512), truncation=True)
-        logits, pooled = model_io.logits_and_embeddings(
-            model, enc["input_ids"].to(device), enc["attention_mask"].to(device))
+        if is_pair:
+            ref = [b[0] for b in batch]
+            alt = [b[1] for b in batch]
+            enc_r = tokenizer(ref, return_tensors="pt", padding="longest",
+                              max_length=mml, truncation=True)
+            enc_a = tokenizer(alt, return_tensors="pt", padding="longest",
+                              max_length=mml, truncation=True)
+            logits, pooled = model_io.logits_and_embeddings(
+                model, enc_r["input_ids"].to(device), enc_r["attention_mask"].to(device),
+                input_ids_alt=enc_a["input_ids"].to(device),
+                attention_mask_alt=enc_a["attention_mask"].to(device))
+        else:
+            enc = tokenizer(batch, return_tensors="pt", padding="longest",
+                            max_length=mml, truncation=True)
+            logits, pooled = model_io.logits_and_embeddings(
+                model, enc["input_ids"].to(device), enc["attention_mask"].to(device))
         all_logits.append(logits.detach().cpu().numpy())
         all_emb.append(pooled.detach().cpu().numpy())
 
@@ -478,6 +555,10 @@ def main():
     if flavor == "binary":
         metrics["decision_threshold"] = float(threshold)
         metrics["threshold_source"] = thr_source
+    if flavor == "regression":
+        as_call = regression_as_call_eval(args, input_mode, overrides, df, pred)
+        if as_call is not None:
+            metrics["as_call_from_regression"] = as_call
     with open(os.path.join(args.output_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
     print("Metrics:", json.dumps(metrics, indent=2))

@@ -146,7 +146,7 @@ def split_and_write_csvs(
     if split_mode == "train_dev_test" and not np.isclose(sum(split_ratio), 1.0):
         raise ValueError(f"split_ratio must sum to 1.0, got {split_ratio}.")
 
-    paired_modes = {"hap_pair", "ref_hap1_pair", "ref_hap2_pair"}
+    paired_modes = {"hap_pair", "ref_hap1_pair", "ref_hap2_pair", "ref_alt_pair"}
     input_cols = ["sequence1", "sequence2"] if input_mode in paired_modes else ["sequence"]
 
     # Columns we need to carry through, de-duplicated and order-preserved.
@@ -335,6 +335,15 @@ def hap2_count(row: pd.Series) -> float:
 def total_allele_reads(row: pd.Series) -> float:
     return hap1_count(row) + hap2_count(row)
 
+def log_total_count(row: pd.Series, pseudocount: float = 1.0) -> float:
+    """
+    Total binding depth at the SNV: log(ref_count + alt_count + 1) = log(total_allele_reads + 1).
+    NOT an allelic contrast -- it's a per-locus magnitude. Used as a single-sequence CONTROL
+    (ref_single input, no twin): if the backbone+head can't learn even this easy target, the
+    failure is systemic (LR / frozen backbone / scaling), not "the allelic contrast is too subtle."
+    """
+    return math.log(total_allele_reads(row) + pseudocount)
+
 def hap1_ratio(row: pd.Series) -> float:
     total = total_allele_reads(row)
     if total <= 0:
@@ -363,6 +372,46 @@ def imbalance_significance_label(row: pd.Series) -> int:
 
 def ref_allele_ratio_label(row: pd.Series) -> float:
     return float(row["ref_allele_ratio"])
+
+
+def alt_allele_of(row: pd.Series) -> Optional[str]:
+    """
+    The non-reference allele at a het-SNV: whichever of hap1_allele/hap2_allele differs
+    from ref_allele. Returns None for rows where alt is undefined (neither or both
+    haplotype alleles equal ref -- homozygous-looking or multiallelic rows), so callers
+    can skip them rather than emit a garbage contrast.
+    """
+    ref = str(row["ref_allele"]).upper()
+    h1 = str(row["hap1_allele"]).upper()
+    h2 = str(row["hap2_allele"]).upper()
+    non_ref = [a for a in (h1, h2) if a != ref]
+    if len(set(non_ref)) != 1:        # 0 (homozygous-ref) or 2 distinct (multiallelic) -> undefined
+        return None
+    return non_ref[0]
+
+def ref_count(row: pd.Series) -> float:
+    return get_base_count(row, row["ref_allele"])
+
+def alt_count(row: pd.Series) -> float:
+    alt = alt_allele_of(row)
+    if alt is None:
+        return float("nan")
+    return get_base_count(row, alt)
+
+def signed_log_alt_ref(row: pd.Series, pseudocount: float = 1.0) -> float:
+    """
+    deltaSVM-style signed allelic effect, REFERENCE-oriented:
+        log(alt_count + pc) - log(ref_count + pc)
+    Positive  -> the ALT allele binds more than REF (variant increases binding)
+    Negative  -> the ALT allele binds less than REF (variant decreases binding)
+    Returns NaN where alt is undefined (see alt_allele_of); such rows are dropped at
+    label-attach time. Pair this ONLY with a ref-first input (ref_alt_pair) so the
+    target sign and the input ordering agree.
+    """
+    alt = alt_allele_of(row)
+    if alt is None:
+        return float("nan")
+    return math.log(get_base_count(row, alt) + pseudocount) - math.log(ref_count(row) + pseudocount)
 
 def load_as_table(
     input_tsv: str,
@@ -633,6 +682,15 @@ def add_label_columns(
             values.append(spec.transform_fn(raw))
         df[spec.name] = values
 
+    # Drop rows whose PRIMARY label is undefined (e.g. signed_log_alt_ref returns NaN where
+    # alt is undefined). Safety net; ref_alt_pair already pre-filters these in add_sequence_inputs.
+    before = len(df)
+    df = df[pd.notna(df[primary_label.name])].copy()
+    dropped = before - len(df)
+    if dropped:
+        print(f"add_label_columns: dropped {dropped} rows with undefined primary label "
+              f"'{primary_label.name}'.")
+
     return df
 
 def make_haplotype_sequence(
@@ -682,7 +740,7 @@ def add_sequence_inputs(
     """
 
     single_modes = {"ref_single", "hap1_single", "hap2_single"}
-    paired_modes = {"hap_pair", "ref_hap1_pair", "ref_hap2_pair"}
+    paired_modes = {"hap_pair", "ref_hap1_pair", "ref_hap2_pair", "ref_alt_pair"}
 
     if input_mode not in single_modes and input_mode not in paired_modes:
         raise ValueError(f"Unsupported input_mode: {input_mode}")
@@ -700,6 +758,19 @@ def add_sequence_inputs(
     has_ref_allele = "ref_allele" in df.columns
 
     df = df.copy()
+
+    # ref_alt_pair builds a REFERENCE-vs-ALTERNATE contrast (sequence1=ref, sequence2=alt).
+    # It needs ref + haplotype alleles, and we drop rows where alt is undefined (homozygous-ref
+    # or multiallelic) so the contrast -- and the signed_log_alt_ref target -- stay well-posed.
+    if input_mode == "ref_alt_pair":
+        if not (has_alleles and has_ref_allele):
+            raise ValueError("ref_alt_pair needs ref_allele + hap1_allele/hap2_allele columns.")
+        alt_defined = df.apply(lambda r: alt_allele_of(r) is not None, axis=1)
+        n_drop = int((~alt_defined).sum())
+        if n_drop:
+            print(f"ref_alt_pair: dropping {n_drop} rows with undefined alt "
+                  f"(homozygous-ref / multiallelic).")
+        df = df[alt_defined].copy()
 
     sequences = []
     sequence1s = []
@@ -785,6 +856,14 @@ def add_sequence_inputs(
             sequence2s.append(hap2_seq)
             a1, s1, e1 = offset_extent(ref_allele)
             a2, s2, e2 = offset_extent(hap2_allele)
+
+        elif input_mode == "ref_alt_pair":
+            alt_allele = alt_allele_of(row)  # not None: undefined-alt rows dropped above
+            alt_seq = make_haplotype_sequence(ref_seq, snv_offset, alt_allele)
+            sequence1s.append(ref_seq)
+            sequence2s.append(alt_seq)
+            a1, s1, e1 = offset_extent(ref_allele)
+            a2, s2, e2 = offset_extent(alt_allele)
 
         else:
             raise ValueError(f"Unsupported input_mode: {input_mode}")
@@ -946,6 +1025,8 @@ AS_REGRESSION_TARGETS: Dict[str, Callable[[pd.Series], float]] = {
     "hap1_ratio": hap1_ratio,
     "ref_allele_ratio": ref_allele_ratio_label,
     "signed_log_count_ratio": signed_log_count_ratio,
+    "signed_log_alt_ref": signed_log_alt_ref,
+    "log_total_count": log_total_count,
     "abs_log_count_ratio": abs_log_count_ratio,
     "as_magnitude": as_magnitude_from_ratio,
 }
@@ -955,6 +1036,8 @@ _AS_COUNT_COLS = ["cA", "cC", "cG", "cT", "hap1_allele", "hap2_allele"]
 _AS_TARGET_REQUIREMENTS: Dict[str, List[str]] = {
     "hap1_ratio": _AS_COUNT_COLS,
     "signed_log_count_ratio": _AS_COUNT_COLS,
+    "signed_log_alt_ref": _AS_COUNT_COLS + ["ref_allele"],
+    "log_total_count": _AS_COUNT_COLS,
     "abs_log_count_ratio": _AS_COUNT_COLS,
     "as_magnitude": _AS_COUNT_COLS,
     "ref_allele_ratio": ["ref_allele_ratio"],
@@ -1028,7 +1111,7 @@ class SNVRowSource(RowSource):
     has_variants = True
     supported_input_modes = {
         "ref_single", "hap1_single", "hap2_single",
-        "hap_pair", "ref_hap1_pair", "ref_hap2_pair",
+        "hap_pair", "ref_hap1_pair", "ref_hap2_pair", "ref_alt_pair",
     }
 
     def __init__(
@@ -1145,7 +1228,7 @@ def build_dataset(
             group_cols=group_cols,
         )
 
-    paired = input_mode in {"hap_pair", "ref_hap1_pair", "ref_hap2_pair"}
+    paired = input_mode in {"hap_pair", "ref_hap1_pair", "ref_hap2_pair", "ref_alt_pair"}
     meta_cols = [
         "example_id", "locus_id", "feature_type",
         "anchor_offset_seq1", "feat_start_seq1", "feat_end_seq1",
@@ -1154,6 +1237,9 @@ def build_dataset(
         meta_cols += ["anchor_offset_seq2", "feat_start_seq2", "feat_end_seq2"]
     meta_cols += ["chr", "SNV", "ref_allele", "hap1_allele", "hap2_allele",
                   "tissue", "donor", "assay"]
+    # Carry the AS-call columns so a regression run can be mapped back to imbalance_significance
+    # post-hoc (threshold |prediction| -> AUPRC vs the binary call), and depth for stratification.
+    meta_cols += ["imbalance_significance", "ref_allele_ratio", "total_reads"]
     meta_cols = [c for c in meta_cols if c in df.columns]
 
     split_and_write_csvs(

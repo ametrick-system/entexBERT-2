@@ -91,6 +91,7 @@ class TrainingArguments(transformers.TrainingArguments):
                   "(inverse-frequency from train.csv), or explicit comma-separated per-class "
                   "weights e.g. '1.0,10.0'."},
     )
+    contrast_mode: str = field(default="signed")  # signed | symmetric_abs
     ###############################################################################################
     seed: int = field(default=42)
 
@@ -197,6 +198,8 @@ class TrainingArguments(transformers.TrainingArguments):
         metadata={"help": "Number of center tokens to mean-pool when pooling_mode='center_mean'."}
     )
     ###############################################################################################
+
+    remove_unused_columns: bool = field(default=False) # NEW: override HF default of True
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -344,16 +347,27 @@ class SupervisedDataset(Dataset):
                 if torch.distributed.get_rank() == 0:
                     torch.distributed.barrier()
 
-        output = tokenizer(
-            texts,
-            return_tensors="pt",
-            padding="longest",
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-        )
+        # NEW: for a sequence-pair, tokenize the ref and alt windows SEPARATELY (not [SEP]-concatenated)
+        self.is_pair = has_sequence_pair
+        if has_sequence_pair:
+            seqs_ref = [t[0] for t in texts] # sequence1 = REF window
+            seqs_alt = [t[1] for t in texts] # sequence2 = ALT window
+            out_ref = tokenizer(seqs_ref, return_tensors="pt", padding="longest",
+                                max_length=tokenizer.model_max_length, truncation=True)
+            out_alt = tokenizer(seqs_alt, return_tensors="pt", padding="longest",
+                                max_length=tokenizer.model_max_length, truncation=True)
+            self.input_ids = out_ref["input_ids"]
+            self.attention_mask = out_ref["attention_mask"]
+            self.input_ids_alt = out_alt["input_ids"]
+            self.attention_mask_alt = out_alt["attention_mask"]
+        else:
+            output = tokenizer(texts, return_tensors="pt", padding="longest",
+                               max_length=tokenizer.model_max_length, truncation=True)
+            self.input_ids = output["input_ids"]
+            self.attention_mask = output["attention_mask"]
+            self.input_ids_alt = None # NEW
+            self.attention_mask_alt = None # NEW
 
-        self.input_ids = output["input_ids"]
-        self.attention_mask = output["attention_mask"]
         self.labels = labels
         self.aux_labels = aux_labels # NEW
 
@@ -366,12 +380,15 @@ class SupervisedDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, i) -> Dict[str, Any]: # NEW: change return type to Any
-        #### NEW: SUPPORT FOR AUX LABELS ####
+        #### NEW: SUPPORT FOR AUX LABELS AND REF/ALT SEPARATION ####
         item = {
             "input_ids": self.input_ids[i],
             "attention_mask": self.attention_mask[i],
             "labels": self.labels[i],
         }
+        if getattr(self, "input_ids_alt", None) is not None:
+            item["input_ids_alt"] = self.input_ids_alt[i]
+            item["attention_mask_alt"] = self.attention_mask_alt[i]
 
         if len(self.aux_task_names) > 0:
             item["aux_labels"] = self.aux_labels[i]
@@ -408,6 +425,16 @@ class DataCollatorForSupervisedDataset(object):
             padding_value=0,
         )
 
+        # NEW: twin second sequence (alt window), if present
+        has_alt = "input_ids_alt" in instances[0]
+        if has_alt:
+            input_ids_alt = torch.nn.utils.rnn.pad_sequence(
+                [inst["input_ids_alt"] for inst in instances],
+                batch_first=True, padding_value=self.tokenizer.pad_token_id)
+            attention_mask_alt = torch.nn.utils.rnn.pad_sequence(
+                [inst["attention_mask_alt"] for inst in instances],
+                batch_first=True, padding_value=0)
+
         # main labels
         labels = [instance["labels"] for instance in instances]
         main_dtype = torch.float if self.main_task == "regression" else torch.long
@@ -418,6 +445,9 @@ class DataCollatorForSupervisedDataset(object):
             labels=labels,
             attention_mask=attention_mask,
         )
+        if has_alt: # NEW
+            batch["input_ids_alt"] = input_ids_alt
+            batch["attention_mask_alt"] = attention_mask_alt
 
         # auxiliary labels
         if len(aux_task_types) > 0:
@@ -848,6 +878,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         head_hidden_size: int = -1,
         head_activation: str = "gelu",
         head_dropout: float = 0.1,
+        contrast_mode: str = "signed",
     ):
         super().__init__()
 
@@ -867,6 +898,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         self.head_hidden_size = head_hidden_size
         self.head_activation = head_activation
         self.head_dropout = head_dropout
+
+        self.contrast_mode = contrast_mode
 
         if not (
             len(self.aux_task_names)
@@ -1012,6 +1045,18 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported auxiliary task type for {aux_name}: {aux_type}")
 
+
+    def _score(self, input_ids, attention_mask,
+               output_attentions=None, output_hidden_states=None, **kwargs):
+        backbone_outputs = self.backbone(
+            input_ids=input_ids, attention_mask=attention_mask, return_dict=True,
+            output_attentions=output_attentions, output_hidden_states=output_hidden_states,
+            **kwargs,
+        )
+        pooled = self._pool_sequence_representation(backbone_outputs, attention_mask=attention_mask)
+        pooled = self.dropout(pooled)
+        return self.main_head(pooled), pooled, backbone_outputs
+
     def forward(
         self,
         input_ids=None,
@@ -1020,30 +1065,43 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         aux_labels=None,
         output_attentions=None,
         output_hidden_states=None,
+        input_ids_alt=None,
+        attention_mask_alt=None,
         **kwargs,
     ):
-        backbone_outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_dict=True,
+        if not getattr(self, "_twin_logged", False):
+            self._twin_logged = True
+            print(f"[twin check] input_ids_alt is None? {input_ids_alt is None} "
+                  f"| extra batch keys: {sorted(kwargs.keys())}", flush=True)
+            if getattr(self, "_expect_twin", False) and input_ids_alt is None:
+                raise RuntimeError(
+                    "[twin check] expected a paired (ref_alt) batch but input_ids_alt did not "
+                    "reach forward -- the Trainer/collator dropped it. Set "
+                    "remove_unused_columns=False and check the collator's has_alt branch."
+                )
+
+        # Score the REF window (sequence1).
+        logits, pooled, backbone_outputs = self._score(
+            input_ids, attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             **kwargs,
         )
 
-        pooled = self._pool_sequence_representation(
-            backbone_outputs,
-            attention_mask=attention_mask,
-        )
-        pooled = self.dropout(pooled)
-
-        # Main task logits
-        logits = self.main_head(pooled)
-
-        # Auxiliary logits
-        aux_logits_dict = {}
-        for name in self.aux_task_names:
-            aux_logits_dict[name] = self.aux_heads[name](pooled)
+        # TWIN: if an ALT window is provided, the prediction is the SIGNED contrast
+        # head(alt) - head(ref). Shared weights, two passes, subtract -> deltaSVM-style.
+        if input_ids_alt is not None:
+            logits_alt, pooled_alt, _ = self._score(input_ids_alt, attention_mask_alt, **kwargs)
+            if getattr(self, "contrast_mode", "signed") == "symmetric_abs":
+                # symmetric contrast for a symmetric target (significance): head(|pool(alt)-pool(ref)|)
+                logits = self.main_head(torch.abs(pooled_alt - pooled))
+            else:
+                logits = logits_alt - logits          # signed (deltaSVM-style, regression twin)
+            aux_logits_dict = {}
+        else:
+            aux_logits_dict = {}
+            for name in self.aux_task_names:
+                aux_logits_dict[name] = self.aux_heads[name](pooled)
 
         total_loss = None
         loss_dict = {}
@@ -1178,6 +1236,7 @@ def train():
         head_hidden_size=training_args.head_hidden_size,
         head_activation=training_args.head_activation,
         head_dropout=training_args.head_dropout,
+        contrast_mode=training_args.contrast_mode,
     )
 
     # Optional class weighting for the main classification loss
@@ -1199,6 +1258,7 @@ def train():
         model.class_weights = torch.tensor(w, dtype=torch.float)
         print(f"Main-loss class weights: {model.class_weights.tolist()} (spec={spec!r}, "
               f"counts={train_labels.value_counts().to_dict()})")
+        model._expect_twin = (data_args.input_mode == "ref_alt_pair") if hasattr(data_args, "input_mode") else False
 
     # configure LoRA on the backbone only
     if model_args.use_lora:
@@ -1263,6 +1323,7 @@ def train():
             "aux_task_types": training_args.aux_task_types,
             "aux_num_labels": training_args.aux_num_labels,
             "run_name": training_args.run_name,
+            "contrast_mode": training_args.contrast_mode,
         }
         with open(os.path.join(training_args.output_dir, "run_config.json"), "w") as f:
             json.dump(run_config, f, indent=2)
