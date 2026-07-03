@@ -16,6 +16,12 @@ AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/o
 AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3200/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3400/optimizer.pt
 AS/1/CTCF/all_tissues/ref_alt_pair_regression_256_256_jitter50_signedlogaltref/output/checkpoint-3400/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_alt_pair_signif_256_256_jitter50_symmetric_abs_fullw/input/train.csv
+AS/1/CTCF/all_tissues/ref_alt_pair_signif_256_256_jitter50_symmetric_abs_fullw/input/train.meta.csv
+AS/1/CTCF/all_tissues/ref_alt_pair_signif_256_256_jitter50_symmetric_abs_fullw/output/checkpoint-1000/optimizer.pt
+AS/1/CTCF/all_tissues/ref_alt_pair_signif_256_256_jitter50_symmetric_abs_fullw/output/checkpoint-1000/pytorch_model.bin
+AS/1/CTCF/all_tissues/ref_alt_pair_signif_256_256_jitter50_symmetric_abs_fullw/output/checkpoint-4200/optimizer.pt
+AS/1/CTCF/all_tissues/ref_alt_pair_signif_256_256_jitter50_symmetric_abs_fullw/output/checkpoint-4200/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-1800/optimizer.pt
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-1800/pytorch_model.bin
 AS/1/CTCF/all_tissues/ref_single_classification/output/checkpoint-9500/optimizer.pt

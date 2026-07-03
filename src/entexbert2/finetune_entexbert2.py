@@ -1239,6 +1239,9 @@ def train():
         contrast_mode=training_args.contrast_mode,
     )
 
+    # Arm the twin assertion for ALL paired runs, regardless of task / class-weighting
+    model._expect_twin = (getattr(data_args, "input_mode", None) == "ref_alt_pair")
+
     # Optional class weighting for the main classification loss
     # (full natural-prevalence training without majority-class collapse)
     # Computed from the TRAIN split only
@@ -1258,7 +1261,6 @@ def train():
         model.class_weights = torch.tensor(w, dtype=torch.float)
         print(f"Main-loss class weights: {model.class_weights.tolist()} (spec={spec!r}, "
               f"counts={train_labels.value_counts().to_dict()})")
-        model._expect_twin = (data_args.input_mode == "ref_alt_pair") if hasattr(data_args, "input_mode") else False
 
     # configure LoRA on the backbone only
     if model_args.use_lora:
