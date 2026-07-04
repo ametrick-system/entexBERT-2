@@ -22,9 +22,7 @@ class LabelSpec:
 
     - fn: takes in a row-like object and returns the raw label value
     - transform_fn: applied after fn
-    - required_columns: columns the fn needs to be present on each row. Validated at
-      compose time against the row source's columns so an incompatible label
-      (e.g. an AS count label on a peak source with no allele counts) fails fast.
+    - required_columns: columns the fn needs to be present on each row (validated at compose time against the row source's columns)
     """
     name: str
     fn: Callable[[pd.Series], float]
@@ -66,9 +64,60 @@ class BalanceSpec:
     label_col: str = "imbalance_significance"
     random_state: int = 42
 
+@dataclass
+class PartitionSpec:
+    """
+    Hybrid cross-individual split:
+        - hold out whole chromosome(s) for TEST, bin the rest for TRAIN/DEV
+        - bin_size / salt / ratios travel in the resolved config
+        - K-fold-ready: fold_assignment maps every chromosome to a fold index and fold_id selects which fold is the current test set
+    """
+    enabled: bool = False
+    bin_size: int = 100_000
+    salt: str = "entexbert2_v1"
+    fold_assignment: Dict[str, int] = field(default_factory=dict)   # chromosome -> fold index
+    fold_id: int = 0                                                # which fold is TEST now
+    train_frac_within_nontest: float = 8.0 / 9.0                    # 8:1 train:dev within non-test
+
+
+def genomic_bin_id(chrom: str, pos: int, bin_size: int) -> str:
+    """
+    Deterministic genomic-bin id: chrom + which fixed-width tile the position falls in
+        - uses the genomic position (donor-invariant) so the same locus lands in the same bin for every individual
+    """
+    return f"{chrom}|{int(pos) // int(bin_size)}"
+
+
+def assign_split_column(df: pd.DataFrame, spec: "PartitionSpec") -> np.ndarray:
+    """
+    Per-row train/dev/test assignment for the hybrid partition:
+      1. locus on a held-out test chromosome (fold_assignment[chrom] == fold_id) -> 'test'
+      2. else hash its genomic bin (hashlib.sha1(salt|bin_id)) -> 'train'/'dev' by ratio.
+    
+    ** Deterministic and donor-invariant (keyed only on chrom + genomic position) -> cross-individual train,dev/test disjointness **
+    """
+    pos_col = "SNV" if "SNV" in df.columns else "ref_start"
+    chroms = df["chr"].astype(str).to_numpy()
+    positions = df[pos_col].astype(int).to_numpy()
+
+    train_frac = spec.train_frac_within_nontest
+    out = np.empty(len(df), dtype=object)
+
+    for i in range(len(df)):
+        c = chroms[i]
+        if spec.fold_assignment.get(c) == spec.fold_id:
+            out[i] = "test"
+            continue
+        bid = genomic_bin_id(c, positions[i], spec.bin_size)
+        h = int(hashlib.sha1(f"{spec.salt}|{bid}".encode()).hexdigest(), 16)
+        frac = (h % 1_000_000) / 1_000_000.0
+        out[i] = "train" if frac < train_frac else "dev"
+
+    return out
+
 def log1p_transform(x: float) -> float:
     """
-    Safe log1p transform for nonnegative signal.
+    log1p transform for nonnegative signal
     """
     x = float(x)
 
@@ -373,7 +422,6 @@ def imbalance_significance_label(row: pd.Series) -> int:
 def ref_allele_ratio_label(row: pd.Series) -> float:
     return float(row["ref_allele_ratio"])
 
-
 def alt_allele_of(row: pd.Series) -> Optional[str]:
     """
     The non-reference allele at a het-SNV: whichever of hap1_allele/hap2_allele differs
@@ -412,6 +460,32 @@ def signed_log_alt_ref(row: pd.Series, pseudocount: float = 1.0) -> float:
     if alt is None:
         return float("nan")
     return math.log(get_base_count(row, alt) + pseudocount) - math.log(ref_count(row) + pseudocount)
+
+def _neg_log10_bb(p, eps: float = 1e-300) -> float:
+    return -math.log10(max(float(p), eps))
+
+def neg_log10_p_betabinom(row: pd.Series) -> float:
+    """Privileged LUPI significance target -- NaN-EXCLUDE variant. -log10(p_betabinom); returns
+    NaN when p is missing so the row is DROPPED at label-attach (drop_aux_nan=True). This is the
+    baseline policy: untested sites are excluded, not relabeled 'balanced'. p_betabinom is a
+    per-SNV MEASUREMENT property (known at train, absent for a novel sequence) -> privileged.
+    Never use as a MAIN-task input."""
+    p = row["p_betabinom"]
+    return float("nan") if pd.isna(p) else _neg_log10_bb(p)
+
+def neg_log10_p_betabinom_fill0(row: pd.Series) -> float:
+    """Privileged LUPI significance target -- KEEP variant. -log10(p_betabinom), or 0.0 when p is
+    missing. Use ONLY together with the p_tested flag, so the model can distinguish a real 0
+    (tested & balanced) from a placeholder 0 (untested). For the 'keep untested rows as
+    negatives' policy."""
+    p = row["p_betabinom"]
+    return 0.0 if pd.isna(p) else _neg_log10_bb(p)
+
+def p_tested(row: pd.Series) -> int:
+    """Privileged binary flag: 1 if the site had a beta-binomial test (p_betabinom present) else 0.
+    Binary-valued; use it as an aux head with aux_task_type='binary'. Pairs with
+    neg_log10_p_betabinom_fill0 so 'testability' (a depth/power proxy) is its own privileged signal."""
+    return int(not pd.isna(row["p_betabinom"]))
 
 def load_as_table(
     input_tsv: str,
@@ -1029,6 +1103,9 @@ AS_REGRESSION_TARGETS: Dict[str, Callable[[pd.Series], float]] = {
     "log_total_count": log_total_count,
     "abs_log_count_ratio": abs_log_count_ratio,
     "as_magnitude": as_magnitude_from_ratio,
+    "neg_log10_p_betabinom": neg_log10_p_betabinom,
+    "neg_log10_p_betabinom_fill0": neg_log10_p_betabinom_fill0,
+    "p_tested": p_tested, # binary-valued; use with aux_task_type='binary'
 }
 
 # Columns each target needs present on a row (for compose-time validation).
@@ -1041,6 +1118,9 @@ _AS_TARGET_REQUIREMENTS: Dict[str, List[str]] = {
     "abs_log_count_ratio": _AS_COUNT_COLS,
     "as_magnitude": _AS_COUNT_COLS,
     "ref_allele_ratio": ["ref_allele_ratio"],
+    "neg_log10_p_betabinom": ["p_betabinom"],
+    "neg_log10_p_betabinom_fill0": ["p_betabinom"],
+    "p_tested": ["p_betabinom"],
 }
 
 
