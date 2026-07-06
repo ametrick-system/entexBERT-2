@@ -87,31 +87,52 @@ def genomic_bin_id(chrom: str, pos: int, bin_size: int) -> str:
     """
     return f"{chrom}|{int(pos) // int(bin_size)}"
 
-
 def assign_split_column(df: pd.DataFrame, spec: "PartitionSpec") -> np.ndarray:
     """
-    Per-row train/dev/test assignment for the hybrid partition:
-      1. locus on a held-out test chromosome (fold_assignment[chrom] == fold_id) -> 'test'
-      2. else hash its genomic bin (hashlib.sha1(salt|bin_id)) -> 'train'/'dev' by ratio.
-    
-    ** Deterministic and donor-invariant (keyed only on chrom + genomic position) -> cross-individual train,dev/test disjointness **
+    Assign a 'train'/'dev'/'test' label to every row for the hybrid partition, in two stages:
+      1. a locus on a held-out test chromosome (fold_assignment[chrom] == fold_id) -> 'test'
+      2. otherwise, hash its genomic bin -- int(sha1(f"{salt}|{genomic_bin_id(...)}"), 16) % 1e6 / 1e6
+         -- and send it to 'train' if that fraction < train_frac_within_nontest, else 'dev'
+
+    Deterministic and donor-invariant: the split depends only on (chrom, genomic position), so the
+    same locus lands in the same split across every (donor, assay) cell -> cross-individual
+    train/dev vs test disjointness by construction
+
+    Vectorized: sha1 is evaluated once per DISTINCT genomic bin (a few 1e4 genome-wide) rather than
+    once per row, via np.unique over int64-packed (chrom, bin) keys. The hashed string is identical
+    to the per-row form. Returns an object ndarray of length len(df)
     """
     pos_col = "SNV" if "SNV" in df.columns else "ref_start"
     chroms = df["chr"].astype(str).to_numpy()
-    positions = df[pos_col].astype(int).to_numpy()
+    positions = df[pos_col].astype("int64").to_numpy()
 
-    train_frac = spec.train_frac_within_nontest
-    out = np.empty(len(df), dtype=object)
+    n = len(df)
+    out = np.empty(n, dtype=object)
 
-    for i in range(len(df)):
-        c = chroms[i]
-        if spec.fold_assignment.get(c) == spec.fold_id:
-            out[i] = "test"
-            continue
-        bid = genomic_bin_id(c, positions[i], spec.bin_size)
-        h = int(hashlib.sha1(f"{spec.salt}|{bid}".encode()).hexdigest(), 16)
-        frac = (h % 1_000_000) / 1_000_000.0
-        out[i] = "train" if frac < train_frac else "dev"
+    # Stage 1 (vectorized): loci on a held-out test chromosome -> 'test'
+    test_chroms = [c for c, f in spec.fold_assignment.items() if f == spec.fold_id]
+    is_test = np.isin(chroms, test_chroms) if test_chroms else np.zeros(n, dtype=bool)
+    out[is_test] = "test"
+
+    # Stage 2 (vectorized): hash each UNIQUE genomic bin once, then map the fraction back to rows
+    nontest = ~is_test
+    if nontest.any():
+        bin_idx = positions[nontest] // int(spec.bin_size)                 # int64 tile index
+        chrom_codes, chrom_uniques = pd.factorize(chroms[nontest], sort=False)
+        offset = int(bin_idx.max()) + 1                                    # pack (chrom, bin) -> 1 int64
+        packed = chrom_codes.astype("int64") * offset + bin_idx
+        uniq, inverse = np.unique(packed, return_inverse=True)             # unique bins + row->bin map
+        uniq_frac = np.empty(uniq.shape[0], dtype="float64")
+        for j, val in enumerate(uniq.tolist()):
+            chrom = chrom_uniques[val // offset]
+            b = val % offset
+            # b == pos // bin_size, so genomic_bin_id(chrom, b*bin_size, bin_size) == f"{chrom}|{b}":
+            # one definition of the bin convention, evaluated per distinct bin (not per row).
+            bid = genomic_bin_id(chrom, int(b) * int(spec.bin_size), spec.bin_size)
+            h = int(hashlib.sha1(f"{spec.salt}|{bid}".encode()).hexdigest(), 16)
+            uniq_frac[j] = (h % 1_000_000) / 1_000_000.0
+        fracs = uniq_frac[inverse]
+        out[nontest] = np.where(fracs < spec.train_frac_within_nontest, "train", "dev")
 
     return out
 
@@ -149,7 +170,6 @@ def load_chrom_sizes(chrom_sizes_path: Optional[str]) -> Dict[str, int]:
             chrom_sizes[chrom] = int(size)
 
     return chrom_sizes
-
 
 def split_and_write_csvs(
     df: pd.DataFrame,
@@ -762,7 +782,14 @@ def add_label_columns(
     drop_aux_nan: bool = True,
 ) -> pd.DataFrame:
     """
-    Add primary and auxiliary label columns to the AS dataframe
+    Add primary and auxiliary label columns to the AS dataframe.
+
+    Rows whose PRIMARY label is NaN are always dropped (undefined target).
+    If drop_aux_nan is True (default), rows with a NaN in ANY auxiliary label are also dropped --
+    a NaN aux value would otherwise be written to the training CSV and yield a NaN loss/gradient.
+    This is also the mechanism behind the 'exclude untested sites' p_betabinom policy
+    (neg_log10_p_betabinom returns NaN for untested sites). Set drop_aux_nan=False to keep NaN aux
+    rows (e.g. when using neg_log10_p_betabinom_fill0 + p_tested instead).
     """
     df = df.copy()
     aux_labels = aux_labels or []
@@ -1298,6 +1325,10 @@ def build_dataset(
 
     Writes minimal Trainer CSVs + rich .meta.csv sidecars; returns the final DataFrame.
     Leakage prevention is on by default (group by locus_id); pass group_cols=[] to disable.
+
+    If partition_spec is given and enabled, a deterministic donor-invariant train/dev/test column
+    is computed (hold-out-chromosome TEST + hashed genomic bins for TRAIN/DEV) and takes priority
+    over the group-shuffle split. drop_aux_nan (default True) drops rows with a NaN auxiliary label.
     """
     balance_spec = balance_spec or BalanceSpec(strategy="none")
     aux_labels = aux_labels or []
