@@ -167,6 +167,7 @@ def split_and_write_csvs(
     dedup_sequences_across_splits: bool = True,
     balance_spec: Optional["BalanceSpec"] = None,
     balance_split: str = "all",
+    split_col: Optional[str] = None,
 ):
     """
     Write entexBERT-2 dataset CSVs.
@@ -200,6 +201,8 @@ def split_and_write_csvs(
 
     # Columns we need to carry through, de-duplicated and order-preserved.
     requested = input_cols + [label_col] + aux_cols + group_cols + meta_cols
+    if split_col is not None:
+        requested = requested + [split_col]
     required = list(dict.fromkeys(requested))
 
     missing = [c for c in required if c not in df.columns]
@@ -234,7 +237,23 @@ def split_and_write_csvs(
 
     rng = np.random.default_rng(seed)
 
-    if split_mode == "test_only":
+    if split_col is not None:
+        _vals = set(out[split_col].astype(str).unique())
+        _bad = _vals - {"train", "dev", "test"}
+        if _bad:
+            raise ValueError(
+                f"split_col {split_col!r} has unexpected values {sorted(_bad)}; "
+                f"expected only 'train'/'dev'/'test'."
+            )
+        splits = { 
+            "train.csv": out[out[split_col] == "train"].drop(columns=[split_col]).copy(),
+            "dev.csv":   out[out[split_col] == "dev"].drop(columns=[split_col]).copy(),
+            "test.csv":  out[out[split_col] == "test"].drop(columns=[split_col]).copy(),
+        }
+        _sizes = {k: len(v) for k, v in splits.items()}
+        print(f"Precomputed split via column {split_col!r}: {_sizes}")
+
+    elif split_mode == "test_only":
         splits = {"test.csv": out.copy()}
         print(f"test_only mode: {len(out)} examples -> test.csv")
 
@@ -740,6 +759,7 @@ def add_label_columns(
     df: pd.DataFrame,
     primary_label: LabelSpec,
     aux_labels: Optional[List[LabelSpec]] = None,
+    drop_aux_nan: bool = True,
 ) -> pd.DataFrame:
     """
     Add primary and auxiliary label columns to the AS dataframe
@@ -764,6 +784,17 @@ def add_label_columns(
     if dropped:
         print(f"add_label_columns: dropped {dropped} rows with undefined primary label "
               f"'{primary_label.name}'.")
+
+    # Drop rows with a NaN AUXILIARY label
+    #(an NaN aux value would otherwise be written into the training CSV and produce a NaN loss/gradient)
+    if drop_aux_nan and aux_labels:
+        aux_names = [s.name for s in aux_labels]
+        before = len(df)
+        df = df[df[aux_names].notna().all(axis=1)].copy()
+        dropped = before - len(df)
+        if dropped:
+            print(f"add_label_columns: dropped {dropped} rows with NaN aux label(s) "
+                  f"{aux_names} (drop_aux_nan=True).")
 
     return df
 
@@ -1255,6 +1286,8 @@ def build_dataset(
     split_mode: str = "train_dev_test",
     exclude_loci: Optional[set] = None,
     dedup_sequences_across_splits: bool = True,
+    partition_spec: Optional["PartitionSpec"] = None,
+    drop_aux_nan: bool = True,
 ) -> pd.DataFrame:
     """
     Source-agnostic dataset builder.
@@ -1297,9 +1330,17 @@ def build_dataset(
             f"Available columns: {sorted(df.columns)}"
         )
 
-    df = add_label_columns(df, primary_label=primary_label, aux_labels=aux_labels)
+    df = add_label_columns(df, primary_label=primary_label, aux_labels=aux_labels, drop_aux_nan=drop_aux_nan)
     df = add_sequence_inputs(df, ref_fasta=ref_fasta, input_mode=input_mode)
     df = add_locus_and_example_ids(df)
+
+    split_col = None
+    if partition_spec is not None and partition_spec.enabled:
+        df["_assigned_split"] = assign_split_column(df, partition_spec)
+        split_col = "_assigned_split"
+        _counts = pd.Series(df["_assigned_split"]).value_counts().to_dict()
+        print(f"partition_spec enabled (bin_size={partition_spec.bin_size}, "
+              f"fold_id={partition_spec.fold_id}): row-level split counts {_counts}")
 
     if group_cols:
         summarize_duplicate_as_windows(
@@ -1328,6 +1369,7 @@ def build_dataset(
         label_col=primary_label.name,
         input_mode=input_mode,
         aux_cols=[spec.name for spec in aux_labels],
+        split_col=split_col,
         split_ratio=split_ratio,
         seed=seed,
         skip_ambiguous=skip_ambiguous,
