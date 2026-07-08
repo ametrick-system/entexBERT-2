@@ -362,6 +362,10 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
 
+    # Optional hybrid cross-individual partition (held-out test chrom(s) + hashed genomic bins).
+    # None => fall back to the group-shuffle split. Everything dataset-specific is in the config.
+    partition_spec = build_partition_spec(cfg)
+
     # Head is derived from the label's task_type (single source of truth).
     head = resolve_head(cfg.get("head"), primary_label)
 
