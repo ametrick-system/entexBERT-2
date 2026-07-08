@@ -28,6 +28,13 @@ Example config:
             skip_ambiguous: true, exclude_loci_meta: []}
     head: {task: classification, num_labels: 2, head_num_layers: 1, head_hidden_size: -1}
 
+    # OPTIONAL hybrid cross-individual partition. Omit (or enabled: false) to use the split block
+    # above. When enabled it OVERRIDES the group-shuffle split: the chromosome(s) whose
+    # fold_assignment value == fold_id become TEST; the rest are hashed into train/dev. K-fold-ready
+    # — a later sweep just re-runs with a different fold_id. Nothing dataset-specific is in code.
+    partition: {enabled: true, bin_size: 100000, salt: entexbert2_v1, fold_id: 0,
+                fold_assignment: {chr7: 0, chr14: 0}}
+
 Label types (primary_label / each aux):
     as_class       : {type, name?}                                         (classification)
     as_regression  : {type, target, name?, transform?}                     (regression)
@@ -40,6 +47,7 @@ Label types (primary_label / each aux):
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -48,6 +56,7 @@ from pyfaidx import Fasta
 
 from entexbert2.utils import (
     BalanceSpec,
+    PartitionSpec,
     SNVWindowSpec,
     SNVRowSource,
     build_dataset,
@@ -207,6 +216,48 @@ def load_exclude_loci(meta_paths):
         loci.update(df["locus_id"].astype(str).tolist())
     return loci
 
+def build_partition_spec(cfg):
+    """
+    Build a PartitionSpec from an optional top-level `partition:` config block. Returns None when
+    the block is absent or partition.enabled is false (in which case build_dataset falls back to
+    the group-shuffle split — fully backward-compatible).
+
+    Nothing about any specific dataset lives in code: the held-out test chromosome(s), bin size,
+    salt, and active fold all come from the config. `fold_assignment` maps chromosome -> fold index;
+    the chromosome whose fold index == fold_id becomes the TEST set, the rest are hashed into
+    train/dev. Chromosome keys are coerced to str so YAML ints (e.g. `1:`) match the 'chr' column.
+
+    Config block (all keys optional; shown with PartitionSpec defaults):
+        partition:
+            enabled: true
+            bin_size: 100000
+            salt: entexbert2_v1
+            fold_id: 0
+            train_frac_within_nontest: 0.8888888888888888   # 8:1 train:dev
+            fold_assignment: {chr7: 0, chr14: 0}            # chrom -> fold index
+    """
+    pcfg = cfg.get("partition")
+    if not pcfg or not pcfg.get("enabled", False):
+        return None
+
+    raw_assignment = pcfg.get("fold_assignment", {}) or {}
+    fold_assignment = {str(k): int(v) for k, v in raw_assignment.items()}
+
+    fold_id = int(pcfg.get("fold_id", 0))
+    if fold_assignment and fold_id not in set(fold_assignment.values()):
+        raise ValueError(
+            f"partition.fold_id={fold_id} is not present in fold_assignment "
+            f"(folds {sorted(set(fold_assignment.values()))}); the TEST set would be empty."
+        )
+
+    return PartitionSpec(
+        enabled=True,
+        bin_size=int(pcfg.get("bin_size", 100_000)),
+        salt=str(pcfg.get("salt", "entexbert2_v1")),
+        fold_assignment=fold_assignment,
+        fold_id=fold_id,
+        train_frac_within_nontest=float(pcfg.get("train_frac_within_nontest", 8.0 / 9.0)),
+    )
 
 def resolve_head(head, primary_label):
     """
@@ -323,11 +374,22 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
           f"offset={window_spec.snv_offset_mode} jitter={window_spec.jitter_max_bp}")
     print(f"  split:      {split_mode} group={'locus' if group_cols else 'none'} "
           f"exclude={len(exclude_loci) if exclude_loci else 0} loci")
+
+    if partition_spec is not None:
+        _test_chroms = sorted(c for c, f in partition_spec.fold_assignment.items()
+                              if f == partition_spec.fold_id)
+        print(f"  partition:  hybrid bin_size={partition_spec.bin_size} "
+              f"fold_id={partition_spec.fold_id} test_chroms={_test_chroms} "
+              f"(overrides group-shuffle)")
     print(f"  output_dir: {output_dir}")
 
-    # Self-documenting manifest = the resolved config + derived head.
+    # Self-documenting manifest = the resolved config + derived head + resolved partition.
+    # partition_resolved captures the FULL fold_assignment actually used, so a run is re-derivable
+    # and a later K-fold sweep just re-runs with a different fold_id.
+    partition_resolved = dataclasses.asdict(partition_spec) if partition_spec is not None else None
     with open(os.path.join(output_dir, "experiment_config.json"), "w") as f:
         json.dump({"experiment": name, "resolved": cfg, "head_resolved": head,
+                   "partition_resolved": partition_resolved,
                    "ref_fasta": ref_fasta_path, "output_dir": output_dir}, f, indent=2)
 
     print("Loading reference FASTA...")
@@ -350,6 +412,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         split_mode=split_mode,
         exclude_loci=exclude_loci,
         dedup_sequences_across_splits=dedup_across_splits,
+        partition_spec=partition_spec,
     )
 
     print(f"\nDone. Final rows: {len(df)}")
