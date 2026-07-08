@@ -56,7 +56,7 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
     kmer: int = field(default=-1, metadata={"help": "k-mer for input sequence. -1 means not using k-mer."})
-
+    input_mode: str = field(default="hap_pair", metadata={"help": "ref_single | ref_alt_pair | hap_pair; used to arm the twin-batch assertion."}) # NEW
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -1089,7 +1089,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         )
 
         # TWIN: if an ALT window is provided, the prediction is the SIGNED contrast
-        # head(alt) - head(ref). Shared weights, two passes, subtract -> deltaSVM-style.
+        # head(alt) - head(ref). Shared weights, two passes, subtract -> deltaSVM-style
         if input_ids_alt is not None:
             logits_alt, pooled_alt, _ = self._score(input_ids_alt, attention_mask_alt, **kwargs)
             if getattr(self, "contrast_mode", "signed") == "symmetric_abs":
@@ -1097,11 +1097,12 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 logits = self.main_head(torch.abs(pooled_alt - pooled))
             else:
                 logits = logits_alt - logits          # signed (deltaSVM-style, regression twin)
-            aux_logits_dict = {}
-        else:
-            aux_logits_dict = {}
-            for name in self.aux_task_names:
-                aux_logits_dict[name] = self.aux_heads[name](pooled)
+        # Auxiliary heads read the REF pooled representation in BOTH paths: per-locus privileged
+        # signals (read depth, p_betabinom, effect magnitude) are properties of the locus, not of the
+        # ref/alt contrast. Computing them on `pooled` keeps twin and aux compatible
+        aux_logits_dict = {}
+        for name in self.aux_task_names:
+            aux_logits_dict[name] = self.aux_heads[name](pooled)
 
         total_loss = None
         loss_dict = {}
