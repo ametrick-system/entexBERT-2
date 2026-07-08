@@ -13,11 +13,8 @@ readme = "README.md"
 requires-python = ">=3.8"
 
 dependencies = [
-  "biopython",
-  "edlib",
-  "pyBigWig",
-  "pyfaidx",
-  "matplotlib",
+  "biopython", "edlib", "pyBigWig", "pyfaidx", "matplotlib",
+  "numpy", "pandas", "scikit-learn", "pyyaml", "scipy",
 ]
 
 [tool.setuptools.packages.find]
