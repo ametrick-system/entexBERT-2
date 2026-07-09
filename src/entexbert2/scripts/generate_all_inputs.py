@@ -76,7 +76,7 @@ def dataset_id(dataset):
     return "__".join(_sanitize(p) for p in parts)
 
 
-def load_cells(args, cfg):
+def load_datasets(args, cfg):
     """Dataset list from --datasets_csv (preferred) or a `datasets:` block in the config. Exactly one required."""
     if args.datasets_csv:
         datasets = []
@@ -114,7 +114,7 @@ def load_cells(args, cfg):
     return uniq, source
 
 
-def make_cell_cfg(base_cfg, dataset, base_output_dir, fold_id):
+def make_dataset_cfg(base_cfg, dataset, base_output_dir, fold_id):
     """Deep-copy the base config, override ONLY the row-source selectors + output_dir. Partition untouched."""
     cfg = copy.deepcopy(base_cfg)
     cfg.pop("datasets", None)  # the per-dataset config describes a single dataset
@@ -144,11 +144,11 @@ def main():
     else:
         test_chroms = None
 
-    datasets, cells_source = load_cells(args, base_cfg)
+    datasets, datasets_source = load_datasets(args, base_cfg)
     if args.limit is not None:
         datasets = datasets[:args.limit]
 
-    print(f"generate_all_inputs: {len(datasets)} dataset(s) from {cells_source}")
+    print(f"generate_all_inputs: {len(datasets)} dataset(s) from {datasets_source}")
     print(f"  base output_dir: {base_output_dir}")
     if shared_partition is not None:
         print(f"  SHARED partition: bin_size={shared_partition.bin_size} fold_id={fold_id} "
@@ -165,15 +165,15 @@ def main():
     results = []
     for i, dataset in enumerate(datasets, 1):
         cid = dataset_id(dataset)
-        cell_cfg = make_cell_cfg(base_cfg, dataset, base_output_dir, fold_id)
-        out = cell_cfg["output_dir"]
+        dataset_cfg = make_dataset_cfg(base_cfg, dataset, base_output_dir, fold_id)
+        out = dataset_cfg["output_dir"]
         if args.skip_existing and os.path.exists(os.path.join(out, "train.csv")):
             print(f"\n[{i}/{len(datasets)}] SKIP {cid} (train.csv exists)")
             results.append({"dataset": dataset, "dataset_id": cid, "output_dir": out, "status": "skipped"})
             continue
         print(f"\n[{i}/{len(datasets)}] BUILD {cid}")
         try:
-            df = run_from_config(cell_cfg, ref_fasta=args.ref_fasta)
+            df = run_from_config(dataset_cfg, ref_fasta=args.ref_fasta)
             results.append({"dataset": dataset, "dataset_id": cid, "output_dir": out,
                             "status": "ok", "n_rows": int(len(df))})
         except Exception as e:
@@ -188,7 +188,7 @@ def main():
     os.makedirs(base_output_dir, exist_ok=True)
     manifest = {
         "base_config": args.config,
-        "cells_source": cells_source,
+        "datasets_source": datasets_source,
         "fold_id": fold_id,
         "shared_partition_resolved": (
             {"enabled": shared_partition.enabled, "bin_size": shared_partition.bin_size,
