@@ -373,7 +373,7 @@ def split_and_write_csvs(
     final_cols = input_cols + ["label"] + aux_cols
     if depth_col is not None:
         final_cols = final_cols + ["depth"]
-        
+
     meta_out_cols = list(dict.fromkeys(final_cols + meta_cols + ["split"]))
 
     os.makedirs(output_dir, exist_ok=True)
@@ -1324,6 +1324,7 @@ def build_dataset(
     dedup_sequences_across_splits: bool = True,
     partition_spec: Optional["PartitionSpec"] = None,
     drop_aux_nan: bool = True,
+    depth_col: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Source-agnostic dataset builder.
@@ -1420,6 +1421,7 @@ def build_dataset(
         dedup_sequences_across_splits=dedup_sequences_across_splits,
         balance_spec=balance_spec,
         balance_split=balance_split,
+        depth_col=depth_col,
     )
 
     return df

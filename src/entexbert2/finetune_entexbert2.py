@@ -1038,8 +1038,14 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                     w = depth.clamp(min=1.0)
                     w = w / w.mean()
                     return (w * (logits - labels) ** 2).mean()
-                # default: Gaussian NLL with depth-tied log-variance + learnable global bias
-                s = -torch.log(depth.clamp(min=1.0)) + self.logvar_bias
+                # default: Gaussian NLL with depth-tied log-variance + learnable global bias.
+                # Normalize depth to mean 1 (like weighted_mse) so the loss is invariant to the
+                # arbitrary count scale and well-conditioned at init (exp(-s)~O(1), not ~O(depth));
+                # logvar_bias still absorbs the absolute variance scale. Without this the init
+                # gradient is ~mean(depth)x too large and the NLL DIVERGES on a real net.
+                dn = depth.clamp(min=1.0)
+                dn = dn / dn.mean()
+                s = -torch.log(dn) + self.logvar_bias
                 return (0.5 * torch.exp(-s) * (logits - labels) ** 2 + 0.5 * s).mean()
             return torch.nn.functional.mse_loss(logits, labels)
 
