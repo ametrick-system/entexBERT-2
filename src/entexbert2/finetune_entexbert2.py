@@ -12,7 +12,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 ##########################################
 
-Last modified: 6/25/2026 by Amy Metrick
+Last modified: 7/14/2026 by Amy Metrick
 '''
 
 import os
@@ -93,8 +93,18 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     contrast_mode: str = field(default="signed")  # signed | symmetric_abs
     ###############################################################################################
+    ############################ NEW: HETEROSCEDASTIC REGRESSION HEAD #############################
+    heteroscedastic: bool = field(default=False, metadata={"help":
+        "Regression only: depth-supervised loss (down-weights low-depth/noisy loci). "
+        "Requires a 'depth' column in the CSVs (set depth_col in the build config)."})
+    hetero_loss: str = field(default="nll", metadata={"help":
+        "Which depth-supervised loss when heteroscedastic=True: "
+        "'nll' (Gaussian NLL, mu + depth-tied log-variance + learnable bias) or "
+        "'weighted_mse' (precision-weighted GLS: mean(depth_norm*(y-mu)^2); simpler, "
+        "same mean predictor, no logvar_bias). Both give identical mean gradients up to a "
+        "global scale; weighted_mse has fewer moving parts."})
+    ##############################################################################################
     seed: int = field(default=42)
-
     ######################### NEW: MAIN TASK (with regression and MLP support) #######################
     task: str = field(
         default="regression",
@@ -255,9 +265,10 @@ class SupervisedDataset(Dataset):
         tokenizer: transformers.PreTrainedTokenizer,
         kmer: int = -1,
         task: str = "classification",
-        aux_task_names: Optional[List[str]] = None,
-        aux_task_types: Optional[List[str]] = None,
-    ): # NEW: ADD TASK, AUX INFO
+        aux_task_names: Optional[List[str]] = None, # NEW
+        aux_task_types: Optional[List[str]] = None, # NEW
+        heteroscedastic: bool = False, # NEW
+    ):
 
         super(SupervisedDataset, self).__init__()
 
@@ -265,6 +276,7 @@ class SupervisedDataset(Dataset):
         self.task = task
         self.aux_task_names = aux_task_names or []
         self.aux_task_types = aux_task_types or []
+        self.heteroscedastic = heteroscedastic
 
         # ensure task name list is same size as task type list
         if len(self.aux_task_names) != len(self.aux_task_types):
@@ -308,6 +320,15 @@ class SupervisedDataset(Dataset):
             labels = [int(row["label"]) for row in data]
         else:
             raise ValueError(f"Unsupported main task: {task}")
+        
+        # NEW: depth for the heteroscedastic head (read only when requested)
+        if self.heteroscedastic:
+            if "depth" not in data[0]:
+                raise ValueError("heteroscedastic=True but no 'depth' column in "
+                                 f"{data_path} (set depth_col in the build config).")
+            self.depth = [float(row["depth"]) for row in data]
+        else:
+            self.depth = None
         
         # auxiliary labels
         aux_labels = []
@@ -380,7 +401,7 @@ class SupervisedDataset(Dataset):
         return len(self.input_ids)
 
     def __getitem__(self, i) -> Dict[str, Any]: # NEW: change return type to Any
-        #### NEW: SUPPORT FOR AUX LABELS AND REF/ALT SEPARATION ####
+        #### NEW: SUPPORT FOR AUX LABELS, REF/ALT SEPARATION, HETEROSCEDASTIC HEAD ####
         item = {
             "input_ids": self.input_ids[i],
             "attention_mask": self.attention_mask[i],
@@ -392,6 +413,9 @@ class SupervisedDataset(Dataset):
 
         if len(self.aux_task_names) > 0:
             item["aux_labels"] = self.aux_labels[i]
+        
+        if getattr(self, "depth", None) is not None:
+            item["depth"] = self.depth[i]
 
         return item
 
@@ -474,6 +498,10 @@ class DataCollatorForSupervisedDataset(object):
                 batched_aux_labels.append(aux_tensor)
 
             batch["aux_labels"] = batched_aux_labels
+
+        # NEW: for heteroscedastic head
+        if "depth" in instances[0]:
+            batch["depth"] = torch.tensor([inst["depth"] for inst in instances], dtype=torch.float)
 
         return batch
 
@@ -900,6 +928,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         self.head_dropout = head_dropout
 
         self.contrast_mode = contrast_mode
+        self.heteroscedastic = False   # set from training_args in main()
+        self.logvar_bias = torch.nn.Parameter(torch.zeros(1))  # 'b' in s = -log(depth)+b
 
         if not (
             len(self.aux_task_names)
@@ -996,11 +1026,21 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         else:
             raise ValueError(f"Unsupported pooling_mode: {self.pooling_mode}")
 
-    def _compute_main_loss(self, logits, labels):
+    def _compute_main_loss(self, logits, labels, depth=None):
         if self.main_task == "regression":
             if logits.ndim > 1 and logits.shape[-1] == 1:
                 logits = logits.squeeze(-1)
             labels = labels.float()
+            if getattr(self, "heteroscedastic", False) and depth is not None:
+                if getattr(self, "hetero_loss", "nll") == "weighted_mse":
+                    # precision-weighted GLS: weight each locus by depth (normalized to mean 1
+                    # so the overall loss scale / effective LR is unchanged). No logvar_bias.
+                    w = depth.clamp(min=1.0)
+                    w = w / w.mean()
+                    return (w * (logits - labels) ** 2).mean()
+                # default: Gaussian NLL with depth-tied log-variance + learnable global bias
+                s = -torch.log(depth.clamp(min=1.0)) + self.logvar_bias
+                return (0.5 * torch.exp(-s) * (logits - labels) ** 2 + 0.5 * s).mean()
             return torch.nn.functional.mse_loss(logits, labels)
 
         elif self.main_task == "classification":
@@ -1067,6 +1107,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         output_hidden_states=None,
         input_ids_alt=None,
         attention_mask_alt=None,
+        depth=None,
         **kwargs,
     ):
         if not getattr(self, "_twin_logged", False):
@@ -1109,7 +1150,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
 
         # Main loss
         if labels is not None:
-            main_loss = self._compute_main_loss(logits, labels)
+            main_loss = self._compute_main_loss(logits, labels, depth=depth)
             total_loss = main_loss
             loss_dict["main_loss"] = main_loss.detach()
 
@@ -1187,6 +1228,7 @@ def train():
         task=training_args.task,
         aux_task_names=training_args.aux_task_names,
         aux_task_types=training_args.aux_task_types,
+        heteroscedastic=training_args.heteroscedastic,
     )
 
     val_dataset = SupervisedDataset(
@@ -1196,6 +1238,7 @@ def train():
         task=training_args.task,
         aux_task_names=training_args.aux_task_names,
         aux_task_types=training_args.aux_task_types,
+        heteroscedastic=training_args.heteroscedastic,
     )
 
     test_dataset = SupervisedDataset(
@@ -1205,6 +1248,7 @@ def train():
         task=training_args.task,
         aux_task_names=training_args.aux_task_names,
         aux_task_types=training_args.aux_task_types,
+        heteroscedastic=training_args.heteroscedastic,
     )
 
     data_collator = DataCollatorForSupervisedDataset(
@@ -1239,6 +1283,10 @@ def train():
         head_dropout=training_args.head_dropout,
         contrast_mode=training_args.contrast_mode,
     )
+
+    # For heteroscedastic regression head functionality
+    model.heteroscedastic = training_args.heteroscedastic
+    model.hetero_loss = training_args.hetero_loss   # "nll" | "weighted_mse"
 
     # Arm the twin assertion for ALL paired runs, regardless of task / class-weighting
     model._expect_twin = (getattr(data_args, "input_mode", None) == "ref_alt_pair")

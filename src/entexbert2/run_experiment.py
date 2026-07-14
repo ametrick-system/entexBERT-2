@@ -361,6 +361,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         raise ValueError(f"balance.apply_to must be 'all' or 'train', got {balance_split!r}.")
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
+    depth_col = cfg.get("depth_col") # e.g. "total_reads" for the heteroscedastic head
 
     # Optional hybrid cross-individual partition (held-out test chrom(s) + hashed genomic bins).
     # None => fall back to the group-shuffle split. Everything dataset-specific is in the config.
@@ -417,6 +418,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         exclude_loci=exclude_loci,
         dedup_sequences_across_splits=dedup_across_splits,
         partition_spec=partition_spec,
+        depth_col=depth_col,
     )
 
     print(f"\nDone. Final rows: {len(df)}")

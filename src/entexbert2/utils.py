@@ -188,6 +188,7 @@ def split_and_write_csvs(
     balance_spec: Optional["BalanceSpec"] = None,
     balance_split: str = "all",
     split_col: Optional[str] = None,
+    depth_col: Optional[str] = None,
 ):
     """
     Write entexBERT-2 dataset CSVs.
@@ -219,10 +220,13 @@ def split_and_write_csvs(
     paired_modes = {"hap_pair", "ref_hap1_pair", "ref_hap2_pair", "ref_alt_pair"}
     input_cols = ["sequence1", "sequence2"] if input_mode in paired_modes else ["sequence"]
 
-    # Columns we need to carry through, de-duplicated and order-preserved.
+    # Columns we need to carry through, de-duplicated and order-preserved
     requested = input_cols + [label_col] + aux_cols + group_cols + meta_cols
     if split_col is not None:
         requested = requested + [split_col]
+    if depth_col is not None:
+        requested = requested + [depth_col]
+
     required = list(dict.fromkeys(requested))
 
     missing = [c for c in required if c not in df.columns]
@@ -231,6 +235,8 @@ def split_and_write_csvs(
 
     out = df[required].copy()
     out = out.rename(columns={label_col: "label"})
+    if depth_col is not None and depth_col != "depth":
+        out = out.rename(columns={depth_col: "depth"}) # rename to a stable name
 
     # meta_cols may reference label_col under its original name; after rename use "label".
     meta_cols = ["label" if c == label_col else c for c in meta_cols]
@@ -363,8 +369,11 @@ def split_and_write_csvs(
         print(f"train-only balance ({balance_spec.strategy}): train {before} -> {after} rows "
               f"(pos {before_pos} -> {after_pos}); dev/test left at natural prevalence.")
 
-    # Minimal Trainer CSV columns vs. rich metadata CSV columns.
+    # Minimal Trainer CSV columns vs. rich metadata CSV columns
     final_cols = input_cols + ["label"] + aux_cols
+    if depth_col is not None:
+        final_cols = final_cols + ["depth"]
+        
     meta_out_cols = list(dict.fromkeys(final_cols + meta_cols + ["split"]))
 
     os.makedirs(output_dir, exist_ok=True)
