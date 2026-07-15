@@ -250,6 +250,9 @@ def build_partition_spec(cfg):
             f"(folds {sorted(set(fold_assignment.values()))}); the TEST set would be empty."
         )
 
+    # boundary_bp defaults to the window half-width (max of left/right) when boundary exclusion is on
+    _wcfg = cfg.get("window", {}) or {}
+    _default_bp = max(int(_wcfg.get("left_bp", 0)), int(_wcfg.get("right_bp", 0)))
     return PartitionSpec(
         enabled=True,
         bin_size=int(pcfg.get("bin_size", 100_000)),
@@ -257,6 +260,10 @@ def build_partition_spec(cfg):
         fold_assignment=fold_assignment,
         fold_id=fold_id,
         train_frac_within_nontest=float(pcfg.get("train_frac_within_nontest", 8.0 / 9.0)),
+        bin_test_frac=float(pcfg.get("bin_test_frac", 0.0)),
+        bin_dev_frac=float(pcfg.get("bin_dev_frac", 0.0)),
+        exclude_boundary=bool(pcfg.get("exclude_boundary", False)),
+        boundary_bp=int(pcfg.get("boundary_bp", _default_bp)),
     )
 
 def resolve_head(head, primary_label):

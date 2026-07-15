@@ -78,6 +78,16 @@ class PartitionSpec:
     fold_assignment: Dict[str, int] = field(default_factory=dict)   # chromosome -> fold index
     fold_id: int = 0                                                # which fold is TEST now
     train_frac_within_nontest: float = 8.0 / 9.0                    # 8:1 train:dev within non-test
+    # --- pure genomic-bin 3-way split (used only when NO chromosome is held out) ---
+    # When fold_assignment yields no test chromosomes AND bin_test_frac > 0, the bin hash assigns
+    # test/dev/train directly (all chromosomes contribute to every split). Leaves the chromosome-
+    # holdout path untouched (bin_test_frac == 0 -> old 2-way train/dev behavior).
+    bin_test_frac: float = 0.0     # fraction of bins -> test  (e.g. 0.10)
+    bin_dev_frac: float = 0.0      # fraction of bins -> dev   (e.g. 0.10); train = 1 - test - dev
+    # --- boundary-leakage control: drop loci whose [pos-boundary_bp, pos+boundary_bp] window
+    #     crosses a bin edge (near-identical windows can otherwise land in different splits) ---
+    exclude_boundary: bool = False
+    boundary_bp: int = 0           # half-window; set to max(left_bp, right_bp)
 
 
 def genomic_bin_id(chrom: str, pos: int, bin_size: int) -> str:
@@ -132,7 +142,25 @@ def assign_split_column(df: pd.DataFrame, spec: "PartitionSpec") -> np.ndarray:
             h = int(hashlib.sha1(f"{spec.salt}|{bid}".encode()).hexdigest(), 16)
             uniq_frac[j] = (h % 1_000_000) / 1_000_000.0
         fracs = uniq_frac[inverse]
-        out[nontest] = np.where(fracs < spec.train_frac_within_nontest, "train", "dev")
+        pure_bin = (len(test_chroms) == 0) and (spec.bin_test_frac > 0)
+        if pure_bin:
+            tf, dv = spec.bin_test_frac, spec.bin_dev_frac
+            out[nontest] = np.where(
+                fracs < tf, "test",
+                np.where(fracs < tf + dv, "dev", "train"),
+            )
+        else:
+            out[nontest] = np.where(fracs < spec.train_frac_within_nontest, "train", "dev")
+
+    # Boundary exclusion: mark loci whose window straddles a bin edge for dropping. Applied only to
+    # hashed (nontest) rows -- whole-chromosome test sets are boundary-free by construction. The
+    # sentinel "__exclude__" is dropped in build_dataset before split_and_write_csvs (which validates
+    # the split column against exactly {train,dev,test}).
+    if spec.exclude_boundary and spec.boundary_bp > 0:
+        bp = int(spec.boundary_bp); bs = int(spec.bin_size)
+        home = positions // bs
+        same_bin = ((positions - bp) // bs == home) & ((positions + bp) // bs == home)
+        out[nontest & ~same_bin] = "__exclude__"
 
     return out
 
@@ -1382,6 +1410,12 @@ def build_dataset(
         _counts = pd.Series(df["_assigned_split"]).value_counts().to_dict()
         print(f"partition_spec enabled (bin_size={partition_spec.bin_size}, "
               f"fold_id={partition_spec.fold_id}): row-level split counts {_counts}")
+        if (df["_assigned_split"] == "__exclude__").any():
+            _n0 = len(df)
+            df = df[df["_assigned_split"] != "__exclude__"].copy()
+            print(f"  boundary exclusion: dropped {_n0 - len(df)} loci whose window "
+                  f"straddled a {partition_spec.bin_size}bp bin edge "
+                  f"(boundary_bp={partition_spec.boundary_bp})")
 
     if group_cols:
         summarize_duplicate_as_windows(
