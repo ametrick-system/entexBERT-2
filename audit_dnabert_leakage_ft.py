@@ -99,26 +99,57 @@ def audit_indiv(indiv_dir):
     nlab = all_df.groupby("hash")["label"].nunique()
     conflict_hashes = set(nlab[nlab > 1].index)
 
+    # test_files_for returns test.txt FIRST, then numeric subdirs 1..N in order, so the
+    # first entry is the within-individual primary test and the rest are the paper's
+    # cross-donor resamples (SNPs exclusive to other donors), each EVALUATED SEPARATELY.
+    names = list(test_dfs.keys())
     fracs, rowcounts, conflicts = [], [], []
-    for name, t in test_dfs.items():
+    per_set = {}          # name -> leaked fraction, kept individually
+    for name in names:
+        t = test_dfs[name]
         leaked = int(t["hash"].isin(trainval).sum())
-        fracs.append(leaked / max(len(t), 1))
-        rowcounts.append(len(t))
+        frac = leaked / max(len(t), 1)
+        fracs.append(frac); rowcounts.append(len(t))
         conflicts.append(len(set(t["hash"]) & trainval & conflict_hashes))
+        per_set[name] = frac
     val_leak = int(val["hash"].isin(train_set).sum()) / max(len(val), 1)
 
-    return {
+    # split primary (within-individual) from the cross-donor resample sets
+    primary_name = names[0] if names and os.path.basename(names[0]) == "test.txt" \
+                   and os.path.dirname(names[0]) == "" else None
+    if primary_name is not None:
+        primary_leak = per_set[primary_name]
+        cross = [per_set[n] for n in names if n != primary_name]
+    else:                                   # fallback: no bare test.txt found
+        primary_leak = float(np.min(fracs))
+        cross = fracs
+
+    out = {
         "train_rows": len(train), "train_unique": train["hash"].nunique(),
         "val_rows": len(val), "val_unique": val["hash"].nunique(),
-        "n_test_files": len(test_dfs),
+        "n_test_files": len(test_dfs), "n_crossdonor_sets": len(cross),
         "test_rows_mean": float(np.mean(rowcounts)),
         "val_leaked_frac": val_leak,
+        # within-individual held-out test.txt (matches the paper's ~0.79 regime)
+        "primary_test_leaked_frac": float(primary_leak),
+        # per-set-then-average across the cross-donor resamples (matches the paper's
+        # 0.6876 regime: 10 sets each evaluated separately, then averaged)
+        "crossdonor_leaked_frac_mean": float(np.mean(cross)),
+        "crossdonor_leaked_frac_std": float(np.std(cross, ddof=1)) if len(cross) > 1 else 0.0,
+        "crossdonor_leaked_frac_min": float(np.min(cross)),
+        "crossdonor_leaked_frac_max": float(np.max(cross)),
+        # kept for backward-compat / spread across ALL 11 files
         "test_leaked_frac_mean": float(np.mean(fracs)),
         "test_leaked_frac_min": float(np.min(fracs)),
         "test_leaked_frac_max": float(np.max(fracs)),
         "train_within_dup_frac": (len(train) - train["hash"].nunique()) / max(len(train), 1),
         "label_conflict_seqs_in_test_mean": float(np.mean(conflicts)),
     }
+    # each individual cross-donor set as its own column (crossdonor_set_01 ...)
+    cross_names = [n for n in names if n != primary_name] if primary_name is not None else names
+    for i, n in enumerate(cross_names, 1):
+        out[f"crossdonor_set_{i:02d}"] = float(per_set[n])
+    return out
 
 
 def main():
@@ -148,29 +179,40 @@ def main():
                     continue
                 res.update({"k": k, "assay": assay, "train_indiv": indiv})
                 rows.append(res)
-                print(f"  k={k} {assay:16s} indiv={indiv:3s} test-leak {res['test_leaked_frac_mean']*100:5.1f}%  "
-                      f"val-leak {res['val_leaked_frac']*100:5.1f}%  "
-                      f"(train {res['train_rows']}/{res['train_unique']}u, {res['n_test_files']} test files)")
+                print(f"  k={k} {assay:16s} indiv={indiv:3s} "
+                      f"primary {res['primary_test_leaked_frac']*100:5.1f}%  "
+                      f"cross-donor {res['crossdonor_leaked_frac_mean']*100:5.1f}%"
+                      f"(+/-{res['crossdonor_leaked_frac_std']*100:.0f})  "
+                      f"val {res['val_leaked_frac']*100:5.1f}%  "
+                      f"(train {res['train_rows']}/{res['train_unique']}u, {res['n_crossdonor_sets']} cross sets)")
 
     if not rows:
         sys.exit("No datasets audited — check --base_dir / layout (expects <k>/<assay>/<indiv>/train.txt,val.txt,test.txt).")
     df = pd.DataFrame(rows)
-    cols = ["k", "assay", "train_indiv", "train_rows", "train_unique", "val_rows", "val_unique",
-            "n_test_files", "test_rows_mean", "test_leaked_frac_mean", "test_leaked_frac_min",
-            "test_leaked_frac_max", "val_leaked_frac", "train_within_dup_frac",
-            "label_conflict_seqs_in_test_mean"]
-    df = df[cols].sort_values(["k", "assay", "train_indiv"])
+    lead = ["k", "assay", "train_indiv", "train_rows", "train_unique", "val_rows", "val_unique",
+            "n_test_files", "n_crossdonor_sets", "test_rows_mean", "val_leaked_frac",
+            "primary_test_leaked_frac", "crossdonor_leaked_frac_mean", "crossdonor_leaked_frac_std",
+            "crossdonor_leaked_frac_min", "crossdonor_leaked_frac_max",
+            "test_leaked_frac_mean", "test_leaked_frac_min", "test_leaked_frac_max",
+            "train_within_dup_frac", "label_conflict_seqs_in_test_mean"]
+    set_cols = sorted([c for c in df.columns if c.startswith("crossdonor_set_")])
+    cols = lead + set_cols
+    df = df[[c for c in cols if c in df.columns]].sort_values(["k", "assay", "train_indiv"])
     out_csv = os.path.join(args.out_dir, f"{args.out_prefix}_leakage_by_dataset.csv")
     df.to_csv(out_csv, index=False)
 
-    print("\n=== OVERALL ===")
+    print("\n=== OVERALL (two regimes, matched to the paper) ===")
     print(f"datasets audited: {len(df)}")
-    print(f"mean test-leakage: {df['test_leaked_frac_mean'].mean()*100:.1f}%  "
-          f"(range {df['test_leaked_frac_mean'].min()*100:.0f}-{df['test_leaked_frac_mean'].max()*100:.0f}%)")
-    print("\n=== per-assay mean test-leakage (avg over k and train_indiv) ===")
-    pa = (df.groupby("assay")["test_leaked_frac_mean"].mean().sort_values(ascending=False) * 100)
-    for a, v in pa.items():
-        print(f"  {a:16s} {v:5.1f}%")
+    print(f"WITHIN-INDIVIDUAL primary test.txt leak: {df['primary_test_leaked_frac'].mean()*100:.1f}%  "
+          f"(range {df['primary_test_leaked_frac'].min()*100:.0f}-{df['primary_test_leaked_frac'].max()*100:.0f}%)")
+    print(f"CROSS-DONOR 10-set average leak (per-set-then-average): "
+          f"{df['crossdonor_leaked_frac_mean'].mean()*100:.1f}%  "
+          f"(range {df['crossdonor_leaked_frac_mean'].min()*100:.0f}-{df['crossdonor_leaked_frac_mean'].max()*100:.0f}%)")
+    print("\n=== per-assay (avg over k and train_indiv): within | cross-donor ===")
+    pa = (df.groupby("assay")[["primary_test_leaked_frac", "crossdonor_leaked_frac_mean"]]
+            .mean().sort_values("crossdonor_leaked_frac_mean", ascending=False) * 100)
+    for a, r in pa.iterrows():
+        print(f"  {a:16s} within {r['primary_test_leaked_frac']:5.1f}%   cross-donor {r['crossdonor_leaked_frac_mean']:5.1f}%")
     print(f"\nwrote {out_csv}")
 
     # heatmap: one panel per k, assay (rows) x train_indiv (cols)
@@ -183,13 +225,14 @@ def main():
     assays = sorted(df["assay"].unique())
     fig, axes = plt.subplots(1, len(ks), figsize=(3.0*len(ks)+1.2, 0.42*len(assays)+1.6),
                              squeeze=False, constrained_layout=True)
-    vmax = max(1.0, df["test_leaked_frac_mean"].max()*100)
+    metric = "crossdonor_leaked_frac_mean"
+    vmax = max(1.0, df[metric].max()*100)
     im = None
     for j, k in enumerate(ks):
         ax = axes[0][j]; sub = df[df["k"] == k]
         M = np.full((len(assays), len(indivs)), np.nan)
         for _, r in sub.iterrows():
-            M[assays.index(r["assay"]), indivs.index(r["train_indiv"])] = r["test_leaked_frac_mean"]*100
+            M[assays.index(r["assay"]), indivs.index(r["train_indiv"])] = r[metric]*100
         im = ax.imshow(M, cmap="Reds", vmin=0, vmax=vmax, aspect="auto")
         ax.set_xticks(range(len(indivs))); ax.set_xticklabels(indivs, rotation=45, ha="right", fontsize=6)
         ax.set_yticks(range(len(assays)))
@@ -200,7 +243,8 @@ def main():
                 if not np.isnan(M[a, d]):
                     ax.text(d, a, f"{M[a,d]:.0f}", ha="center", va="center", fontsize=5,
                             color="white" if M[a, d] > vmax*0.6 else "black")
-    fig.suptitle("Exact-sequence test leakage in FINETUNING data (% of test rows also in train+val)",
+    fig.suptitle("Cross-donor exact-sequence leakage in FINETUNING data "
+                 "(mean over 10 sets, each evaluated separately; % of test rows also in train+val)",
                  y=1.02, fontsize=9)
     cbar = fig.colorbar(im, ax=axes[0].tolist(), fraction=0.025, pad=0.02)
     cbar.set_label("% leaked", fontsize=7)
