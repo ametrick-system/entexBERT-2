@@ -316,6 +316,9 @@ def main():
 
     pca = pd.read_csv(args.pca_csv)
     pred = pd.read_csv(args.predictions_csv)
+    # Twin (ref_alt_pair) runs have sequence1/sequence2, no single 'sequence'.
+    if "sequence" not in pred.columns and "sequence1" in pred.columns:
+        pred["sequence"] = pred["sequence1"]
     if "example_id" not in pca.columns or "example_id" not in pred.columns:
         raise ValueError("Both pca.csv and predictions.csv need 'example_id'.")
     if pred["example_id"].duplicated().any():
@@ -428,7 +431,17 @@ def main():
         feature_sets.append(("position+chrom", pos_X))
     if all_X.shape[1]:
         feature_sets.append(("ALL covariates (no embedding)", all_X))
-    feature_sets.append(("PCs", work[pc_cols].to_numpy()))
+    pc_X = work[pc_cols].to_numpy()
+    feature_sets.append(("PCs", pc_X))
+    # INCREMENTAL: does the embedding add anything ON TOP OF genomic position?
+    # If (position+chrom + PCs) ~= (position+chrom) alone, the model rides regional
+    # autocorrelation; if it gains several points, there is sequence signal beyond location.
+    if pos_cols or chrom_oh is not None:
+        feature_sets.append(("position+chrom + PCs",
+                             np.concatenate([pos_X, pc_X], axis=1)))
+    if all_X.shape[1]:
+        feature_sets.append(("ALL covariates + PCs",
+                             np.concatenate([all_X, pc_X], axis=1)))
     if lab_cols:
         feature_sets.append(("label-related meta", work[lab_cols].to_numpy()))
     auroc_rows = []

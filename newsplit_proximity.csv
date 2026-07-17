@@ -1,0 +1,3 @@
+dataset,split,n,window_bp,frac_window_overlap,frac_strong_overlap_50pct,frac_exact_coord_in_train,median_nearest_train_bp,median_nearest_othertest_bp,n_overlapping_pairs,label_concordance_overlap
+ENC-002_CTCF_binsplit2,test,20603,512,0.0,0.0,0.0,154895.0,5690.0,0,
+ENC-002_CTCF_binsplit2,dev,19932,512,0.0,0.0,0.0,161207.0,4272.0,0,

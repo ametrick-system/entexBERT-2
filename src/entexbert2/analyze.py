@@ -380,7 +380,7 @@ def select_representatives(df, selection_categories, n_per_category,
 # PCA
 # ---------------------------------------------------------------------------
 
-def run_pca(embeddings, n_components, max_examples=None, seed=0):
+def run_pca(embeddings, n_components, max_examples=None, seed=0, standardize=True):
     X = embeddings
     idx = np.arange(len(X))
     if max_examples is not None and len(X) > max_examples:
@@ -388,6 +388,13 @@ def run_pca(embeddings, n_components, max_examples=None, seed=0):
         idx = np.sort(rng.choice(len(X), size=max_examples, replace=False))
         X = X[idx]
     k = min(n_components, X.shape[1], max(2, X.shape[0]))
+    if standardize:
+        # Z-score each embedding dimension so PC1 is not just an overall-magnitude axis
+        # (unstandardized pooled embeddings produce a dominant scale PC + a 'fan' scatter
+        # that matches no biological covariate). Standardizing surfaces label/covariate
+        # structure in the top PCs instead of burying it under embedding norm.
+        from sklearn.preprocessing import StandardScaler
+        X = StandardScaler().fit_transform(X)
     pca = PCA(n_components=k, random_state=seed)
     coords = pca.fit_transform(X)
     return idx, coords, pca.explained_variance_ratio_
@@ -490,6 +497,10 @@ def parse_args():
     # pca
     p.add_argument("--pca_components", type=int, default=10)
     p.add_argument("--max_pca_examples", type=int, default=20000)
+    p.add_argument("--no_standardize_pca", dest="standardize_pca",
+                   action="store_false", default=True,
+                   help="Skip per-dimension z-scoring before PCA (default: standardize, "
+                        "so PC1 is not just an embedding-magnitude axis).")
     return p.parse_args()
 
 
@@ -565,7 +576,8 @@ def main():
 
     # PCA over pooled embeddings
     target = (df["true_value"] if flavor == "regression" else labels)
-    idx, coords, evr = run_pca(embeddings, args.pca_components, args.max_pca_examples)
+    idx, coords, evr = run_pca(embeddings, args.pca_components,
+                               args.max_pca_examples, standardize=args.standardize_pca)
     pca_df = pd.DataFrame(coords, columns=[f"PC{i+1}" for i in range(coords.shape[1])])
     pca_df["target"] = np.asarray(target)[idx]
     # Attach the per-example id and prediction category so pca.csv is self-sufficient
