@@ -59,6 +59,7 @@ from entexbert2.utils import (
     PartitionSpec,
     SNVWindowSpec,
     SNVRowSource,
+    PeakBedRowSource,
     build_dataset,
     make_as_class_label_spec,
     make_as_regression_label_spec,
@@ -101,11 +102,27 @@ def _build_snv_source(cfg):
         chunksize=cfg.get("chunksize", 100000),
     )
 
+def _build_peak_bed_source(cfg):
+    tissue = cfg.get("tissue")
+    if tissue in NONE_TISSUE_TOKENS:
+        tissue = None
+    return PeakBedRowSource(
+        peak_path=cfg["path"],
+        assay=cfg["assay"],
+        donor=cfg["donor"],
+        tissue=tissue,
+        genome_sizes_path=cfg.get("genome_sizes"),
+        is_narrowpeak=(cfg.get("format", "narrowpeak") == "narrowpeak"),
+        summit_mode=cfg.get("summit_mode", "summit"),
+        background_ratio=cfg.get("background_ratio", 1.0),
+        background_gap_bp=cfg.get("background_gap_bp", 1000),
+        exclude_chroms=cfg.get("exclude_chroms"),
+        seed=cfg.get("seed", 42),
+    )
 
 ROW_SOURCE_BUILDERS = {
     "snv_tsv": _build_snv_source,
-    # "peak_bed": _build_peak_source,     # add when PeakRowSource lands
-    # "tiled":    _build_tiled_source,
+     "peak_bed": _build_peak_bed_source,
 }
 
 

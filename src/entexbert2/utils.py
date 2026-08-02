@@ -1328,6 +1328,140 @@ class SNVRowSource(RowSource):
             "min_total_reads": self.min_total_reads,
         }
 
+class PeakBedRowSource(RowSource):
+    """
+    Binding row source: peak summits (positives) + matched non-peak windows
+    (background) as anchored loci, for BINDING-SIGNAL regression.
+
+    Unlike SNVRowSource (one row per het SNV), this source produces genomic
+    anchors from a narrowPeak/BED file plus an equal number of length-matched
+    background windows drawn from the genome outside the peaks. The continuous
+    regression target (e.g. BigWig fold-change) is attached downstream by the
+    label spec's annotator over each windowed locus, so this source only needs
+    to emit the anchor coordinates + provenance.
+
+    Emitted columns (consumed by add_snv_windows / add_sequence_inputs):
+        chr, anchor (0-based center), ref_start, ref_end,
+        donor, tissue, assay, feature_type ("peak" | "background")
+
+    No ref_allele column is emitted: ref_single treats ref_allele as optional
+    (has_ref_allele guard), so it extracts the reference window with no variant
+    substitution and no allele sanity-check.
+
+    supported_input_modes is DELIBERATELY {"ref_single"} only (has_variants=
+    False): this source's job is to produce reference training windows for the
+    binding regressor. It does NOT emit ref/alt pairs. The ref-vs-alt Delta used
+    at ASB-benchmark eval time is computed by the scoring script (which
+    substitutes the alt allele at the window center and re-runs the model),
+    not by this source at training time.
+    """
+
+    source_type = "peak_bed"
+    has_variants = False
+    supported_input_modes = {"ref_single"}
+
+    def __init__(
+        self,
+        peak_path: str,
+        assay: str,
+        donor: str,
+        tissue: Optional[str] = None,
+        genome_sizes_path: Optional[str] = None,
+        is_narrowpeak: bool = True,
+        summit_mode: str = "summit",            # "summit" | "center"
+        background_ratio: float = 1.0,          # #background = ratio * #peaks
+        background_gap_bp: int = 1000,          # min distance of background from any peak
+        exclude_chroms: Optional[List[str]] = None,
+        seed: int = 42,
+    ):
+        self.peak_path = peak_path
+        self.assay = assay
+        self.donor = donor
+        self.tissue = tissue
+        self.genome_sizes_path = genome_sizes_path
+        self.is_narrowpeak = is_narrowpeak
+        self.summit_mode = summit_mode
+        self.background_ratio = float(background_ratio)
+        self.background_gap_bp = int(background_gap_bp)
+        self.exclude_chroms = set(exclude_chroms or [])
+        self.seed = int(seed)
+
+    def _load_peaks(self) -> pd.DataFrame:
+        cols = (["chr", "start", "end", "name", "score", "strand",
+                 "signalValue", "pValue", "qValue", "peak"]
+                if self.is_narrowpeak else ["chr", "start", "end"])
+        df = pd.read_csv(
+            self.peak_path, sep="\t", header=None, comment="#",
+            usecols=range(len(cols)), names=cols,
+        )
+        df = df[~df["chr"].isin(self.exclude_chroms)].copy()
+        df["start"] = df["start"].astype(int)
+        df["end"] = df["end"].astype(int)
+        if self.summit_mode == "summit" and self.is_narrowpeak and "peak" in df:
+            off = df["peak"].astype(int)
+            off = off.where(off >= 0, ((df["end"] - df["start"]) // 2))
+            df["anchor"] = df["start"] + off
+        else:
+            df["anchor"] = (df["start"] + df["end"]) // 2
+        df["feature_type"] = "peak"
+        return df[["chr", "anchor", "start", "end", "feature_type"]]
+
+    def _sample_background(self, peaks: pd.DataFrame) -> pd.DataFrame:
+        sizes = load_chrom_sizes(self.genome_sizes_path)
+        rng = np.random.default_rng(self.seed)
+        n_target = int(round(self.background_ratio * len(peaks)))
+        gap = self.background_gap_bp
+        forbid = {}
+        for c, sub in peaks.groupby("chr"):
+            forbid[c] = (sub["start"].to_numpy() - gap, sub["end"].to_numpy() + gap)
+        chrom_counts = peaks["chr"].value_counts()
+        chroms = chrom_counts.index.to_numpy()
+        weights = (chrom_counts / chrom_counts.sum()).to_numpy()
+        out_chr, out_anchor = [], []
+        tries, max_tries = 0, n_target * 50
+        while len(out_chr) < n_target and tries < max_tries:
+            tries += 1
+            c = rng.choice(chroms, p=weights)
+            csize = sizes.get(c)
+            if not csize:
+                continue
+            a = int(rng.integers(1000, csize - 1000))
+            lo, hi = forbid.get(c, (np.array([]), np.array([])))
+            if lo.size and np.any((a >= lo) & (a <= hi)):
+                continue
+            out_chr.append(c)
+            out_anchor.append(a)
+        bg = pd.DataFrame({"chr": out_chr, "anchor": out_anchor})
+        bg["start"] = bg["anchor"]
+        bg["end"] = bg["anchor"] + 1
+        bg["feature_type"] = "background"
+        return bg
+
+    def load(self) -> pd.DataFrame:
+        peaks = self._load_peaks()
+        bg = self._sample_background(peaks)
+        df = pd.concat([peaks, bg], ignore_index=True)
+        df["ref_start"] = df["anchor"].astype(int)
+        df["ref_end"] = df["anchor"].astype(int) + 1
+        df["donor"] = self.donor
+        df["tissue"] = self.tissue if self.tissue is not None else "all"
+        df["assay"] = self.assay
+        return df.reset_index(drop=True)
+
+    def describe(self) -> dict:
+        return {
+            "source_type": self.source_type,
+            "has_variants": self.has_variants,
+            "peak_path": self.peak_path,
+            "assay": self.assay,
+            "donor": self.donor,
+            "tissue": self.tissue,
+            "is_narrowpeak": self.is_narrowpeak,
+            "summit_mode": self.summit_mode,
+            "background_ratio": self.background_ratio,
+            "background_gap_bp": self.background_gap_bp,
+            "exclude_chroms": sorted(self.exclude_chroms),
+        }
 
 #############################
 # Source-agnostic builder

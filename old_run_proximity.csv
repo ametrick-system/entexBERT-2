@@ -1,3 +1,0 @@
-dataset,split,n,window_bp,frac_window_overlap,frac_strong_overlap_50pct,frac_exact_coord_in_train,median_nearest_train_bp,median_nearest_othertest_bp,n_overlapping_pairs,label_concordance_overlap
-ENC-001_CTCF_oldsplit,test,3678,512,0.4195214790647091,0.3692224034801523,0.0,3103.0,349250.0,1543,0.7835385612443292
-ENC-001_CTCF_oldsplit,dev,3669,512,0.43227037339874624,0.38675388389206866,0.0,2935.0,370910.0,1586,0.8045397225725095
