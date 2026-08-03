@@ -1626,7 +1626,7 @@ class MultiTissuePeakRowSource(RowSource):
 
         # drop consensus loci whose label window would fall off a chromosome end
         # (defensive: a summit near a chrom boundary would crash windowing downstream)
-        sizes = _load_chrom_sizes(self.genome_sizes_path)
+        sizes = load_chrom_sizes(self.genome_sizes_path)
         if sizes:
             # pad by the label radius OR a generous window half-width, whichever is larger,
             # so downstream windowing (left_bp/right_bp, unknown here) can't run off the end
