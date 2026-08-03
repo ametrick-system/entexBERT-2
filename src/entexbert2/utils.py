@@ -1248,6 +1248,27 @@ def make_as_regression_label_spec(
         required_columns=list(_AS_TARGET_REQUIREMENTS[target]),
     )
 
+def make_column_label_spec(
+    column: str,
+    name: Optional[str] = None,
+    task_type: str = "regression",
+    transform_fn: Callable[[float], float] = lambda x: x,
+) -> LabelSpec:
+    """Label read directly from a PRECOMPUTED column on the row source.
+
+    For sources that compute their own target (e.g. MultiTissuePeakRowSource emits
+    `binding_label_raw` = mean fold-change across tissues). `transform_fn` (e.g. log1p)
+    is applied after, matching the bigwig label's default transform. General — not tied
+    to any dataset.
+    """
+    col = column
+    return LabelSpec(
+        name=name or column,
+        fn=lambda row: row[col],
+        task_type=task_type,
+        transform_fn=transform_fn,
+        required_columns=[col],
+    )
 
 #############################
 # Row sources
@@ -1463,6 +1484,216 @@ class PeakBedRowSource(RowSource):
             "exclude_chroms": sorted(self.exclude_chroms),
         }
 
+class MultiTissuePeakRowSource(RowSource):
+    source_type = "multi_tissue_peak"
+    has_variants = False
+    supported_input_modes = {"ref_single"}
+
+    def __init__(
+        self,
+        datasets: List[dict],          # [{tissue, peak_path, bigwig_path}, ...]
+        assay: str,
+        donor: str,
+        genome_sizes_path: Optional[str] = None,
+        is_narrowpeak: bool = True,
+        summit_mode: str = "summit",
+        merge_window_bp: int = 100,    # summits within this distance = one consensus locus
+        label_radius_bp: int = 32,     # footprint for label + reliability reads (match the run)
+        background_ratio: float = 1.0,
+        background_gap_bp: int = 1000,
+        exclude_chroms: Optional[List[str]] = None,
+        seed: int = 42,
+    ):
+        if pyBigWig is None:
+            raise ImportError("pyBigWig is required for MultiTissuePeakRowSource.")
+        assert len(datasets) >= 1, "need at least one (tissue, peak, bigwig) entry"
+        self.datasets = datasets
+        self.assay = assay
+        self.donor = donor
+        self.genome_sizes_path = genome_sizes_path
+        self.is_narrowpeak = is_narrowpeak
+        self.summit_mode = summit_mode
+        self.merge_window_bp = int(merge_window_bp)
+        self.label_radius_bp = int(label_radius_bp)
+        self.background_ratio = float(background_ratio)
+        self.background_gap_bp = int(background_gap_bp)
+        self.exclude_chroms = set(exclude_chroms or [])
+        self.seed = int(seed)
+        self.tissues = [d["tissue"] for d in datasets]
+
+    # ---- peak loading (per tissue) ----
+    def _load_one_peakset(self, peak_path: str, tissue: str) -> pd.DataFrame:
+        cols = (["chr", "start", "end", "name", "score", "strand",
+                 "signalValue", "pValue", "qValue", "peak"]
+                if self.is_narrowpeak else ["chr", "start", "end"])
+        df = pd.read_csv(peak_path, sep="\t", header=None, comment="#",
+                         usecols=range(len(cols)), names=cols)
+        df = df[~df["chr"].isin(self.exclude_chroms)].copy()
+        df["start"] = df["start"].astype(int); df["end"] = df["end"].astype(int)
+        if self.summit_mode == "summit" and self.is_narrowpeak and "peak" in df:
+            off = df["peak"].astype(int)
+            off = off.where(off >= 0, ((df["end"] - df["start"]) // 2))
+            df["summit"] = df["start"] + off
+        else:
+            df["summit"] = (df["start"] + df["end"]) // 2
+        sv = df["signalValue"] if "signalValue" in df else pd.Series(1.0, index=df.index)
+        df["tissue"] = tissue
+        return df[["chr", "summit", "start", "end", "tissue"]].assign(signalValue=sv.astype(float))
+
+    # ---- consensus clustering (sweep-line within merge_window_bp) ----
+    def _consensus_loci(self, allpeaks: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for chrom, sub in allpeaks.groupby("chr"):
+            sub = sub.sort_values("summit").reset_index(drop=True)
+            cluster_id = (sub["summit"].diff().fillna(0) > self.merge_window_bp).cumsum()
+            for _, g in sub.groupby(cluster_id):
+                # canonical summit = the member with the highest signalValue
+                best = g.loc[g["signalValue"].idxmax()]
+                called = sorted(g["tissue"].unique().tolist())
+                rows.append({
+                    "chr": chrom,
+                    "anchor": int(best["summit"]),
+                    "pstart": int(g["start"].min()),   # widest extent (for background exclusion)
+                    "pend": int(g["end"].max()),
+                    "tissue": "|".join(called),
+                    "n_tissues_called": len(called),
+                    "called_sv_mean": float(g["signalValue"].mean()),
+                })
+        return pd.DataFrame(rows)
+
+    # ---- read all tissue BigWigs over ±radius at a set of anchors ----
+    def _read_signal_matrix(self, chrom, anchors) -> np.ndarray:
+        """Return (n_loci, n_tissues) mean fold-change over [anchor-r, anchor+r+1)."""
+        r = self.label_radius_bp
+        mat = np.full((len(anchors), len(self.datasets)), np.nan, dtype=float)
+        for j, d in enumerate(self.datasets):
+            bw = pyBigWig.open(d["bigwig_path"])
+            csize = dict(bw.chroms()).get(chrom)
+            if csize:
+                for i, a in enumerate(anchors):
+                    s = max(0, a - r); e = min(csize, a + r + 1)
+                    if e > s:
+                        v = np.asarray(bw.values(chrom, s, e), dtype=float)
+                        v = v[np.isfinite(v)]
+                        if v.size:
+                            mat[i, j] = v.mean()
+            bw.close()
+        return mat
+
+    # ---- background (single pass against the union of all peaks) ----
+    def _sample_background(self, consensus: pd.DataFrame) -> pd.DataFrame:
+        sizes = load_chrom_sizes(self.genome_sizes_path)
+        rng = np.random.default_rng(self.seed)
+        n_target = int(round(self.background_ratio * len(consensus)))
+        gap = self.background_gap_bp
+        forbid = {c: (sub["pstart"].to_numpy() - gap, sub["pend"].to_numpy() + gap)
+                  for c, sub in consensus.groupby("chr")}
+        counts = consensus["chr"].value_counts()
+        chroms = counts.index.to_numpy(); weights = (counts / counts.sum()).to_numpy()
+        out_c, out_a = [], []
+        tries, maxt = 0, n_target * 50
+        while len(out_c) < n_target and tries < maxt:
+            tries += 1
+            c = rng.choice(chroms, p=weights)
+            csize = sizes.get(c)
+            if not csize:
+                continue
+            a = int(rng.integers(1000, csize - 1000))
+            lo, hi = forbid.get(c, (np.array([]), np.array([])))
+            if lo.size and np.any((a >= lo) & (a <= hi)):
+                continue
+            out_c.append(c); out_a.append(a)
+        return pd.DataFrame({"chr": out_c, "anchor": out_a})
+
+    @staticmethod
+    def _label_noise(cross_std: np.ndarray, mean_depth: np.ndarray) -> np.ndarray:
+        """max(cross_tissue_std, depth_floor); depth_floor = c/sqrt(depth) with c
+        auto-calibrated so median(floor) == median(cross_std) (commensurate units)."""
+        std = np.where(np.isfinite(cross_std), cross_std, 0.0)
+        dep = np.where(np.isfinite(mean_depth) & (mean_depth > 0), mean_depth, np.nan)
+        med_std = np.nanmedian(std[std > 0]) if np.any(std > 0) else 1.0
+        med_dep = np.nanmedian(dep) if np.any(np.isfinite(dep)) else 1.0
+        c = med_std * np.sqrt(med_dep)          # so median floor ≈ median std
+        floor = np.where(np.isfinite(dep), c / np.sqrt(dep), med_std)
+        return np.maximum(std, floor), float(c)
+
+    def load(self) -> pd.DataFrame:
+        # 1) union all tissue peaks, cluster into consensus loci
+        allpeaks = pd.concat(
+            [self._load_one_peakset(d["peak_path"], d["tissue"]) for d in self.datasets],
+            ignore_index=True)
+        consensus = self._consensus_loci(allpeaks)
+
+        # drop consensus loci whose label window would fall off a chromosome end
+        # (defensive: a summit near a chrom boundary would crash windowing downstream)
+        sizes = _load_chrom_sizes(self.genome_sizes_path)
+        if sizes:
+            # pad by the label radius OR a generous window half-width, whichever is larger,
+            # so downstream windowing (left_bp/right_bp, unknown here) can't run off the end
+            r = max(self.label_radius_bp, 512)
+            csz = consensus["chr"].map(sizes)
+            ok = csz.notna() & (consensus["anchor"] - r >= 0) & (consensus["anchor"] + r + 1 <= csz)
+            n_drop = int((~ok).sum())
+            if n_drop:
+                print(f"[multi_tissue] dropped {n_drop} consensus loci near chrom ends "
+                      f"(window would exceed chromosome bounds)")
+            consensus = consensus[ok].reset_index(drop=True)
+
+        # 2) read all tissue BigWigs at consensus anchors -> label + reliability
+        parts = []
+        for chrom, sub in consensus.groupby("chr"):
+            sub = sub.reset_index(drop=True)
+            mat = self._read_signal_matrix(chrom, sub["anchor"].tolist())  # (n, N)
+            sub = sub.assign(
+                binding_label_raw=np.nanmean(mat, axis=1),
+                cross_tissue_std=np.nanstd(mat, axis=1),
+                mean_depth=sub["called_sv_mean"].to_numpy(),  # peak-call strength proxy
+            )
+            parts.append(sub)
+        peaks = pd.concat(parts, ignore_index=True)
+        peaks["feature_type"] = "peak"
+
+        # 3) background once, labelled from the same BigWigs
+        bg = self._sample_background(consensus)
+        bgparts = []
+        for chrom, sub in bg.groupby("chr"):
+            sub = sub.reset_index(drop=True)
+            mat = self._read_signal_matrix(chrom, sub["anchor"].tolist())
+            sub = sub.assign(
+                binding_label_raw=np.nanmean(mat, axis=1),
+                cross_tissue_std=np.nanstd(mat, axis=1),
+                mean_depth=np.nan,
+                tissue="background", n_tissues_called=0,
+                pstart=sub["anchor"], pend=sub["anchor"] + 1,
+            )
+            bgparts.append(sub)
+        bg = pd.concat(bgparts, ignore_index=True) if bgparts else pd.DataFrame(columns=peaks.columns)
+        bg["feature_type"] = "background"
+
+        df = pd.concat([peaks, bg], ignore_index=True)
+        df["binding_label_raw"] = df["binding_label_raw"].fillna(0.0)
+        # a locus with <2 finite tissue reads has no measurable spread -> std 0
+        df["cross_tissue_std"] = df["cross_tissue_std"].fillna(0.0)
+        # 4) label_noise (calibrated across ALL rows)
+        ln, c = self._label_noise(df["cross_tissue_std"].to_numpy(), df["mean_depth"].to_numpy())
+        df["label_noise"] = ln
+        self._depth_floor_c = c
+
+        # 5) finalize schema
+        df["anchor"] = df["anchor"].astype(int)
+        df["ref_start"] = df["anchor"]; df["ref_end"] = df["anchor"] + 1
+        df["donor"] = self.donor; df["assay"] = self.assay
+        keep = ["chr", "anchor", "ref_start", "ref_end", "donor", "tissue", "assay",
+                "feature_type", "binding_label_raw",
+                "n_tissues_called", "cross_tissue_std", "mean_depth", "label_noise"]
+        return df[keep].reset_index(drop=True)
+
+    def describe(self) -> dict:
+        return {"source_type": self.source_type, "has_variants": self.has_variants,
+                "n_tissues": len(self.datasets), "tissues": self.tissues,
+                "merge_window_bp": self.merge_window_bp, "label_radius_bp": self.label_radius_bp,
+                "background_ratio": self.background_ratio}
+
 #############################
 # Source-agnostic builder
 #############################
@@ -1570,6 +1801,11 @@ def build_dataset(
     # Carry the AS-call columns so a regression run can be mapped back to imbalance_significance
     # post-hoc (threshold |prediction| -> AUPRC vs the binary call), and depth for stratification.
     meta_cols += ["imbalance_significance", "ref_allele_ratio", "total_reads"]
+
+    # Binding-regression reliability columns (multi_tissue_peak); skipped when absent
+    meta_cols += ["binding_label_raw", "n_tissues_called", "cross_tissue_std",
+                  "mean_depth", "label_noise"]
+    
     meta_cols = [c for c in meta_cols if c in df.columns]
 
     split_and_write_csvs(

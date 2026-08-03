@@ -60,11 +60,13 @@ from entexbert2.utils import (
     SNVWindowSpec,
     SNVRowSource,
     PeakBedRowSource,
+    MultiTissuePeakRowSource,
     build_dataset,
     make_as_class_label_spec,
     make_as_regression_label_spec,
     make_bigwig_label_spec,
     make_peak_bed_label_spec,
+    make_column_label_spec,
     log1p_transform,
     identity_transform,
 )
@@ -120,9 +122,27 @@ def _build_peak_bed_source(cfg):
         seed=cfg.get("seed", 42),
     )
 
+def _build_multi_tissue_peak_source(cfg):
+    tracks = cfg["tissue_tracks"]          # [{tissue, peak_path, bigwig_path}, ...]
+    return MultiTissuePeakRowSource(
+        datasets=tracks,
+        assay=cfg["assay"],
+        donor=cfg["donor"],
+        genome_sizes_path=cfg.get("genome_sizes"),
+        is_narrowpeak=(cfg.get("format", "narrowpeak") == "narrowpeak"),
+        summit_mode=cfg.get("summit_mode", "summit"),
+        merge_window_bp=cfg.get("merge_window_bp", 100),
+        label_radius_bp=cfg.get("label_radius_bp", 32),
+        background_ratio=cfg.get("background_ratio", 1.0),
+        background_gap_bp=cfg.get("background_gap_bp", 1000),
+        exclude_chroms=cfg.get("exclude_chroms"),
+        seed=cfg.get("seed", 42),
+    )
+
 ROW_SOURCE_BUILDERS = {
     "snv_tsv": _build_snv_source,
-     "peak_bed": _build_peak_bed_source,
+    "peak_bed": _build_peak_bed_source,
+    "multi_tissue_peak": _build_multi_tissue_peak_source,
 }
 
 
@@ -180,13 +200,17 @@ def _build_peak(cfg, tf):
         transform_fn=tf,
     )
 
+def _build_column(cfg, tf):
+    return make_column_label_spec(
+        column=cfg["column"], name=cfg.get("name"), transform_fn=tf
+    )
 
 LABEL_BUILDERS = {
     "as_class": _build_as_class,
     "as_regression": _build_as_regression,
     "bigwig": _build_bigwig,
+    "column": _build_column,
     "peak": _build_peak,
-    # "hap_difference": _build_hap_difference,   # add when two-track diff label lands
 }
 
 
