@@ -1520,6 +1520,8 @@ class MultiTissuePeakRowSource(RowSource):
         self.exclude_chroms = set(exclude_chroms or [])
         self.seed = int(seed)
         self.tissues = [d["tissue"] for d in datasets]
+        # p-value confidence tracks are optional; enabled when every tissue provides pval_path
+        self._has_pval = all(d.get("pval_path") for d in datasets)
 
     # ---- peak loading (per tissue) ----
     def _load_one_peakset(self, peak_path: str, tissue: str) -> pd.DataFrame:
@@ -1562,12 +1564,17 @@ class MultiTissuePeakRowSource(RowSource):
         return pd.DataFrame(rows)
 
     # ---- read all tissue BigWigs over ±radius at a set of anchors ----
-    def _read_signal_matrix(self, chrom, anchors) -> np.ndarray:
-        """Return (n_loci, n_tissues) mean fold-change over [anchor-r, anchor+r+1)."""
+    def _read_signal_matrix(self, chrom, anchors, path_key="bigwig_path") -> np.ndarray:
+        """Return (n_loci, n_tissues) mean signal over [anchor-r, anchor+r+1).
+        path_key selects which per-tissue track to read ('bigwig_path' = fold-change label,
+        'pval_path' = signal p-value confidence). Tissues lacking path_key stay NaN."""
         r = self.label_radius_bp
         mat = np.full((len(anchors), len(self.datasets)), np.nan, dtype=float)
         for j, d in enumerate(self.datasets):
-            bw = pyBigWig.open(d["bigwig_path"])
+            p = d.get(path_key)
+            if p is None:
+                continue
+            bw = pyBigWig.open(p)
             csize = dict(bw.chroms()).get(chrom)
             if csize:
                 for i, a in enumerate(anchors):
@@ -1643,12 +1650,16 @@ class MultiTissuePeakRowSource(RowSource):
         parts = []
         for chrom, sub in consensus.groupby("chr"):
             sub = sub.reset_index(drop=True)
-            mat = self._read_signal_matrix(chrom, sub["anchor"].tolist())  # (n, N)
-            sub = sub.assign(
+            mat = self._read_signal_matrix(chrom, sub["anchor"].tolist())  # (n, N) fold-change
+            assign = dict(
                 binding_label_raw=np.nanmean(mat, axis=1),
                 cross_tissue_std=np.nanstd(mat, axis=1),
                 mean_depth=sub["called_sv_mean"].to_numpy(),  # peak-call strength proxy
             )
+            if self._has_pval:
+                pmat = self._read_signal_matrix(chrom, sub["anchor"].tolist(), path_key="pval_path")
+                assign["mean_pval"] = np.nanmean(pmat, axis=1)  # detection-confidence signal
+            sub = sub.assign(**assign)
             parts.append(sub)
         peaks = pd.concat(parts, ignore_index=True)
         peaks["feature_type"] = "peak"
@@ -1659,19 +1670,27 @@ class MultiTissuePeakRowSource(RowSource):
         for chrom, sub in bg.groupby("chr"):
             sub = sub.reset_index(drop=True)
             mat = self._read_signal_matrix(chrom, sub["anchor"].tolist())
-            sub = sub.assign(
+            assign = dict(
                 binding_label_raw=np.nanmean(mat, axis=1),
                 cross_tissue_std=np.nanstd(mat, axis=1),
                 mean_depth=np.nan,
                 tissue="background", n_tissues_called=0,
                 pstart=sub["anchor"], pend=sub["anchor"] + 1,
             )
+            if self._has_pval:
+                pmat = self._read_signal_matrix(chrom, sub["anchor"].tolist(), path_key="pval_path")
+                assign["mean_pval"] = np.nanmean(pmat, axis=1)
+            sub = sub.assign(**assign)
             bgparts.append(sub)
         bg = pd.concat(bgparts, ignore_index=True) if bgparts else pd.DataFrame(columns=peaks.columns)
         bg["feature_type"] = "background"
 
         df = pd.concat([peaks, bg], ignore_index=True)
         df["binding_label_raw"] = df["binding_label_raw"].fillna(0.0)
+        if self._has_pval:
+            # NaN mean_pval = no p-value coverage (background gaps) -> 0 confidence.
+            # The het loss clamps depth to >=1, so 0 becomes the floor (least-trusted), not a divide error.
+            df["mean_pval"] = df["mean_pval"].fillna(0.0)
         # a locus with <2 finite tissue reads has no measurable spread -> std 0
         df["cross_tissue_std"] = df["cross_tissue_std"].fillna(0.0)
         # 4) label_noise (calibrated across ALL rows)
@@ -1686,6 +1705,8 @@ class MultiTissuePeakRowSource(RowSource):
         keep = ["chr", "anchor", "ref_start", "ref_end", "donor", "tissue", "assay",
                 "feature_type", "binding_label_raw",
                 "n_tissues_called", "cross_tissue_std", "mean_depth", "label_noise"]
+        if self._has_pval:
+            keep.append("mean_pval")
         return df[keep].reset_index(drop=True)
 
     def describe(self) -> dict:
