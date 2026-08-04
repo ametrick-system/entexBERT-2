@@ -103,6 +103,14 @@ class TrainingArguments(transformers.TrainingArguments):
         "'weighted_mse' (precision-weighted GLS: mean(depth_norm*(y-mu)^2); simpler, "
         "same mean predictor, no logvar_bias). Both give identical mean gradients up to a "
         "global scale; weighted_mse has fewer moving parts."})
+    predict_sigma: bool = field(default=False, metadata={"help":
+        "Regression only: add a SEPARATE variance head that predicts a per-sequence "
+        "log-variance FROM THE SEQUENCE (not from an input depth column). Trains a Gaussian "
+        "NLL with LEARNED variance and, unlike --heteroscedastic, emits sigma at INFERENCE so "
+        "a variant can be scored by Delta/sigma. Mutually exclusive with --heteroscedastic."})
+    sigma_logvar_clamp: float = field(default=10.0, metadata={"help":
+        "Clamp |log_var| from the sigma head to this range for numerical stability "
+        "(exp(+-10) is a safe variance range)."})
     ##############################################################################################
     seed: int = field(default=42)
     ######################### NEW: MAIN TASK (with regression and MLP support) #######################
@@ -562,6 +570,9 @@ def preprocess_logits_for_metrics(
         logits = logits[0]
 
     if main_task == "regression":
+        # sigma head packs [mu, log_var]; eval metrics use mu only
+        if logits.ndim > 1 and logits.shape[-1] == 2:
+            logits = logits[..., 0]
         # expected shape: [batch] or [batch, 1]
         if logits.ndim > 1 and logits.shape[-1] == 1:
             logits = logits.squeeze(-1)
@@ -907,6 +918,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         head_activation: str = "gelu",
         head_dropout: float = 0.1,
         contrast_mode: str = "signed",
+        predict_sigma: bool = False,
+        sigma_logvar_clamp: float = 10.0,
     ):
         super().__init__()
 
@@ -930,6 +943,9 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         self.contrast_mode = contrast_mode
         self.heteroscedastic = False   # set from training_args in main()
         self.logvar_bias = torch.nn.Parameter(torch.zeros(1))  # 'b' in s = -log(depth)+b
+        #test-time sigma head — a LEARNED per-sequence log-variance from the sequence
+        self.predict_sigma = predict_sigma
+        self.sigma_logvar_clamp = float(sigma_logvar_clamp)
 
         if not (
             len(self.aux_task_names)
@@ -962,6 +978,17 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             activation=head_activation,
             dropout=head_dropout,
         )
+
+        # separate variance head (only when predict_sigma). Same shape as a 1-layer
+        # main head so it has capacity to read the sequence; outputs a scalar log-variance.
+        # Built ONLY when requested so existing checkpoints keep identical state_dict keys.
+        self.sigma_head = None
+        if self.predict_sigma:
+           self.sigma_head = build_prediction_head(
+                input_size=hidden_size, output_size=1,
+                num_layers=max(1, head_num_layers), hidden_size=head_hidden_size,
+                activation=head_activation, dropout=head_dropout,
+            )
 
         # Auxiliary heads
         self.aux_heads = torch.nn.ModuleDict()
@@ -1028,6 +1055,16 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
 
     def _compute_main_loss(self, logits, labels, depth=None):
         if self.main_task == "regression":
+            # learned-sigma path. logits is packed [mu, log_var]; Gaussian NLL with the
+            # PREDICTED variance: 0.5*exp(-lv)*(mu-y)^2 + 0.5*lv (mean). This is separate from
+            # the depth-tied heteroscedastic path and is what emits sigma at inference.
+            if self.predict_sigma:
+                mu = logits[..., 0]
+                log_var = logits[..., 1].clamp(-self.sigma_logvar_clamp,
+                                               self.sigma_logvar_clamp)
+                labels = labels.float().view_as(mu)
+                return (0.5 * torch.exp(-log_var) * (mu - labels) ** 2
+                        + 0.5 * log_var).mean()
             if logits.ndim > 1 and logits.shape[-1] == 1:
                 logits = logits.squeeze(-1)
             labels = labels.float()
@@ -1137,13 +1174,35 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
 
         # TWIN: if an ALT window is provided, the prediction is the SIGNED contrast
         # head(alt) - head(ref). Shared weights, two passes, subtract -> deltaSVM-style
+        contrast_vec = None                # set in the symmetric_abs twin branch below
+        symmetric = getattr(self, "contrast_mode", "signed") == "symmetric_abs"
         if input_ids_alt is not None:
             logits_alt, pooled_alt, _ = self._score(input_ids_alt, attention_mask_alt, **kwargs)
-            if getattr(self, "contrast_mode", "signed") == "symmetric_abs":
+            if symmetric:
                 # symmetric contrast for a symmetric target (significance): head(|pool(alt)-pool(ref)|)
-                logits = self.main_head(torch.abs(pooled_alt - pooled))
+                contrast_vec = torch.abs(pooled_alt - pooled)
+                logits = self.main_head(contrast_vec)
             else:
                 logits = logits_alt - logits          # signed (deltaSVM-style, regression twin)
+        # LEARNED sigma head -> pack logits as [mu, log_var]. The variance model MUST match
+        # model_io.logits_and_embeddings exactly (train == inference), branching on contrast_mode:
+        #   signed:        Var(Delta)=Var(ref)+Var(alt) -> log_var=logsumexp(lv_ref, lv_alt)
+        #   symmetric_abs: prediction is head(contrast_vec), so sigma reads the SAME contrast_vec
+        #   single-seq:    just lv(ref)
+        if self.predict_sigma and self.sigma_head is not None:
+            c = self.sigma_logvar_clamp
+            if input_ids_alt is not None and symmetric:
+                log_var = self.sigma_head(contrast_vec).clamp(-c, c)
+            elif input_ids_alt is not None:
+                lv_ref = self.sigma_head(pooled).clamp(-c, c)
+                lv_alt = self.sigma_head(pooled_alt).clamp(-c, c)
+                log_var = torch.logsumexp(torch.cat([lv_ref, lv_alt], dim=-1),
+                                          dim=-1, keepdim=True).clamp(-c, c)
+            else:
+                log_var = self.sigma_head(pooled).clamp(-c, c)
+            mu = logits if logits.ndim > 1 else logits.unsqueeze(-1)
+            logits = torch.cat([mu, log_var], dim=-1)                        # [B,2]
+
         # Auxiliary heads read the REF pooled representation in BOTH paths: per-locus privileged
         # signals (read depth, p_betabinom, effect magnitude) are properties of the locus, not of the
         # ref/alt contrast. Computing them on `pooled` keeps twin and aux compatible
@@ -1288,11 +1347,19 @@ def train():
         head_activation=training_args.head_activation,
         head_dropout=training_args.head_dropout,
         contrast_mode=training_args.contrast_mode,
+        predict_sigma=training_args.predict_sigma,
+        sigma_logvar_clamp=training_args.sigma_logvar_clamp,
     )
 
     # For heteroscedastic regression head functionality
     model.heteroscedastic = training_args.heteroscedastic
     model.hetero_loss = training_args.hetero_loss   # "nll" | "weighted_mse"
+
+    if training_args.predict_sigma and training_args.heteroscedastic:
+        raise ValueError("--predict_sigma (learned test-time sigma) and --heteroscedastic "
+                         "(depth-tied training reweight) are mutually exclusive; pick one.")
+    if training_args.predict_sigma and training_args.task != "regression":
+        raise ValueError("--predict_sigma is regression-only.")
 
     # Arm the twin assertion for ALL paired runs, regardless of task / class-weighting
     model._expect_twin = (getattr(data_args, "input_mode", None) == "ref_alt_pair")
@@ -1375,6 +1442,8 @@ def train():
             "head_hidden_size": training_args.head_hidden_size,
             "head_activation": training_args.head_activation,
             "head_dropout": training_args.head_dropout,
+            "predict_sigma": training_args.predict_sigma,
+            "sigma_logvar_clamp": training_args.sigma_logvar_clamp,
             "num_aux_tasks": training_args.num_aux_tasks,
             "aux_task_names": training_args.aux_task_names,
             "aux_task_types": training_args.aux_task_types,

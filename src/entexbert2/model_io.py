@@ -144,6 +144,8 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
         head_hidden_size=run_config["head_hidden_size"],
         head_activation=run_config["head_activation"],
         head_dropout=run_config["head_dropout"],
+        predict_sigma=run_config.get("predict_sigma", False),
+        sigma_logvar_clamp=run_config.get("sigma_logvar_clamp", 10.0),
     )
     # Twin contrast mode (signed = head(alt)-head(ref); symmetric_abs = head(|pool(alt)-pool(ref)|)).
     # Set as an attribute so logits_and_embeddings mirrors training even if the constructor
@@ -190,21 +192,44 @@ def logits_and_embeddings(model, input_ids, attention_mask,
     pool(alt) - pool(ref) -- the representation the head's prediction is actually based on.
     Single-sequence inference (alt=None) is unchanged.
     """
+    predict_sigma = getattr(model, "predict_sigma", False) and getattr(model, "sigma_head", None) is not None
+    clamp = getattr(model, "sigma_logvar_clamp", 10.0)
+
     def _score(ids, mask):
         backbone_outputs = model.backbone(input_ids=ids, attention_mask=mask, return_dict=True)
         pooled = model._pool_sequence_representation(backbone_outputs, attention_mask=mask)
         return model.main_head(pooled), pooled
 
     logits, pooled = _score(input_ids, attention_mask)
+    log_var = None
+
     if input_ids_alt is not None:
         logits_alt, pooled_alt = _score(input_ids_alt, attention_mask_alt)
         if getattr(model, "contrast_mode", "signed") == "symmetric_abs":
-            # Symmetric contrast for a symmetric target (e.g. significance): the prediction is
-            # head(|pool(alt) - pool(ref)|), and the embedding is that symmetric contrast vector.
+            # Symmetric target: prediction is head(|pool(alt)-pool(ref)|); sigma reads the SAME
+            # contrast vector (identical to training forward()).
             contrast = torch.abs(pooled_alt - pooled)
             logits = model.main_head(contrast)
+            if predict_sigma:
+                log_var = model.sigma_head(contrast).clamp(-clamp, clamp)
             pooled = contrast
         else:
+            # Signed twin: Var(Delta)=Var(ref)+Var(alt) -> logsumexp(lv_ref, lv_alt), computed
+            # from the raw ref/alt pools BEFORE pooled is overwritten (identical to training).
+            if predict_sigma:
+                lv_ref = model.sigma_head(pooled).clamp(-clamp, clamp)
+                lv_alt = model.sigma_head(pooled_alt).clamp(-clamp, clamp)
+                log_var = torch.logsumexp(torch.cat([lv_ref, lv_alt], dim=-1),
+                                          dim=-1, keepdim=True).clamp(-clamp, clamp)
             logits = logits_alt - logits
             pooled = pooled_alt - pooled
+    
+    elif predict_sigma:
+        # single-sequence inference
+        log_var = model.sigma_head(pooled).clamp(-clamp, clamp)
+    if predict_sigma:
+        # pack [mu, log_var] so the caller can score Delta/sigma; sigma = exp(0.5*log_var)
+        mu = logits if logits.ndim > 1 else logits.unsqueeze(-1)
+        logits = torch.cat([mu, log_var], dim=-1)
+
     return logits, pooled
