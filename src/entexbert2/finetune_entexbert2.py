@@ -12,7 +12,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 ##########################################
 
-Last modified: 7/14/2026 by Amy Metrick
+Last modified: 8/7/2026 by Amy Metrick
 '''
 
 import os
@@ -319,15 +319,22 @@ class SupervisedDataset(Dataset):
             )
         
         # main labels
-        if "label" not in data[0]:
-            raise ValueError("CSV must contain a 'label' column for the main task.")
-
-        if task == "regression":
-            labels = [float(row["label"]) for row in data]
-        elif task == "classification":
-            labels = [int(row["label"]) for row in data]
+        if task == "betabinomial": # NEW
+            for col in ("k", "n"):
+                if col not in data[0]:
+                    raise ValueError(f"betabinomial task requires a {col!r} column "
+                                     f"(hap1_count / total); missing in {data_path}.")
+            # label pair [k, n]: k = hap1 reads, n = total. Loss-only; never fed to the trunk
+            labels = [[float(row["k"]), float(row["n"])] for row in data]
         else:
-            raise ValueError(f"Unsupported main task: {task}")
+            if "label" not in data[0]:
+                raise ValueError("CSV must contain a 'label' column for the main task.")
+            if task == "regression":
+                labels = [float(row["label"]) for row in data]
+            elif task == "classification":
+                labels = [int(row["label"]) for row in data]
+            else:
+                raise ValueError(f"Unsupported main task: {task}")
         
         # NEW: depth for the heteroscedastic head (read only when requested)
         if self.heteroscedastic:
@@ -469,7 +476,9 @@ class DataCollatorForSupervisedDataset(object):
 
         # main labels
         labels = [instance["labels"] for instance in instances]
-        main_dtype = torch.float if self.main_task == "regression" else torch.long
+        main_dtype = (torch.float
+                      if self.main_task in ("regression", "betabinomial")
+                      else torch.long)
         labels = torch.tensor(labels, dtype=main_dtype)
 
         batch = dict(
@@ -569,6 +578,12 @@ def preprocess_logits_for_metrics(
     if isinstance(logits, tuple):
         logits = logits[0]
 
+    if main_task == "betabinomial":
+        # main head emits the signed twin; predicted logit p = -twin. Return that scalar.
+        if logits.ndim > 1 and logits.shape[-1] == 1:
+            logits = logits.squeeze(-1)
+        return -logits
+
     if main_task == "regression":
         # sigma head packs [mu, log_var]; eval metrics use mu only
         if logits.ndim > 1 and logits.shape[-1] == 2:
@@ -612,6 +627,42 @@ def compute_metrics(main_task: str, eval_pred):
         predictions = predictions.squeeze(-1)
     if labels.ndim > 1 and labels.shape[-1] == 1:
         labels = labels.squeeze(-1)
+
+    # NEW: BETABINOMIAL METRICS
+    if main_task == "betabinomial":
+        # predictions = predicted logit p (already -twin from preprocess).
+        # labels = [k, n] per locus. Observed logit p̂ = logit(k/n); ASB label = significance
+        # is NOT in labels here, so we derive the classification view from p̂ deviating from 0.5.
+        preds = np.asarray(predictions, dtype=float).reshape(-1)
+        lab = np.asarray(labels, dtype=float).reshape(-1, 2)
+        k = lab[:, 0]; n = lab[:, 1]
+        ok = (n > 0) & np.isfinite(preds)
+        preds, k, n = preds[ok], k[ok], n[ok]
+        phat = np.clip(k / n, 1e-6, 1 - 1e-6)
+        logit_phat = np.log(phat / (1 - phat))
+        out = {}
+        if len(preds) > 1 and np.std(preds) > 0 and np.std(logit_phat) > 0:
+            out["spearman"] = spearmanr(preds, logit_phat)[0]     # <- the calibration-gap metric
+            out["pearson"] = pearsonr(preds, logit_phat)[0]
+        else:
+            out["spearman"] = 0.0; out["pearson"] = 0.0
+        # balanced ASB-AUROC: does |predicted logit p| separate imbalanced from balanced loci?
+        # "positive" = binomial-tail significant at 0.05 (a depth-aware balance test), so this
+        # tracks the same ASB notion without needing a separate significance column at eval.
+        # Vectorized two-sided binomial test (scipy.stats.binom.cdf) so eval doesn't loop per-locus.
+        from scipy.stats import binom
+        kk = np.rint(k).astype(int); nn = np.rint(n).astype(int)
+        lo = np.minimum(kk, nn - kk)
+        pval = np.clip(2.0 * binom.cdf(lo, nn, 0.5), 0.0, 1.0)   # symmetric p=0.5 two-sided
+        sig = pval < 0.05
+        if sig.any() and (~sig).any():
+            score = np.abs(preds)
+            out["auroc"] = sklearn.metrics.roc_auc_score(sig.astype(int), score)
+            out["auprc"] = sklearn.metrics.average_precision_score(sig.astype(int), score)
+        else:
+            out["auroc"] = 0.0; out["auprc"] = 0.0
+        out["n"] = int(len(preds))
+        return out
 
     # NEW: REGRESSION METRICS
     if main_task == "regression":
@@ -767,8 +818,8 @@ def build_prediction_head(
 ############################################################################################################
 
 ####### NEW: FUNCTION TO ENSURE ALL TRAINING ARGS ARE VALID #######
-def validate_training_args(training_args):
-    allowed_main_tasks = {"classification", "regression"}
+def validate_training_args(training_args, data_args=None):
+    allowed_main_tasks = {"classification", "regression", "betabinomial"}
     allowed_aux_task_types = {"binary", "multiclass", "regression"}
     allowed_pooling_modes = {"cls", "center_mean"}
     allowed_head_activations = {"gelu", "relu", "tanh", "silu"}
@@ -784,6 +835,24 @@ def validate_training_args(training_args):
 
     if training_args.task == "classification" and training_args.main_num_labels < 1:
         raise ValueError("For classification, main_num_labels must be >= 1.")
+
+    if training_args.task == "betabinomial":
+        if training_args.main_num_labels != 1:
+            raise ValueError("For betabinomial, main_num_labels must be 1 (mu is a scalar logit).")
+        if training_args.predict_sigma or training_args.heteroscedastic:
+            raise ValueError("betabinomial is mutually exclusive with predict_sigma / "
+                             "heteroscedastic (it has its own count likelihood).")
+        # SIGN CORRECTNESS: mu = -(twin) = head(hap1)-head(hap2) matches k=hap1_count ONLY when
+        # the twin's two windows are (hap1, hap2). That holds iff input_mode == "hap_pair".
+        # ref_alt_pair builds (ref, alt) and would invert the sign on rows where hap1 != ref.
+        # input_mode is a DataArguments field (line 59), read here off the passed data_args.
+        im = getattr(data_args, "input_mode", None) if data_args is not None else None
+        if im != "hap_pair":
+            raise ValueError(
+                f"betabinomial requires input_mode='hap_pair' (twin = hap1 vs hap2, so "
+                f"mu=-twin=logit P(hap1) matches k=hap1_count); got input_mode={im!r}. "
+                f"Other paired modes (e.g. ref_alt_pair) would silently invert calibration. "
+                f"(If data_args was not passed to validate_training_args, apply HUNK 4a/4b.)")
 
     # Validate pooling regardless of whether LUPI is used.
     if training_args.pooling_mode not in allowed_pooling_modes:
@@ -943,6 +1012,10 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         self.contrast_mode = contrast_mode
         self.heteroscedastic = False   # set from training_args in main()
         self.logvar_bias = torch.nn.Parameter(torch.zeros(1))  # 'b' in s = -log(depth)+b
+        # betabinomial: single GLOBAL learned concentration. s = softplus(log_s)+1 (>0, away
+        # from the rho->0 binomial singularity). Init 2.0 -> s~2.1 -> rho~0.32 (mildly
+        # overdispersed) so training starts away from the overconfident binomial limit.
+        self.betabinom_log_s = torch.nn.Parameter(torch.tensor([2.0]))
         #test-time sigma head — a LEARNED per-sequence log-variance from the sequence
         self.predict_sigma = predict_sigma
         self.sigma_logvar_clamp = float(sigma_logvar_clamp)
@@ -1054,6 +1127,24 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             raise ValueError(f"Unsupported pooling_mode: {self.pooling_mode}")
 
     def _compute_main_loss(self, logits, labels, depth=None):
+        if self.main_task == "betabinomial":
+            # logits here is the SIGNED twin = logits_alt - logits = head(hap2) - head(hap1)
+            # (hap_pair mode: seq1=hap1, seq2=hap2 -- enforced by the H4 input_mode guard).
+            # We want mu = logit p, p = P(read from hap1) = head(hap1) - head(hap2) = -twin.
+            mu = -logits
+            if mu.ndim > 1 and mu.shape[-1] == 1:
+                mu = mu.squeeze(-1)
+            k = labels[..., 0].float()          # hap1 reads   (loss-only constant)
+            n = labels[..., 1].float()          # total reads  (loss-only constant)
+            eps = 1e-6
+            p = torch.sigmoid(mu).clamp(eps, 1.0 - eps)
+            s = torch.nn.functional.softplus(self.betabinom_log_s) + 1.0
+            a = p * s
+            b = (1.0 - p) * s
+            lg = torch.lgamma
+            ll = (lg(k + a) + lg(n - k + b) - lg(n + a + b)) - (lg(a) + lg(b) - lg(a + b))
+            return (-ll).mean()
+
         if self.main_task == "regression":
             # learned-sigma path. logits is packed [mu, log_var]; Gaussian NLL with the
             # PREDICTED variance: 0.5*exp(-lv)*(mu-y)^2 + 0.5*lv (mean). This is separate from
@@ -1268,7 +1359,7 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    validate_training_args(training_args) # NEW
+    validate_training_args(training_args, data_args) # NEW
     training_args.label_names = ["labels"] # NEW
 
     # load tokenizer
@@ -1325,7 +1416,7 @@ def train():
     #### NEW: ALTERED FORMAT FOR MODEL LOADING ####
 
     # main head output dimension
-    if training_args.task == "regression":
+    if training_args.task in ("regression", "betabinomial"):
         main_num_labels = 1
     else:
         main_num_labels = training_args.main_num_labels
