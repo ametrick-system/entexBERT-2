@@ -217,6 +217,7 @@ def split_and_write_csvs(
     balance_split: str = "all",
     split_col: Optional[str] = None,
     depth_col: Optional[str] = None,
+    count_cols: Optional[List[str]] = None,
 ):
     """
     Write entexBERT-2 dataset CSVs.
@@ -254,6 +255,8 @@ def split_and_write_csvs(
         requested = requested + [split_col]
     if depth_col is not None:
         requested = requested + [depth_col]
+    if count_cols:
+        requested = requested + list(count_cols)
 
     required = list(dict.fromkeys(requested))
 
@@ -401,6 +404,8 @@ def split_and_write_csvs(
     final_cols = input_cols + ["label"] + aux_cols
     if depth_col is not None:
         final_cols = final_cols + ["depth"]
+    if count_cols:
+        final_cols = final_cols + list(count_cols)
 
     meta_out_cols = list(dict.fromkeys(final_cols + meta_cols + ["split"]))
 
@@ -1484,6 +1489,78 @@ class PeakBedRowSource(RowSource):
             "exclude_chroms": sorted(self.exclude_chroms),
         }
 
+class BetabinomCountRowSource(RowSource):
+    """
+    Beta-binomial count row source: ONE row per (donor, locus) with pre-summed allelic
+    read counts, for the supervised beta-binomial ASB task.
+
+    Reads the aggregated CSV produced by build_betabinom_counts.py (reads summed across
+    tissues per unique haplotype-sequence locus, tissue-agnostic like ADASTRA). This source
+    only carries coordinates + alleles + counts; the hap1/hap2 windows are built downstream
+    by add_sequence_inputs in hap_pair mode, and k/n reach train.csv via the count_cols
+    passthrough (they are NOT a label spec — the finetune betabinomial task reads them
+    directly as its [k, n] label pair).
+
+    Required CSV columns: chr, ref_start, ref_allele, hap1_allele, hap2_allele, k, n.
+    Optional (carried if present): imbalance_significance, donor, assay.
+
+    supported_input_modes is DELIBERATELY {"hap_pair"} only: the beta-binomial sign
+    convention (mu = -(twin) = logit P(hap1) matches k=hap1_count) holds ONLY when the twin's
+    two windows are (hap1, hap2), which is exactly hap_pair. The finetune H4 guard enforces
+    the same thing from the training side.
+    """
+
+    source_type = "betabinom_counts"
+    has_variants = True
+    supported_input_modes = {"hap_pair"}
+
+    def __init__(
+        self,
+        counts_csv: str,
+        assay: Optional[str] = None,
+        donor: Optional[str] = None,
+    ):
+        self.counts_csv = counts_csv
+        self.assay = assay
+        self.donor = donor
+
+    def load(self) -> pd.DataFrame:
+        df = pd.read_csv(self.counts_csv)
+        need = ["chr", "ref_start", "ref_allele", "hap1_allele", "hap2_allele", "k", "n"]
+        missing = [c for c in need if c not in df.columns]
+        if missing:
+            raise ValueError(
+                f"betabinom_counts source: {self.counts_csv} missing columns {missing}. "
+                f"Expected the output of build_betabinom_counts.py. Have: {sorted(df.columns)}")
+        # optional donor/assay filters (the aggregated table may hold several)
+        if self.donor is not None and "donor" in df.columns:
+            df = df[df["donor"] == self.donor]
+        if self.assay is not None and "assay" in df.columns \
+                and str(self.assay).upper() != "ALL":
+            df = df[df["assay"].astype(str).str.contains(self.assay, case=False, na=False)]
+        df = df.reset_index(drop=True)
+        if df.empty:
+            raise ValueError(f"betabinom_counts source: no rows after donor/assay filter "
+                             f"(donor={self.donor!r}, assay={self.assay!r}).")
+        df["ref_start"] = df["ref_start"].astype(int)
+        df["ref_end"] = df["ref_start"] + 1
+        df["anchor"] = df["ref_start"]          # add_snv_windows centers on 'anchor'
+        df["k"] = df["k"].astype(float)
+        df["n"] = df["n"].astype(float)
+        bad = int(((df["k"] < 0) | (df["n"] < df["k"]) | (df["n"] <= 0)).sum())
+        if bad:
+            raise ValueError(f"betabinom_counts source: {bad} rows violate 0<=k<=n, n>0.")
+        return df
+
+    def describe(self) -> dict:
+        return {
+            "source_type": self.source_type,
+            "has_variants": self.has_variants,
+            "counts_csv": self.counts_csv,
+            "assay": self.assay,
+            "donor": self.donor,
+        }
+
 class MultiTissuePeakRowSource(RowSource):
     source_type = "multi_tissue_peak"
     has_variants = False
@@ -1739,6 +1816,7 @@ def build_dataset(
     partition_spec: Optional["PartitionSpec"] = None,
     drop_aux_nan: bool = True,
     depth_col: Optional[str] = None,
+    count_cols: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
     Source-agnostic dataset builder.
@@ -1847,6 +1925,7 @@ def build_dataset(
         balance_spec=balance_spec,
         balance_split=balance_split,
         depth_col=depth_col,
+        count_cols=count_cols,
     )
 
     return df

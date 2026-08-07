@@ -61,6 +61,7 @@ from entexbert2.utils import (
     SNVRowSource,
     PeakBedRowSource,
     MultiTissuePeakRowSource,
+    BetabinomCountRowSource,
     build_dataset,
     make_as_class_label_spec,
     make_as_regression_label_spec,
@@ -139,10 +140,18 @@ def _build_multi_tissue_peak_source(cfg):
         seed=cfg.get("seed", 42),
     )
 
+def _build_betabinom_source(cfg):
+    return BetabinomCountRowSource(
+        counts_csv=cfg["path"],
+        assay=cfg.get("assay"),
+        donor=cfg.get("donor"),
+    )
+
 ROW_SOURCE_BUILDERS = {
     "snv_tsv": _build_snv_source,
     "peak_bed": _build_peak_bed_source,
     "multi_tissue_peak": _build_multi_tissue_peak_source,
+    "betabinom_counts": _build_betabinom_source,
 }
 
 
@@ -410,6 +419,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
     depth_col = cfg.get("depth_col") # e.g. "total_reads" for the heteroscedastic head
+    count_cols = cfg.get("count_cols") # e.g. ["k", "n"] for the beta-binomial task
 
     # Optional hybrid cross-individual partition (held-out test chrom(s) + hashed genomic bins).
     # None => fall back to the group-shuffle split. Everything dataset-specific is in the config.
@@ -467,6 +477,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         dedup_sequences_across_splits=dedup_across_splits,
         partition_spec=partition_spec,
         depth_col=depth_col,
+        count_cols=count_cols,
     )
 
     print(f"\nDone. Final rows: {len(df)}")
