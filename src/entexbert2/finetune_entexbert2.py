@@ -1,3 +1,19 @@
+'''
+This script is a modified version of the DNABERT-2 finetuning script,
+found at https://github.com/MAGICS-LAB/DNABERT_2/blob/main/finetune/train.py
+
+This modified version supports:
+- Continuous label prediction via a linear regression head
+- 2-stage fine-tune
+
+All modifications to the original script are wrapped in comments in the following format:
+### NEW/MODIFIED: [description of addition/modification] ####
+...
+#############################################################
+
+Last modified: 8/10/2026 by Amy Metrick
+'''
+
 import os
 import csv
 import copy
@@ -341,15 +357,15 @@ def train():
         tokenizer.eos_token = tokenizer.pad_token
 
     # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair functionality]]
-        train_dataset = SupervisedDataset(tokenizer=tokenizer,
-                                      data_path=os.path.join(data_args.data_path, "train.csv"),
-                                      kmer=data_args.kmer, input_mode=data_args.input_mode)
+    train_dataset = SupervisedDataset(tokenizer=tokenizer,
+                                    data_path=os.path.join(data_args.data_path, "train.csv"),
+                                    kmer=data_args.kmer, input_mode=data_args.input_mode)
     val_dataset = SupervisedDataset(tokenizer=tokenizer, 
-                                     data_path=os.path.join(data_args.data_path, "dev.csv"), 
-                                     kmer=data_args.kmer, input_mode=data_args.input_mode)
+                                    data_path=os.path.join(data_args.data_path, "dev.csv"), 
+                                    kmer=data_args.kmer, input_mode=data_args.input_mode)
     test_dataset = SupervisedDataset(tokenizer=tokenizer, 
-                                     data_path=os.path.join(data_args.data_path, "test.csv"), 
-                                     kmer=data_args.kmer, input_mode=data_args.input_mode)
+                                    data_path=os.path.join(data_args.data_path, "test.csv"), 
+                                    kmer=data_args.kmer, input_mode=data_args.input_mode)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
 
