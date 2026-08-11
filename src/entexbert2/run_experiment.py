@@ -1,49 +1,43 @@
 #!/usr/bin/env python3
 
 """
-Config-driven entexBERT-2 dataset runner.
+Config-driven entexBERT-2 dataset runner (2-stage ASB pipeline).
 
 Each experiment is a declarative config (YAML or JSON); this runner composes a row source
-with primary/aux labels and calls the source-agnostic build_dataset. New formats are added
-by (1) implementing a RowSource / make_*_label_spec in entexbert2.utils and (2) registering
-it in ROW_SOURCE_BUILDERS / LABEL_BUILDERS below. New *experiments* need no code at all.
+with a primary label and calls the source-agnostic build_dataset in entexbert2.build_inputs.
+New formats are added by (1) implementing a RowSource / make_*_label_spec in build_inputs and
+(2) registering it in ROW_SOURCE_BUILDERS / LABEL_BUILDERS below. New *experiments* need no code.
+
+Two live pipelines:
+
+  Stage 1 (binding trunk):  row_source multi_tissue_peak + label bigwig (or column)
+  Stage 2 (ASB twin head):  row_source betabinom_counts + label logit_ratio, with
+                            depth_col: n  (n carried through as the privileged weight)
 
 Usage:
-    python run_experiment.py configs/as_ctcf_binary_1024_center.yaml
+    python run_experiment.py configs/stage2_ctcf_asb.yaml
     python run_experiment.py exp.yaml --ref_fasta /data/hg38.fa --output_dir runs/foo
 
-Example config:
+Example Stage-2 config:
 
-    experiment: as_ctcf_binary_1024_center
+    experiment: stage2_ctcf_asb
     ref_fasta: /data/hg38.fa
-    output_dir: runs/as_ctcf_binary_1024_center
-    row_source: {type: snv_tsv, path: hetSNVs_default_AS.tsv,
-                 assay: TF-ChIP-seq_CTCF, donor: ENC-002, tissue: null, min_total_reads: 10}
-    primary_label: {type: as_class}
-    aux_labels: []
-    sequence: {input_mode: ref_single}
-    window: {left_bp: 512, right_bp: 511, snv_offset_mode: fixed, jitter_max_bp: 0}
-    balance: {strategy: none, label_col: imbalance_significance}
-    split: {mode: train_dev_test, ratio: [0.8, 0.1, 0.1], seed: 42, group: locus,
-            skip_ambiguous: true, exclude_loci_meta: []}
-    head: {task: classification, num_labels: 2, head_num_layers: 1, head_hidden_size: -1}
-
-    # OPTIONAL hybrid cross-individual partition. Omit (or enabled: false) to use the split block
-    # above. When enabled it OVERRIDES the group-shuffle split: the chromosome(s) whose
-    # fold_assignment value == fold_id become TEST; the rest are hashed into train/dev. K-fold-ready
-    # — a later sweep just re-runs with a different fold_id. Nothing dataset-specific is in code.
+    output_dir: runs/stage2_ctcf_asb
+    row_source: {type: betabinom_counts, path: ctcf_betabinom_counts.csv, donor: null}
+    primary_label: {type: logit_ratio}          # y = logit((k+0.5)/(n+1))
+    sequence: {input_mode: hap_pair}
+    window: {left_bp: 128, right_bp: 128, snv_offset_mode: fixed, jitter_max_bp: 0}
+    balance: {strategy: none}
+    split: {mode: train_dev_test, ratio: [0.8, 0.1, 0.1], seed: 42, group: locus}
+    head: {task: regression, num_labels: 1, head_num_layers: 1, head_hidden_size: -1}
+    depth_col: n                                 # n -> `depth` weight column (w = n_eff)
     partition: {enabled: true, bin_size: 100000, salt: entexbert2_v1, fold_id: 0,
-                fold_assignment: {chr7: 0, chr14: 0}}
+                fold_assignment: {chr5: 0, chr12: 0}}
 
-Label types (primary_label / each aux):
-    as_class       : {type, name?}                                         (classification)
-    as_regression  : {type, target, name?, transform?}                     (regression)
-                     target in {hap1_ratio, ref_allele_ratio, signed_log_count_ratio,
-                                abs_log_count_ratio, as_magnitude}
-    bigwig         : {type, path, target_name|name, signal_mode?, region?, radius_bp?,
-                      transform?, missing_value?}                          (regression)
-    peak           : {type, path, target_name|name, peak_mode?, score_field?, region?,
-                      radius_bp?, format?, transform?, missing_value?}
+Label types:
+    logit_ratio : {type, name?}                  Stage-2 ASB target logit((k+0.5)/(n+1))  (regression)
+    bigwig      : {type, path, name?, signal_mode?, region?, radius_bp?, transform?}       (regression)
+    column      : {type, column, name?, transform?}   precomputed source column            (regression)
 """
 
 import argparse
@@ -54,19 +48,15 @@ import sys
 
 from pyfaidx import Fasta
 
-from entexbert2.utils import (
+from entexbert2.build_inputs import (
     BalanceSpec,
     PartitionSpec,
     SNVWindowSpec,
-    SNVRowSource,
-    PeakBedRowSource,
     MultiTissuePeakRowSource,
     BetabinomCountRowSource,
     build_dataset,
-    make_as_class_label_spec,
-    make_as_regression_label_spec,
+    make_logit_ratio_label_spec,
     make_bigwig_label_spec,
-    make_peak_bed_label_spec,
     make_column_label_spec,
     log1p_transform,
     identity_transform,
@@ -91,37 +81,6 @@ def get_transform_fn(name):
 # ---------------------------------------------------------------------------
 # Row source registry  (extension point #1)
 # ---------------------------------------------------------------------------
-
-def _build_snv_source(cfg):
-    tissue = cfg.get("tissue")
-    if tissue in NONE_TISSUE_TOKENS:
-        tissue = None
-    return SNVRowSource(
-        input_tsv=cfg["path"],
-        assay=cfg["assay"],
-        donor=cfg["donor"],
-        tissue=tissue,
-        min_total_reads=cfg.get("min_total_reads"),
-        chunksize=cfg.get("chunksize", 100000),
-    )
-
-def _build_peak_bed_source(cfg):
-    tissue = cfg.get("tissue")
-    if tissue in NONE_TISSUE_TOKENS:
-        tissue = None
-    return PeakBedRowSource(
-        peak_path=cfg["path"],
-        assay=cfg["assay"],
-        donor=cfg["donor"],
-        tissue=tissue,
-        genome_sizes_path=cfg.get("genome_sizes"),
-        is_narrowpeak=(cfg.get("format", "narrowpeak") == "narrowpeak"),
-        summit_mode=cfg.get("summit_mode", "summit"),
-        background_ratio=cfg.get("background_ratio", 1.0),
-        background_gap_bp=cfg.get("background_gap_bp", 1000),
-        exclude_chroms=cfg.get("exclude_chroms"),
-        seed=cfg.get("seed", 42),
-    )
 
 def _build_multi_tissue_peak_source(cfg):
     tracks = cfg["tissue_tracks"]          # [{tissue, peak_path, bigwig_path}, ...]
@@ -148,10 +107,8 @@ def _build_betabinom_source(cfg):
     )
 
 ROW_SOURCE_BUILDERS = {
-    "snv_tsv": _build_snv_source,
-    "peak_bed": _build_peak_bed_source,
-    "multi_tissue_peak": _build_multi_tissue_peak_source,
-    "betabinom_counts": _build_betabinom_source,
+    "multi_tissue_peak": _build_multi_tissue_peak_source,   # Stage 1 (binding trunk)
+    "betabinom_counts": _build_betabinom_source,            # Stage 2 (ASB twin head)
 }
 
 
@@ -161,10 +118,9 @@ ROW_SOURCE_BUILDERS = {
 
 # Default post-fn transform per label type.
 _DEFAULT_TRANSFORM = {
-    "as_class": "identity",
-    "as_regression": "identity",
+    "logit_ratio": "identity",
     "bigwig": "log1p",
-    "peak": "log1p",
+    "column": "identity",
 }
 
 
@@ -172,14 +128,8 @@ def _label_name(cfg, fallback):
     return cfg.get("name") or cfg.get("target_name") or fallback
 
 
-def _build_as_class(cfg, _tf):
-    return make_as_class_label_spec(name=cfg.get("name", "imbalance_significance"))
-
-
-def _build_as_regression(cfg, tf):
-    return make_as_regression_label_spec(
-        target=cfg["target"], name=cfg.get("name"), transform_fn=tf
-    )
+def _build_logit_ratio(cfg, _tf):
+    return make_logit_ratio_label_spec(name=cfg.get("name", "logit_ratio"))
 
 
 def _build_bigwig(cfg, tf):
@@ -196,30 +146,15 @@ def _build_bigwig(cfg, tf):
     )
 
 
-def _build_peak(cfg, tf):
-    return make_peak_bed_label_spec(
-        name=_label_name(cfg, "peak"),
-        bed_path=cfg["path"],
-        mode=cfg.get("peak_mode", "binary"),
-        region=cfg.get("region", "snv"),
-        radius_bp=cfg.get("radius_bp", 0),
-        score_field=cfg.get("score_field", "signalValue"),
-        is_narrowpeak=(cfg.get("format", "narrowpeak") == "narrowpeak"),
-        missing_value=cfg.get("missing_value", 0.0),
-        transform_fn=tf,
-    )
-
 def _build_column(cfg, tf):
     return make_column_label_spec(
         column=cfg["column"], name=cfg.get("name"), transform_fn=tf
     )
 
 LABEL_BUILDERS = {
-    "as_class": _build_as_class,
-    "as_regression": _build_as_regression,
-    "bigwig": _build_bigwig,
-    "column": _build_column,
-    "peak": _build_peak,
+    "logit_ratio": _build_logit_ratio,     # Stage 2 ASB target
+    "bigwig": _build_bigwig,               # Stage 1 binding signal
+    "column": _build_column,               # precomputed source column (e.g. consensus fold-change)
 }
 
 
@@ -284,7 +219,7 @@ def build_partition_spec(cfg):
             salt: entexbert2_v1
             fold_id: 0
             train_frac_within_nontest: 0.8888888888888888   # 8:1 train:dev
-            fold_assignment: {chr7: 0, chr14: 0}            # chrom -> fold index
+            fold_assignment: {chr5: 0, chr12: 0}            # chrom -> fold index
     """
     pcfg = cfg.get("partition")
     if not pcfg or not pcfg.get("enabled", False):
@@ -320,7 +255,7 @@ def resolve_head(head, primary_label):
     """
     Derive/validate the finetune head config from the primary label's task_type so the two
     can't disagree. The config's `head` block only needs architecture (head_num_layers,
-    head_hidden_size) and, for classification, num_labels (the class count).
+    head_hidden_size). The 2-stage ASB model is regression-only (num_labels=1).
     """
     head = dict(head or {})
     task = primary_label.task_type  # authoritative: comes from the label
@@ -332,22 +267,20 @@ def resolve_head(head, primary_label):
         )
     head["task"] = task
 
-    if task == "regression":
-        if head.get("num_labels", 1) != 1:
-            print(f"  note: regression forces num_labels=1 (config had {head.get('num_labels')}).")
-        head["num_labels"] = 1
-    else:
-        if "num_labels" not in head:
-            print("  note: classification head defaulting to num_labels=2; set head.num_labels "
-                  "explicitly for multi-bin labels.")
-        head.setdefault("num_labels", 2)
+    if task != "regression":
+        raise ValueError(
+            f"The streamlined 2-stage model supports task='regression' only, got {task!r}."
+        )
+    if head.get("num_labels", 1) != 1:
+        print(f"  note: regression forces num_labels=1 (config had {head.get('num_labels')}).")
+    head["num_labels"] = 1
 
     head.setdefault("head_num_layers", 1)
     head.setdefault("head_hidden_size", -1)
     return head
 
 
-def emit_finetune_settings(head, output_dir, primary_name, aux_names):
+def emit_finetune_settings(head, output_dir, primary_name, depth_col):
     """Print the finetune settings recorded for this dataset (verified flags only)."""
     print("\nFinetune settings (map to finetune_entexbert2.py):")
     print(f"  --task {head['task']}")
@@ -355,8 +288,8 @@ def emit_finetune_settings(head, output_dir, primary_name, aux_names):
     print(f"  --head_num_layers {head['head_num_layers']}  (1 = linear, >1 = MLP)")
     if head["head_hidden_size"] != -1:
         print(f"  --head_hidden_size {head['head_hidden_size']}")
-    if aux_names:
-        print(f"  (aux heads: {aux_names} — set --num_aux_tasks / --aux_task_types / --aux_num_labels)")
+    if depth_col:
+        print(f"  --hetero_loss precision_neff --neff_s <s>   (privileged weight from '{depth_col}' -> depth)")
     print(f"  trainer data path: {output_dir}")
     print(f"  primary label column: {primary_name}")
 
@@ -418,8 +351,8 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         raise ValueError(f"balance.apply_to must be 'all' or 'train', got {balance_split!r}.")
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
-    depth_col = cfg.get("depth_col") # e.g. "total_reads" for the heteroscedastic head
-    count_cols = cfg.get("count_cols") # e.g. ["k", "n"] for the beta-binomial task
+    depth_col = cfg.get("depth_col")   # Stage 2: "n" -> privileged precision weight (w = n_eff)
+    count_cols = cfg.get("count_cols") # optional: extra count columns to carry into train.csv
 
     # Optional hybrid cross-individual partition (held-out test chrom(s) + hashed genomic bins).
     # None => fall back to the group-shuffle split. Everything dataset-specific is in the config.
@@ -437,6 +370,8 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
           f"offset={window_spec.snv_offset_mode} jitter={window_spec.jitter_max_bp}")
     print(f"  split:      {split_mode} group={'locus' if group_cols else 'none'} "
           f"exclude={len(exclude_loci) if exclude_loci else 0} loci")
+    if depth_col:
+        print(f"  depth_col:  {depth_col} (-> 'depth' privileged weight)")
 
     if partition_spec is not None:
         _test_chroms = sorted(c for c, f in partition_spec.fold_assignment.items()
@@ -481,7 +416,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     )
 
     print(f"\nDone. Final rows: {len(df)}")
-    emit_finetune_settings(head, output_dir, primary_label.name, [a.name for a in aux_labels])
+    emit_finetune_settings(head, output_dir, primary_label.name, depth_col)
     return df
 
 

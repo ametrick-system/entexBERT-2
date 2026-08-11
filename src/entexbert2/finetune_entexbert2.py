@@ -1,20 +1,3 @@
-'''
-This script is a modified version of the DNABERT-2 finetuning script,
-found at https://github.com/MAGICS-LAB/DNABERT_2/blob/main/finetune/train.py
-
-This modified version supports:
-- Continuous label prediction via a linear regression head
-- Incorporation of auxiliary tasks during training following the LUPI framework
-- A Multi-Layer Perceptron head with several options for between-layer non-linearities
-
-All modifications to the original script are wrapped in comments in the following format:
-### NEW: [description of modification] ###
-...
-##########################################
-
-Last modified: 8/7/2026 by Amy Metrick
-'''
-
 import os
 import csv
 import copy
@@ -35,12 +18,11 @@ from peft import (
     get_peft_model_state_dict,
 )
 
-####################### NEW IMPORTS ##############################
-import pandas as pd
-from functools import partial
-from scipy.stats import pearsonr, spearmanr
-from transformers.modeling_outputs import SequenceClassifierOutput
-###################################################################
+## NEW IMPORTS #################################################
+from scipy.stats import pearsonr, spearmanr # regression metrics
+from entexbert2.model import entexBERT2ForSequencePrediction 
+################################################################
+
 
 @dataclass
 class ModelArguments:
@@ -50,13 +32,30 @@ class ModelArguments:
     lora_alpha: int = field(default=32, metadata={"help": "alpha for LoRA"})
     lora_dropout: float = field(default=0.05, metadata={"help": "dropout rate for LoRA"})
     lora_target_modules: str = field(default="query,value", metadata={"help": "where to perform LoRA"})
-
+    # NEW: entexBERT-2 head / pooling architecture (used by entexBERT2ForSequencePrediction) ################
+    pooling_mode: str = field(default="center_mean", metadata={"help": "'center_mean' or 'cls'"})
+    center_pool_width: int = field(default=5, metadata={"help": "odd width of the center-mean pool window"})
+    head_num_layers: int = field(default=1, metadata={"help": "1 = linear head, >=2 = MLP head g_phi"})
+    head_hidden_size: int = field(default=-1, metadata={"help": "MLP hidden size (-1 = auto)"})
+    head_activation: str = field(default="gelu")
+    head_dropout: float = field(default=0.1)
+    # NEW: privileged precision weighting w =  n(1+s)/(n+s) #################################################
+    neff_s: float = field(default=50.0, metadata={"help": "n_eff saturation cap s (0 = unweighted)"})
+    # NEW: 2-stage transfer learning ########################################################################
+    init_backbone_from: Optional[str] = field(default=None,
+        metadata={"help": "path to a Stage-1 checkpoint; loads backbone.* weights only"})
+    freeze_backbone: bool = field(default=False,
+        metadata={"help": "freeze the backbone (Stage 2: train the twin head only)"})
+    #########################################################################################################
 
 @dataclass
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
     kmer: int = field(default=-1, metadata={"help": "k-mer for input sequence. -1 means not using k-mer."})
-    input_mode: str = field(default="hap_pair", metadata={"help": "ref_single | ref_alt_pair | hap_pair; used to arm the twin-batch assertion."}) # NEW
+    # NEW: regression task capabilities and streamline haplotype pair input format ########################
+    task: str = field(default="regression", metadata={"help": "'regression' (only mode supported)"})
+    input_mode: str = field(default="hap_pair", metadata={"help": "'hap_pair' (twin) or 'single'"})
+    #######################################################################################################
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -84,140 +83,11 @@ class TrainingArguments(transformers.TrainingArguments):
     dataloader_pin_memory: bool = field(default=False)
     eval_and_save_results: bool = field(default=True)
     save_model: bool = field(default=False)
-    ######################## NEW: CLASS WEIGHTING FOR IMBALANCED DATASETS #########################
-    class_weights: str = field(
-        default="none",
-        metadata={"help": "Main classification-loss class weighting: 'none', 'balanced' "
-                  "(inverse-frequency from train.csv), or explicit comma-separated per-class "
-                  "weights e.g. '1.0,10.0'."},
-    )
-    contrast_mode: str = field(default="signed")  # signed | symmetric_abs
-    ###############################################################################################
-    ############################ NEW: HETEROSCEDASTIC REGRESSION HEAD #############################
-    heteroscedastic: bool = field(default=False, metadata={"help":
-        "Regression only: depth-supervised loss (down-weights low-depth/noisy loci). "
-        "Requires a 'depth' column in the CSVs (set depth_col in the build config)."})
-    hetero_loss: str = field(default="nll", metadata={"help":
-        "Which depth-supervised loss when heteroscedastic=True: "
-        "'nll' (Gaussian NLL, mu + depth-tied log-variance + learnable bias) or "
-        "'weighted_mse' (precision-weighted GLS: mean(depth_norm*(y-mu)^2); simpler, "
-        "same mean predictor, no logvar_bias). Both give identical mean gradients up to a "
-        "global scale; weighted_mse has fewer moving parts."})
-    predict_sigma: bool = field(default=False, metadata={"help":
-        "Regression only: add a SEPARATE variance head that predicts a per-sequence "
-        "log-variance FROM THE SEQUENCE (not from an input depth column). Trains a Gaussian "
-        "NLL with LEARNED variance and, unlike --heteroscedastic, emits sigma at INFERENCE so "
-        "a variant can be scored by Delta/sigma. Mutually exclusive with --heteroscedastic."})
-    sigma_logvar_clamp: float = field(default=10.0, metadata={"help":
-        "Clamp |log_var| from the sigma head to this range for numerical stability "
-        "(exp(+-10) is a safe variance range)."})
-    ##############################################################################################
     seed: int = field(default=42)
-    ######################### NEW: MAIN TASK (with regression and MLP support) #######################
-    task: str = field(
-        default="regression",
-        metadata={"help": "Main task type: 'classification' or 'regression'"}
-    )
-
-    main_num_labels: int = field(
-        default=1,
-        metadata={
-            "help": (
-                "Number of output labels for the main head. "
-                "Use 1 for regression, 1 for binary BCE classification, "
-                "2 for binary softmax classification, and >2 for multiclass."
-            )
-        }
-    )
-
-    head_num_layers: int = field(
-        default=1,
-        metadata={
-            "help": (
-                "Total number of Linear layers in the main prediction head. "
-                "1 means a simple linear head. >1 means an MLP head."
-            )
-        },
-    )
-
-    head_hidden_size: int = field(
-        default=-1,
-        metadata={
-            "help": (
-                "Hidden size for MLP prediction head. "
-                "If -1, use the backbone hidden size."
-            )
-        },
-    )
-
-    head_activation: str = field(
-        default="gelu",
-        metadata={
-            "help": "Activation function for MLP prediction head: 'gelu', 'relu', 'tanh', or 'silu'."
-        },
-    )
-
-    head_dropout: float = field(
-        default=0.1,
-        metadata={
-            "help": "Dropout probability used inside the MLP prediction head."
-        },
-    )
-    ##################################################################################################
-
-    ############################## NEW: LUPI / AUX TASKS ################################
-    num_aux_tasks: int = field(
-        default=0,
-        metadata={"help": "Number of auxiliary tasks. 0 means no auxiliary supervision."}
-    )
-
-    aux_task_names: List[str] = field(
-        default_factory=list,
-        metadata={"help": "Names of auxiliary tasks, one per auxiliary head."}
-    )
-
-    aux_task_types: List[str] = field(
-        default_factory=list,
-        metadata={
-            "help": (
-                "Type of each auxiliary task. "
-                "Supported values per head: 'binary', 'multiclass', 'regression'."
-            )
-        }
-    )
-
-    aux_num_labels: List[int] = field(
-        default_factory=list,
-        metadata={
-            "help": (
-                "Number of output labels/classes for each auxiliary head. "
-                "Use 1 for regression, 1 for binary BCE-style classification, "
-                "and >1 for multiclass classification."
-            )
-        }
-    )
-
-    lambda_aux: List[float] = field(
-        default_factory=list,
-        metadata={
-            "help": "Loss weight for each auxiliary task, one per auxiliary head."
-        }
-    )
-    #####################################################################################
-
-    ############################## NEW: ENABLE CENTER/MEAN POOLING ###############################
-    pooling_mode: str = field(
-        default="cls",
-        metadata={"help": "How to pool token embeddings: 'cls' or 'center_mean'."}
-    )
-
-    center_pool_width: int = field(
-        default=5,
-        metadata={"help": "Number of center tokens to mean-pool when pooling_mode='center_mean'."}
-    )
-    ###############################################################################################
-
-    remove_unused_columns: bool = field(default=False) # NEW: override HF default of True
+    # NEW: regression selects the best checkpoint by Spearman, greater is better!
+    metric_for_best_model: str = field(default="spearman")
+    greater_is_better: bool = field(default=True)
+    #############################################################################
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -226,7 +96,6 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: st
         cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
-
 
 """
 Get the reversed complement of the original DNA sequence.
@@ -242,7 +111,6 @@ Transform a dna sequence to k-mer string
 def generate_kmer_str(sequence: str, k: int) -> str:
     """Generate k-mer string from DNA sequence."""
     return " ".join([sequence[i:i+k] for i in range(len(sequence) - k + 1)])
-
 
 """
 Load or generate k-mer string for each DNA sequence. The generated k-mer string will be saved to the same directory as the original data with the same name but with a suffix of "_{k}mer".
@@ -265,1102 +133,199 @@ def load_or_generate_kmer(data_path: str, texts: List[str], k: int) -> List[str]
 
 class SupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
-    #### EDITED (indicated with NEW) to support optional LUPI auxiliary labels ####
 
-    def __init__(
-        self,
-        data_path: str,
-        tokenizer: transformers.PreTrainedTokenizer,
-        kmer: int = -1,
-        task: str = "classification",
-        aux_task_names: Optional[List[str]] = None, # NEW
-        aux_task_types: Optional[List[str]] = None, # NEW
-        heteroscedastic: bool = False, # NEW
-    ):
+    def __init__(self, 
+                 data_path: str, 
+                 tokenizer: transformers.PreTrainedTokenizer, 
+                 kmer: int = -1,
+                 input_mode: str = "hap_pair"): # NEW: hap_pair reads two windows per example
 
         super(SupervisedDataset, self).__init__()
 
-        ##################### NEW: INITIALIZE TASK, AUX INFO ########################
-        self.task = task
-        self.aux_task_names = aux_task_names or []
-        self.aux_task_types = aux_task_types or []
-        self.heteroscedastic = heteroscedastic
-
-        # ensure task name list is same size as task type list
-        if len(self.aux_task_names) != len(self.aux_task_types):
-            raise ValueError(
-                f"aux_task_names and aux_task_types must have the same length, got "
-                f"{len(self.aux_task_names)} and {len(self.aux_task_types)}"
-            )
-        #############################################################################
-
-        # load data from the disk
+        # MODIFIED: load data from the disk ##############################################
+             # read by column name: sequence1,sequence2,label[,depth])
+             # original code inferred  single-vs-paired sequence input from the column count
         with open(data_path, "r") as f:
-            reader = csv.DictReader(f) # NEW: use DictReader to parse column names
-            data = list(reader)
-        
-        ##### NEW: THE BELOW STRUCTURE IS REWORKED USING DictReader TO HANDLE NEW INPUT CSV FORMAT #####
-        if len(data) == 0:
-            raise ValueError(f"No rows found in {data_path}")
-        
-        # detect whether this is single-sequence or sequence-pair
-        has_sequence = "sequence" in data[0]
-        has_sequence_pair = "sequence1" in data[0] and "sequence2" in data[0]
+            rows = list(csv.DictReader(f))
+        if not rows:
+            raise ValueError(f"{data_path} is empty.")
+        cols = rows[0].keys()
 
-        if has_sequence:
-            logging.warning("Perform single-sequence prediction...")
-            texts = [row["sequence"] for row in data]
-        elif has_sequence_pair:
-            logging.warning("Perform sequence-pair prediction...")
-            texts = [[row["sequence1"], row["sequence2"]] for row in data]
+        if input_mode == "hap_pair":
+            if "sequence1" not in cols or "sequence2" not in cols:
+                raise ValueError(f"hap_pair needs sequence1,sequence2 columns; got {list(cols)}.")
+            logging.warning("Perform hap_pair twin regression...")
+            texts = [[r["sequence1"], r["sequence2"]] for r in rows]
         else:
-            raise ValueError(
-                "CSV must contain either 'sequence' column or both 'sequence1' and 'sequence2' columns."
-            )
-        
-        # main labels
-        if task == "betabinomial": # NEW
-            for col in ("k", "n"):
-                if col not in data[0]:
-                    raise ValueError(f"betabinomial task requires a {col!r} column "
-                                     f"(hap1_count / total); missing in {data_path}.")
-            # label pair [k, n]: k = hap1 reads, n = total. Loss-only; never fed to the trunk
-            labels = [[float(row["k"]), float(row["n"])] for row in data]
-        else:
-            if "label" not in data[0]:
-                raise ValueError("CSV must contain a 'label' column for the main task.")
-            if task == "regression":
-                labels = [float(row["label"]) for row in data]
-            elif task == "classification":
-                labels = [int(row["label"]) for row in data]
-            else:
-                raise ValueError(f"Unsupported main task: {task}")
-        
-        # NEW: depth for the heteroscedastic head (read only when requested)
-        if self.heteroscedastic:
-            if "depth" not in data[0]:
-                raise ValueError("heteroscedastic=True but no 'depth' column in "
-                                 f"{data_path} (set depth_col in the build config).")
-            self.depth = [float(row["depth"]) for row in data]
-        else:
-            self.depth = None
-        
-        # auxiliary labels
-        aux_labels = []
-        for row in data:
-            row_aux = []
-            for aux_name, aux_type in zip(self.aux_task_names, self.aux_task_types):
-                if aux_name not in row:
-                    raise ValueError(
-                        f"Auxiliary task column '{aux_name}' not found in {data_path}"
-                    )
+            seqcol = "sequence" if "sequence" in cols else "sequence1"
+            logging.warning("Perform single-sequence regression...")
+            texts = [r[seqcol] for r in rows]
 
-                raw_val = row[aux_name]
+        # NEW: float labels for regression tasks
+        labels = [float(r["label"]) for r in rows]
+        # NEW: optional privileged depth column n (the precision weight)
+        self.depth = [float(r["depth"]) for r in rows] if "depth" in cols else None
+        ############################################################################################
 
-                if aux_type == "regression":
-                    row_aux.append(float(raw_val))
-                elif aux_type == "binary":
-                    # BCEWithLogitsLoss expects float labels
-                    row_aux.append(float(raw_val))
-                elif aux_type == "multiclass":
-                    row_aux.append(int(raw_val))
-                else:
-                    raise ValueError(
-                        f"Unsupported aux task type '{aux_type}' for aux task '{aux_name}'"
-                    )
-            aux_labels.append(row_aux)
-        ########################################################################################
         
         if kmer != -1:
-            if torch.distributed.is_available() and torch.distributed.is_initialized(): # NEW: added for robustness in case of using multiple GPUs
-                if torch.distributed.get_rank() not in [0, -1]:
-                    torch.distributed.barrier()
+            # only write file on the first process
+            if torch.distributed.get_rank() not in [0, -1]:
+                torch.distributed.barrier()
 
             logging.warning(f"Using {kmer}-mer as input...")
-            texts = load_or_generate_kmer(data_path, texts, kmer)
 
-            if torch.distributed.is_available() and torch.distributed.is_initialized(): # NEW (see above)
-                if torch.distributed.get_rank() == 0:
-                    torch.distributed.barrier()
+            # MODIFIED: k-merize *each* window of the pair (or the single sequence)
+            if input_mode == "hap_pair":
+                flat = [s for pair in texts for s in pair]
+                flat = load_or_generate_kmer(data_path, flat, kmer)
+                texts = [[flat[2 * i], flat[2 * i + 1]] for i in range(len(texts))]
+            else:
+                texts = load_or_generate_kmer(data_path, texts, kmer)
+            #######################################################################
 
-        # NEW: for a sequence-pair, tokenize the ref and alt windows SEPARATELY (not [SEP]-concatenated)
-        self.is_pair = has_sequence_pair
-        if has_sequence_pair:
-            seqs_ref = [t[0] for t in texts] # sequence1 = REF window
-            seqs_alt = [t[1] for t in texts] # sequence2 = ALT window
-            out_ref = tokenizer(seqs_ref, return_tensors="pt", padding="longest",
-                                max_length=tokenizer.model_max_length, truncation=True)
-            out_alt = tokenizer(seqs_alt, return_tensors="pt", padding="longest",
-                                max_length=tokenizer.model_max_length, truncation=True)
-            self.input_ids = out_ref["input_ids"]
-            self.attention_mask = out_ref["attention_mask"]
-            self.input_ids_alt = out_alt["input_ids"]
-            self.attention_mask_alt = out_alt["attention_mask"]
+            if torch.distributed.get_rank() == 0:
+                torch.distributed.barrier()
+
+        # MODIFIED: for hap_pair, tokenize the two windows SEPARATELY rather than [SEP]-concatenating
+        self.input_mode = input_mode
+        if input_mode == "hap_pair":
+            enc1 = tokenizer([t[0] for t in texts], return_tensors="pt", padding="longest",
+                             max_length=tokenizer.model_max_length, truncation=True)
+            enc2 = tokenizer([t[1] for t in texts], return_tensors="pt", padding="longest",
+                             max_length=tokenizer.model_max_length, truncation=True)
+            self.input_ids = enc1["input_ids"]
+            self.attention_mask = enc1["attention_mask"]
+            self.input_ids_alt = enc2["input_ids"]
+            self.attention_mask_alt = enc2["attention_mask"]
         else:
-            output = tokenizer(texts, return_tensors="pt", padding="longest",
-                               max_length=tokenizer.model_max_length, truncation=True)
-            self.input_ids = output["input_ids"]
-            self.attention_mask = output["attention_mask"]
-            self.input_ids_alt = None # NEW
-            self.attention_mask_alt = None # NEW
+            enc = tokenizer(texts, return_tensors="pt", padding="longest",
+                            max_length=tokenizer.model_max_length, truncation=True)
+            self.input_ids = enc["input_ids"]
+            self.attention_mask = enc["attention_mask"]
+            self.input_ids_alt = None
+            self.attention_mask_alt = None
 
         self.labels = labels
-        self.aux_labels = aux_labels # NEW
-
-        ######### NEW: SET NUM_LABELS TO 1 FOR REGRESSION TASK ##########
-        # Stored only for dataset inspection/debugging
-        # The model head size is controlled by training_args.main_num_labels
-        self.num_labels = 1 if task == "regression" else len(set(labels))
+        self.num_labels = 1 # NEW: regression -> single output
+        ############################################################################################
 
     def __len__(self):
         return len(self.input_ids)
 
-    def __getitem__(self, i) -> Dict[str, Any]: # NEW: change return type to Any
-        #### NEW: SUPPORT FOR AUX LABELS, REF/ALT SEPARATION, HETEROSCEDASTIC HEAD ####
-        item = {
-            "input_ids": self.input_ids[i],
-            "attention_mask": self.attention_mask[i],
-            "labels": self.labels[i],
-        }
-        if getattr(self, "input_ids_alt", None) is not None:
+    def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+        # MODIFIED: emit the twin pair + float label (+ depth weight when present)
+        item = dict(input_ids=self.input_ids[i], labels=self.labels[i])
+        if self.input_ids_alt is not None:
             item["input_ids_alt"] = self.input_ids_alt[i]
-            item["attention_mask_alt"] = self.attention_mask_alt[i]
-
-        if len(self.aux_task_names) > 0:
-            item["aux_labels"] = self.aux_labels[i]
-        
-        if getattr(self, "depth", None) is not None:
+        if self.depth is not None:
             item["depth"] = self.depth[i]
-
         return item
+        ###########################################################################
 
 @dataclass
 class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
-    #### EDITED (indicated with NEW) to support optional LUPI auxiliary labels ####
 
     tokenizer: transformers.PreTrainedTokenizer
-    ######### NEW: KEEP TRACK OF MAIN & AUX TASK TYPES #############
-    main_task: str = "classification"
-    aux_task_types: Optional[List[str]] = None
 
-    def __call__(self, instances: Sequence[Dict]) -> Dict[str, Any]: # NEW: use Any, since batch will contain tensors
-        # NOTE: altered structure to support aux functionality
-        aux_task_types = self.aux_task_types or [] # NEW
-        
-        # input_ids
+    def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids = [instance["input_ids"] for instance in instances]
-        input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id,
-        )
-
-        # NEW: ATTENTION MASK PADDING TO ALLOW ATTENTION MASK TO BE PASSED THROUGH __getitem__
-        attention_mask = [instance["attention_mask"] for instance in instances]
-        attention_mask = torch.nn.utils.rnn.pad_sequence(
-            attention_mask,
-            batch_first=True,
-            padding_value=0,
-        )
-
-        # NEW: twin second sequence (alt window), if present
-        has_alt = "input_ids_alt" in instances[0]
-        if has_alt:
-            input_ids_alt = torch.nn.utils.rnn.pad_sequence(
-                [inst["input_ids_alt"] for inst in instances],
-                batch_first=True, padding_value=self.tokenizer.pad_token_id)
-            attention_mask_alt = torch.nn.utils.rnn.pad_sequence(
-                [inst["attention_mask_alt"] for inst in instances],
-                batch_first=True, padding_value=0)
-
-        # main labels
         labels = [instance["labels"] for instance in instances]
-        main_dtype = (torch.float
-                      if self.main_task in ("regression", "betabinomial")
-                      else torch.long)
-        labels = torch.tensor(labels, dtype=main_dtype)
-
+        input_ids = torch.nn.utils.rnn.pad_sequence(
+            input_ids, batch_first=True, padding_value=self.tokenizer.pad_token_id
+        )
+        # MODIFIED: float labels (regression target) instead of .long() class ids
         batch = dict(
             input_ids=input_ids,
-            labels=labels,
-            attention_mask=attention_mask,
+            labels=torch.tensor(labels, dtype=torch.float),
+            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
         )
-        if has_alt: # NEW
-            batch["input_ids_alt"] = input_ids_alt
-            batch["attention_mask_alt"] = attention_mask_alt
-
-        # auxiliary labels
-        if len(aux_task_types) > 0:
-            if "aux_labels" not in instances[0]:
-                raise ValueError(
-                    "aux_task_types were provided to the collator, "
-                    "but dataset instances do not contain 'aux_labels'."
-                )
-
-            num_aux_tasks = len(aux_task_types)
-            batched_aux_labels = []
-
-            for aux_idx in range(num_aux_tasks):
-                aux_values = [instance["aux_labels"][aux_idx] for instance in instances]
-                aux_type = aux_task_types[aux_idx]
-
-                if aux_type in {"binary", "regression"}:
-                    aux_tensor = torch.tensor(aux_values, dtype=torch.float)
-                elif aux_type == "multiclass":
-                    aux_tensor = torch.tensor(aux_values, dtype=torch.long)
-                else:
-                    raise ValueError(f"Unsupported auxiliary task type: {aux_type}")
-
-                batched_aux_labels.append(aux_tensor)
-
-            batch["aux_labels"] = batched_aux_labels
-
-        # NEW: for heteroscedastic head
+        # NEW: pad + attach the second (alt) window when present (twin input)
+        if "input_ids_alt" in instances[0]:
+            alt = torch.nn.utils.rnn.pad_sequence(
+                [instance["input_ids_alt"] for instance in instances],
+                batch_first=True, padding_value=self.tokenizer.pad_token_id
+            )
+            batch["input_ids_alt"] = alt
+            batch["attention_mask_alt"] = alt.ne(self.tokenizer.pad_token_id)
+        # NEW: carry the privileged depth weight through to the loss (crucially NOT the model input)
         if "depth" in instances[0]:
-            batch["depth"] = torch.tensor([inst["depth"] for inst in instances], dtype=torch.float)
-
+            batch["depth"] = torch.tensor([instance["depth"] for instance in instances],
+                                          dtype=torch.float)
         return batch
 
-"""
-Manually calculate the accuracy, f1, matthews_correlation, precision, recall with sklearn.
-"""
-def calculate_metric_with_sklearn(predictions: np.ndarray, labels: np.ndarray):
-    ##### EDITED TO BE ROBUST TO DIFFERENT SHAPES #####
-    # ensure correct shapes
-    predictions = np.squeeze(predictions)
-    labels = np.squeeze(labels)
+# """
+# Manually calculate the accuracy, f1, matthews_correlation, precision, recall with sklearn.
+# """
+# def calculate_metric_with_sklearn(predictions: np.ndarray, labels: np.ndarray):
+#     valid_mask = labels != -100  # Exclude padding tokens (assuming -100 is the padding token ID)
+#     valid_predictions = predictions[valid_mask]
+#     valid_labels = labels[valid_mask]
+#     return {
+#         "accuracy": sklearn.metrics.accuracy_score(valid_labels, valid_predictions),
+#         "f1": sklearn.metrics.f1_score(
+#             valid_labels, valid_predictions, average="macro", zero_division=0
+#         ),
+#         "matthews_correlation": sklearn.metrics.matthews_corrcoef(
+#             valid_labels, valid_predictions
+#         ),
+#         "precision": sklearn.metrics.precision_score(
+#             valid_labels, valid_predictions, average="macro", zero_division=0
+#         ),
+#         "recall": sklearn.metrics.recall_score(
+#             valid_labels, valid_predictions, average="macro", zero_division=0
+#         ),
+#     }
 
-    # exclude padding tokens if present
-    valid_mask = labels != -100
-
-    if valid_mask.sum() == 0:
-        return {
-            "accuracy": 0.0,
-            "f1": 0.0,
-            "matthews_correlation": 0.0,
-            "precision": 0.0,
-            "recall": 0.0,
-        }
-
-    valid_predictions = predictions[valid_mask]
-    valid_labels = labels[valid_mask]
-
-    # ensure integer type for classification metrics
-    valid_predictions = valid_predictions.astype(int)
-    valid_labels = valid_labels.astype(int)
-    ####################################################
-
-    return {
-        "accuracy": sklearn.metrics.accuracy_score(valid_labels, valid_predictions),
-        "f1": sklearn.metrics.f1_score(
-            valid_labels, valid_predictions, average="macro", zero_division=0
-        ),
-        "matthews_correlation": sklearn.metrics.matthews_corrcoef(
-            valid_labels, valid_predictions
-        ),
-        "precision": sklearn.metrics.precision_score(
-            valid_labels, valid_predictions, average="macro", zero_division=0
-        ),
-        "recall": sklearn.metrics.recall_score(
-            valid_labels, valid_predictions, average="macro", zero_division=0
-        ),
+# NEW: regression metrics ######################################################################
+def calculate_regression_metrics(predictions: np.ndarray, labels: np.ndarray):
+    pred = np.asarray(predictions, dtype=float).reshape(-1)
+    y = np.asarray(labels, dtype=float).reshape(-1)
+    out = {
+        "mse": float(np.mean((pred - y) ** 2)),
+        "pearson": float(pearsonr(pred, y)[0]) if len(y) > 2 else float("nan"),
+        "spearman": float(spearmanr(pred, y).correlation) if len(y) > 2 else float("nan"),
     }
+    direction = (y > 0).astype(int) # hap1-favored vs hap2-favored
+    if 0 < direction.sum() < len(direction):
+        out["auroc"] = float(sklearn.metrics.roc_auc_score(direction, pred))
+    else:
+        out["auroc"] = float("nan")
+    return out
+##############################################################################################
 
-# (original version) from: https://discuss.huggingface.co/t/cuda-out-of-memory-when-using-trainer-with-compute-metrics/2941/13
-# NEW: EDITED FOR STABILITY IN AUX TASK ARCHITECTURE
-def preprocess_logits_for_metrics(
-    main_task: str,
-    logits: Union[torch.Tensor, Tuple[torch.Tensor, Any]],
-    labels,
-):
-    # If model output is a tuple, take the first element as the main logits
+# from: https://discuss.huggingface.co/t/cuda-out-of-memory-when-using-trainer-with-compute-metrics/2941/13
+# def preprocess_logits_for_metrics(logits:Union[torch.Tensor, Tuple[torch.Tensor, Any]], _):
+#     if isinstance(logits, tuple):  # Unpack logits if it's a tuple
+#         logits = logits[0]
+
+#     if logits.ndim == 3:
+#         # Reshape logits to 2D if needed
+#         logits = logits.reshape(-1, logits.shape[-1])
+
+#     return torch.argmax(logits, dim=-1)
+
+# MODIFIED: for regression, logits ARE the prediction
+def preprocess_logits_for_metrics(logits: Union[torch.Tensor, Tuple[torch.Tensor, Any]], _):
     if isinstance(logits, tuple):
         logits = logits[0]
-
-    if main_task == "betabinomial":
-        # main head emits the signed twin; predicted logit p = -twin. Return that scalar.
-        if logits.ndim > 1 and logits.shape[-1] == 1:
-            logits = logits.squeeze(-1)
-        return -logits
-
-    if main_task == "regression":
-        # sigma head packs [mu, log_var]; eval metrics use mu only
-        if logits.ndim > 1 and logits.shape[-1] == 2:
-            logits = logits[..., 0]
-        # expected shape: [batch] or [batch, 1]
-        if logits.ndim > 1 and logits.shape[-1] == 1:
-            logits = logits.squeeze(-1)
-        return logits
-    
-    elif main_task == "classification":
-        # Sequence-labeling-style logits, if ever present
-        if logits.ndim == 3:
-            logits = logits.reshape(-1, logits.shape[-1])
-
-        # Single-logit binary classification: make shape [batch] so compute_metrics uses the sigmoid/AUROC path
-        if logits.ndim > 1 and logits.shape[-1] == 1:
-            logits = logits.squeeze(-1)
-
-        return logits
-
-    else:
-        raise ValueError(f"Unsupported main task: {main_task}")
+    return logits.reshape(-1) # flatten: (N, 1) -> (N,)
 
 """
 Compute metrics used for huggingface trainer.
 """ 
-def compute_metrics(main_task: str, eval_pred):
+def compute_metrics(eval_pred):
     predictions, labels = eval_pred
-
-    # Hugging Face may pass multiple label arrays as a tuple
-    # when the batch contains both labels and aux_labels.
-    # We only want the main task labels.
-    if isinstance(labels, tuple):
-        labels = labels[0]
-
-    # Safely squeeze trailing singleton dimensions
-    if isinstance(predictions, tuple):
-        predictions = predictions[0]
-
-    if predictions.ndim > 1 and predictions.shape[-1] == 1:
-        predictions = predictions.squeeze(-1)
-    if labels.ndim > 1 and labels.shape[-1] == 1:
-        labels = labels.squeeze(-1)
-
-    # NEW: BETABINOMIAL METRICS
-    if main_task == "betabinomial":
-        # predictions = predicted logit p (already -twin from preprocess).
-        # labels = [k, n] per locus. Observed logit p̂ = logit(k/n); ASB label = significance
-        # is NOT in labels here, so we derive the classification view from p̂ deviating from 0.5.
-        preds = np.asarray(predictions, dtype=float).reshape(-1)
-        lab = np.asarray(labels, dtype=float).reshape(-1, 2)
-        k = lab[:, 0]; n = lab[:, 1]
-        ok = (n > 0) & np.isfinite(preds)
-        preds, k, n = preds[ok], k[ok], n[ok]
-        phat = np.clip(k / n, 1e-6, 1 - 1e-6)
-        logit_phat = np.log(phat / (1 - phat))
-        out = {}
-        if len(preds) > 1 and np.std(preds) > 0 and np.std(logit_phat) > 0:
-            out["spearman"] = spearmanr(preds, logit_phat)[0]     # <- the calibration-gap metric
-            out["pearson"] = pearsonr(preds, logit_phat)[0]
-        else:
-            out["spearman"] = 0.0; out["pearson"] = 0.0
-        # balanced ASB-AUROC: does |predicted logit p| separate imbalanced from balanced loci?
-        # "positive" = binomial-tail significant at 0.05 (a depth-aware balance test), so this
-        # tracks the same ASB notion without needing a separate significance column at eval.
-        # Vectorized two-sided binomial test (scipy.stats.binom.cdf) so eval doesn't loop per-locus.
-        from scipy.stats import binom
-        kk = np.rint(k).astype(int); nn = np.rint(n).astype(int)
-        lo = np.minimum(kk, nn - kk)
-        pval = np.clip(2.0 * binom.cdf(lo, nn, 0.5), 0.0, 1.0)   # symmetric p=0.5 two-sided
-        sig = pval < 0.05
-        if sig.any() and (~sig).any():
-            score = np.abs(preds)
-            out["auroc"] = sklearn.metrics.roc_auc_score(sig.astype(int), score)
-            out["auprc"] = sklearn.metrics.average_precision_score(sig.astype(int), score)
-        else:
-            out["auroc"] = 0.0; out["auprc"] = 0.0
-        out["n"] = int(len(preds))
-        return out
-
-    # NEW: REGRESSION METRICS
-    if main_task == "regression":
-        labels = np.asarray(labels, dtype=float)
-        predictions = np.asarray(predictions, dtype=float)
-
-        # Ignore NaNs and infs if they appear
-        finite_mask = np.isfinite(labels) & np.isfinite(predictions)
-
-        if finite_mask.sum() == 0:
-            return {
-                "mse": float("nan"),
-                "r2": float("nan"),
-                "pearson": float("nan"),
-                "spearman": float("nan"),
-            }
-
-        labels = labels[finite_mask]
-        predictions = predictions[finite_mask]
-
-        mse = sklearn.metrics.mean_squared_error(labels, predictions)
-        r2 = sklearn.metrics.r2_score(labels, predictions)
-
-        # Guard against constant arrays / tiny eval sets
-        if len(labels) > 1 and np.std(labels) > 0 and np.std(predictions) > 0:
-            pearson = pearsonr(labels, predictions)[0]
-            spearman = spearmanr(labels, predictions)[0]
-        else:
-            pearson = 0.0
-            spearman = 0.0
-
-        return {
-            "mse": mse,
-            "r2": r2,
-            "pearson": pearson,
-            "spearman": spearman,
-        }
-
-    elif main_task == "classification":
-        labels = np.asarray(labels)
-
-        # binary / multiclass logits
-        if predictions.ndim == 2:
-            pred_classes = np.argmax(predictions, axis=-1)
-            metrics = calculate_metric_with_sklearn(pred_classes, labels)
-
-            # add AUROC for binary classification only
-            if predictions.shape[1] == 2:
-                probs = np.exp(predictions - np.max(predictions, axis=1, keepdims=True))
-                probs = probs / np.sum(probs, axis=1, keepdims=True)
-                pos_probs = probs[:, 1]
-
-                if len(np.unique(labels)) == 2:
-                    metrics["auroc"] = sklearn.metrics.roc_auc_score(labels, pos_probs)
-                    metrics["auprc"] = sklearn.metrics.average_precision_score(labels, pos_probs)
-                else:
-                    metrics["auroc"] = 0.0
-                    metrics["auprc"] = 0.0
-
-            return metrics
-
-        # single-logit binary classification
-        elif predictions.ndim == 1:
-            pos_probs = 1.0 / (1.0 + np.exp(-predictions))
-            pred_classes = (pos_probs >= 0.5).astype(int)
-            metrics = calculate_metric_with_sklearn(pred_classes, labels)
-
-            if len(np.unique(labels)) == 2:
-                metrics["auroc"] = sklearn.metrics.roc_auc_score(labels, pos_probs)
-                metrics["auprc"] = sklearn.metrics.average_precision_score(labels, pos_probs)
-            else:
-                metrics["auroc"] = 0.0
-                metrics["auprc"] = 0.0
-
-            return metrics
-
-        else:
-            raise ValueError(f"Unexpected classification prediction shape: {predictions.shape}")
-
-    else:
-        raise ValueError(f"Unsupported main task: {main_task}")
-
-############################### NEW: HELPER FUNCTIONS TO CONSTRUCT MLP HEAD ################################
-def get_activation_module(name: str) -> torch.nn.Module:
-    """
-    Return activation module from string name
-    """
-    name = name.lower()
-
-    if name == "gelu":
-        return torch.nn.GELU()
-    elif name == "relu":
-        return torch.nn.ReLU()
-    elif name == "tanh":
-        return torch.nn.Tanh()
-    elif name == "silu":
-        return torch.nn.SiLU()
-    else:
-        raise ValueError(
-            f"Unsupported activation {name!r}. "
-            "Choose from {'gelu', 'relu', 'tanh', 'silu'}."
-        )
-
-def build_prediction_head(
-    input_size: int,
-    output_size: int,
-    num_layers: int = 1,
-    hidden_size: int = -1,
-    activation: str = "gelu",
-    dropout: float = 0.1,
-) -> torch.nn.Module:
-    """
-    Build either a linear prediction head or an MLP prediction head
-
-    num_layers counts total Linear layers.
-      - num_layers=1: Linear(input_size -> output_size)
-      - num_layers=2: Linear(input_size -> hidden_size) + activation/dropout + Linear(hidden_size -> output_size)
-      - num_layers=3+: deeper MLP
-    """
-    if num_layers < 1:
-        raise ValueError(f"num_layers must be >= 1, got {num_layers}.")
-
-    if hidden_size == -1:
-        hidden_size = input_size
-
-    if hidden_size <= 0:
-        raise ValueError(f"hidden_size must be positive or -1, got {hidden_size}.")
-
-    if dropout < 0 or dropout >= 1:
-        raise ValueError(f"dropout must be in [0, 1), got {dropout}.")
-
-    # Original behavior: simple linear head.
-    if num_layers == 1:
-        return torch.nn.Linear(input_size, output_size)
-
-    layers = []
-
-    # First hidden layer
-    layers.append(torch.nn.Linear(input_size, hidden_size))
-    layers.append(get_activation_module(activation))
-    layers.append(torch.nn.Dropout(dropout))
-
-    # Additional hidden layers
-    for _ in range(num_layers - 2):
-        layers.append(torch.nn.Linear(hidden_size, hidden_size))
-        layers.append(get_activation_module(activation))
-        layers.append(torch.nn.Dropout(dropout))
-
-    # Final output layer
-    layers.append(torch.nn.Linear(hidden_size, output_size))
-
-    return torch.nn.Sequential(*layers)
-############################################################################################################
-
-####### NEW: FUNCTION TO ENSURE ALL TRAINING ARGS ARE VALID #######
-def validate_training_args(training_args, data_args=None):
-    allowed_main_tasks = {"classification", "regression", "betabinomial"}
-    allowed_aux_task_types = {"binary", "multiclass", "regression"}
-    allowed_pooling_modes = {"cls", "center_mean"}
-    allowed_head_activations = {"gelu", "relu", "tanh", "silu"}
-
-    if training_args.task not in allowed_main_tasks:
-        raise ValueError(
-            f"Unsupported main task {training_args.task!r}. "
-            f"Choose from {allowed_main_tasks}."
-        )
-
-    if training_args.task == "regression" and training_args.main_num_labels != 1:
-        raise ValueError("For regression, main_num_labels must be 1.")
-
-    if training_args.task == "classification" and training_args.main_num_labels < 1:
-        raise ValueError("For classification, main_num_labels must be >= 1.")
-
-    if training_args.task == "betabinomial":
-        if training_args.main_num_labels != 1:
-            raise ValueError("For betabinomial, main_num_labels must be 1 (mu is a scalar logit).")
-        if training_args.predict_sigma or training_args.heteroscedastic:
-            raise ValueError("betabinomial is mutually exclusive with predict_sigma / "
-                             "heteroscedastic (it has its own count likelihood).")
-        # SIGN CORRECTNESS: mu = -(twin) = head(hap1)-head(hap2) matches k=hap1_count ONLY when
-        # the twin's two windows are (hap1, hap2). That holds iff input_mode == "hap_pair".
-        # ref_alt_pair builds (ref, alt) and would invert the sign on rows where hap1 != ref.
-        # input_mode is a DataArguments field (line 59), read here off the passed data_args.
-        im = getattr(data_args, "input_mode", None) if data_args is not None else None
-        if im != "hap_pair":
-            raise ValueError(
-                f"betabinomial requires input_mode='hap_pair' (twin = hap1 vs hap2, so "
-                f"mu=-twin=logit P(hap1) matches k=hap1_count); got input_mode={im!r}. "
-                f"Other paired modes (e.g. ref_alt_pair) would silently invert calibration. "
-                f"(If data_args was not passed to validate_training_args, apply HUNK 4a/4b.)")
-
-    # Validate pooling regardless of whether LUPI is used.
-    if training_args.pooling_mode not in allowed_pooling_modes:
-        raise ValueError(
-            f"Unsupported pooling_mode {training_args.pooling_mode!r}. "
-            f"Choose from {allowed_pooling_modes}."
-        )
-
-    if training_args.center_pool_width < 1:
-        raise ValueError("center_pool_width must be >= 1.")
-
-    if training_args.pooling_mode == "center_mean" and training_args.center_pool_width % 2 == 0:
-        raise ValueError(
-            "center_pool_width should be odd for symmetric center pooling."
-        )
-
-    if training_args.head_num_layers < 1:
-        raise ValueError("head_num_layers must be >= 1.")
-
-    if training_args.head_hidden_size != -1 and training_args.head_hidden_size <= 0:
-        raise ValueError("head_hidden_size must be positive or -1.")
-
-    if training_args.head_activation.lower() not in allowed_head_activations:
-        raise ValueError(
-            f"Unsupported head_activation {training_args.head_activation!r}. "
-            f"Choose from {allowed_head_activations}."
-        )
-
-    if training_args.head_dropout < 0 or training_args.head_dropout >= 1:
-        raise ValueError("head_dropout must be in [0, 1).")
-
-    if training_args.num_aux_tasks < 0:
-        raise ValueError("num_aux_tasks must be >= 0.")
-
-    if training_args.num_aux_tasks == 0:
-        if any([
-            training_args.aux_task_names,
-            training_args.aux_task_types,
-            training_args.aux_num_labels,
-            training_args.lambda_aux,
-        ]):
-            raise ValueError(
-                "num_aux_tasks is 0, but auxiliary task configuration lists are non-empty."
-            )
-        return
-
-    if len(training_args.aux_task_names) != training_args.num_aux_tasks:
-        raise ValueError(
-            f"num_aux_tasks={training_args.num_aux_tasks}, but got "
-            f"{len(training_args.aux_task_names)} aux_task_names."
-        )
-
-    if len(training_args.aux_task_types) != training_args.num_aux_tasks:
-        raise ValueError(
-            f"num_aux_tasks={training_args.num_aux_tasks}, but got "
-            f"{len(training_args.aux_task_types)} aux_task_types."
-        )
-
-    if len(training_args.aux_num_labels) != training_args.num_aux_tasks:
-        raise ValueError(
-            f"num_aux_tasks={training_args.num_aux_tasks}, but got "
-            f"{len(training_args.aux_num_labels)} aux_num_labels."
-        )
-
-    if len(training_args.lambda_aux) != training_args.num_aux_tasks:
-        raise ValueError(
-            f"num_aux_tasks={training_args.num_aux_tasks}, but got "
-            f"{len(training_args.lambda_aux)} lambda_aux values."
-        )
-
-    for i, (task_type, num_labels, weight) in enumerate(
-        zip(
-            training_args.aux_task_types,
-            training_args.aux_num_labels,
-            training_args.lambda_aux,
-        )
-    ):
-        if task_type not in allowed_aux_task_types:
-            raise ValueError(
-                f"Unsupported aux_task_types[{i}]={task_type!r}. "
-                f"Choose from {allowed_aux_task_types}."
-            )
-
-        if task_type in {"binary", "regression"} and num_labels != 1:
-            raise ValueError(
-                f"Aux task {i} has type {task_type!r}, so aux_num_labels[{i}] must be 1, got {num_labels}."
-            )
-
-        if task_type == "multiclass" and num_labels < 2:
-            raise ValueError(
-                f"Aux task {i} is multiclass, so aux_num_labels[{i}] must be >= 2, got {num_labels}."
-            )
-
-        if weight < 0:
-            raise ValueError(f"lambda_aux[{i}] must be nonnegative, got {weight}.")
-
-####### NEW: FUNCTION TO PRINT NUMBER OF TRAINABLE PARAMETERS #######
-def print_trainable_parameters(model):
-    """
-    Print the number and percentage of trainable parameters.
-    Useful for checking whether full fine-tuning vs. LoRA is configured correctly.
-    """
-    trainable = 0
-    total = 0
-
-    for _, param in model.named_parameters():
-        total += param.numel()
-        if param.requires_grad:
-            trainable += param.numel()
-
-    print(
-        f"Trainable parameters: {trainable:,} / {total:,} "
-        f"({100 * trainable / total:.2f}%)"
-    )
-
-# !!! NEW: entexBERT-2 training class !!!
-class entexBERT2ForSequencePrediction(torch.nn.Module):
-    def __init__(
-        self,
-        model_name_or_path: str,
-        cache_dir: Optional[str] = None,
-        main_task: str = "classification",
-        main_num_labels: int = 2,
-        aux_task_names: Optional[List[str]] = None,
-        aux_task_types: Optional[List[str]] = None,
-        aux_num_labels: Optional[List[int]] = None,
-        lambda_aux: Optional[List[float]] = None,
-        pooling_mode: str = "cls",
-        center_pool_width: int = 5,
-        head_num_layers: int = 1,
-        head_hidden_size: int = -1,
-        head_activation: str = "gelu",
-        head_dropout: float = 0.1,
-        contrast_mode: str = "signed",
-        predict_sigma: bool = False,
-        sigma_logvar_clamp: float = 10.0,
-    ):
-        super().__init__()
-
-        self.main_task = main_task
-        self.main_num_labels = main_num_labels
-        self.class_weights = None # optional torch.Tensor, set in main() for weighted loss
-
-        self.aux_task_names = aux_task_names or []
-        self.aux_task_types = aux_task_types or []
-        self.aux_num_labels = aux_num_labels or []
-        self.lambda_aux = lambda_aux or []
-
-        self.pooling_mode = pooling_mode
-        self.center_pool_width = center_pool_width
-
-        self.head_num_layers = head_num_layers
-        self.head_hidden_size = head_hidden_size
-        self.head_activation = head_activation
-        self.head_dropout = head_dropout
-
-        self.contrast_mode = contrast_mode
-        self.heteroscedastic = False   # set from training_args in main()
-        self.logvar_bias = torch.nn.Parameter(torch.zeros(1))  # 'b' in s = -log(depth)+b
-        # betabinomial: single GLOBAL learned concentration. s = softplus(log_s)+1 (>0, away
-        # from the rho->0 binomial singularity). Init 2.0 -> s~2.1 -> rho~0.32 (mildly
-        # overdispersed) so training starts away from the overconfident binomial limit.
-        self.betabinom_log_s = torch.nn.Parameter(torch.tensor([2.0]))
-        #test-time sigma head — a LEARNED per-sequence log-variance from the sequence
-        self.predict_sigma = predict_sigma
-        self.sigma_logvar_clamp = float(sigma_logvar_clamp)
-
-        if not (
-            len(self.aux_task_names)
-            == len(self.aux_task_types)
-            == len(self.aux_num_labels)
-            == len(self.lambda_aux)
-        ):
-            raise ValueError(
-                "aux_task_names, aux_task_types, aux_num_labels, and lambda_aux "
-                "must all have the same length."
-            )
-
-        # Shared pretrained backbone
-        self.backbone = transformers.AutoModel.from_pretrained(
-            model_name_or_path,
-            cache_dir=cache_dir,
-            trust_remote_code=True,
-        )
-
-        hidden_size = self.backbone.config.hidden_size
-        dropout_prob = getattr(self.backbone.config, "hidden_dropout_prob", 0.1)
-        self.dropout = torch.nn.Dropout(dropout_prob)
-
-        # Main head
-        self.main_head = build_prediction_head(
-            input_size=hidden_size,
-            output_size=main_num_labels,
-            num_layers=head_num_layers,
-            hidden_size=head_hidden_size,
-            activation=head_activation,
-            dropout=head_dropout,
-        )
-
-        # separate variance head (only when predict_sigma). Same shape as a 1-layer
-        # main head so it has capacity to read the sequence; outputs a scalar log-variance.
-        # Built ONLY when requested so existing checkpoints keep identical state_dict keys.
-        self.sigma_head = None
-        if self.predict_sigma:
-           self.sigma_head = build_prediction_head(
-                input_size=hidden_size, output_size=1,
-                num_layers=max(1, head_num_layers), hidden_size=head_hidden_size,
-                activation=head_activation, dropout=head_dropout,
-            )
-
-        # Auxiliary heads
-        self.aux_heads = torch.nn.ModuleDict()
-        for name, num_labels in zip(self.aux_task_names, self.aux_num_labels):
-            self.aux_heads[name] = torch.nn.Linear(hidden_size, num_labels)
-    
-    def _pool_sequence_representation(self, backbone_outputs, attention_mask=None):
-        """
-        Pool token-level representations.
-        Supported modes:
-          - cls: use first token
-          - center_mean: mean-pool a window around the center of the sequence
-        """
-
-        # Extract token-level hidden states
-        if hasattr(backbone_outputs, "last_hidden_state") and backbone_outputs.last_hidden_state is not None:
-            sequence_output = backbone_outputs.last_hidden_state
-
-        elif isinstance(backbone_outputs, dict) and "last_hidden_state" in backbone_outputs:
-            sequence_output = backbone_outputs["last_hidden_state"]
-
-        elif isinstance(backbone_outputs, (tuple, list)):
-            first = backbone_outputs[0]
-            if torch.is_tensor(first) and first.ndim == 3:
-                sequence_output = first
-            else:
-                raise ValueError(f"Cannot extract token-level hidden states from output type {type(backbone_outputs)}")
-
-        else:
-            raise ValueError(f"Cannot extract token-level hidden states from output type {type(backbone_outputs)}")
-
-        if self.pooling_mode == "cls":
-            return sequence_output[:, 0, :]
-
-        elif self.pooling_mode == "center_mean":
-            if self.center_pool_width % 2 == 0:
-                raise ValueError("center_pool_width should be odd for symmetric center pooling.")
-
-            batch_size, max_seq_len, hidden_size = sequence_output.shape
-            half = self.center_pool_width // 2
-
-            pooled_outputs = []
-
-            for b in range(batch_size):
-                if attention_mask is not None:
-                    # Number of non-padding tokens for this example
-                    valid_len = int(attention_mask[b].sum().item())
-                else:
-                    valid_len = max_seq_len
-
-                valid_len = max(valid_len, 1) # To be extra safe :)
-
-                center = valid_len // 2
-                start = max(0, center - half)
-                end = min(valid_len, center + half + 1)
-
-                pooled_b = sequence_output[b, start:end, :].mean(dim=0)
-                pooled_outputs.append(pooled_b)
-
-            return torch.stack(pooled_outputs, dim=0)
-
-        else:
-            raise ValueError(f"Unsupported pooling_mode: {self.pooling_mode}")
-
-    def _compute_main_loss(self, logits, labels, depth=None):
-        if self.main_task == "betabinomial":
-            # logits here is the SIGNED twin = logits_alt - logits = head(hap2) - head(hap1)
-            # (hap_pair mode: seq1=hap1, seq2=hap2 -- enforced by the H4 input_mode guard).
-            # We want mu = logit p, p = P(read from hap1) = head(hap1) - head(hap2) = -twin.
-            mu = -logits
-            if mu.ndim > 1 and mu.shape[-1] == 1:
-                mu = mu.squeeze(-1)
-            k = labels[..., 0].float()          # hap1 reads   (loss-only constant)
-            n = labels[..., 1].float()          # total reads  (loss-only constant)
-            eps = 1e-6
-            p = torch.sigmoid(mu).clamp(eps, 1.0 - eps)
-            s = torch.nn.functional.softplus(self.betabinom_log_s) + 1.0
-            a = p * s
-            b = (1.0 - p) * s
-            lg = torch.lgamma
-            ll = (lg(k + a) + lg(n - k + b) - lg(n + a + b)) - (lg(a) + lg(b) - lg(a + b))
-            return (-ll).mean()
-
-        if self.main_task == "regression":
-            # learned-sigma path. logits is packed [mu, log_var]; Gaussian NLL with the
-            # PREDICTED variance: 0.5*exp(-lv)*(mu-y)^2 + 0.5*lv (mean). This is separate from
-            # the depth-tied heteroscedastic path and is what emits sigma at inference.
-            if self.predict_sigma:
-                mu = logits[..., 0]
-                log_var = logits[..., 1].clamp(-self.sigma_logvar_clamp,
-                                               self.sigma_logvar_clamp)
-                labels = labels.float().view_as(mu)
-                return (0.5 * torch.exp(-log_var) * (mu - labels) ** 2
-                        + 0.5 * log_var).mean()
-            if logits.ndim > 1 and logits.shape[-1] == 1:
-                logits = logits.squeeze(-1)
-            labels = labels.float()
-            if getattr(self, "heteroscedastic", False) and depth is not None:
-                if getattr(self, "hetero_loss", "nll") == "weighted_mse":
-                    # precision-weighted GLS: weight each locus by depth (normalized to mean 1
-                    # so the overall loss scale / effective LR is unchanged). No logvar_bias.
-                    w = depth.clamp(min=1.0)
-                    w = w / w.mean()
-                    return (w * (logits - labels) ** 2).mean()
-                # default: Gaussian NLL with depth-tied log-variance + learnable global bias.
-                # Normalize depth to mean 1 (like weighted_mse) so the loss is invariant to the
-                # arbitrary count scale and well-conditioned at init (exp(-s)~O(1), not ~O(depth));
-                # logvar_bias still absorbs the absolute variance scale. Without this the init
-                # gradient is ~mean(depth)x too large and the NLL DIVERGES on a real net.
-                dn = depth.clamp(min=1.0)
-                dn = dn / dn.mean()
-                s = -torch.log(dn) + self.logvar_bias
-                return (0.5 * torch.exp(-s) * (logits - labels) ** 2 + 0.5 * s).mean()
-            return torch.nn.functional.mse_loss(logits, labels)
-
-        elif self.main_task == "classification":
-            labels = labels.long()
-
-            # Binary classification with single logit
-            if self.main_num_labels == 1:
-                if logits.ndim > 1 and logits.shape[-1] == 1:
-                    logits = logits.squeeze(-1)
-                labels = labels.float()
-                pos_weight = None
-                if self.class_weights is not None and self.class_weights.numel() == 2:
-                    cw = self.class_weights.to(logits.device)
-                    pos_weight = cw[1] / cw[0]
-                return torch.nn.functional.binary_cross_entropy_with_logits(
-                    logits, labels, pos_weight=pos_weight)
-
-            # Multiclass classification
-            weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
-            return torch.nn.functional.cross_entropy(logits, labels, weight=weight)
-
-        else:
-            raise ValueError(f"Unsupported main task: {self.main_task}")
-
-    def _compute_aux_loss(self, aux_name, aux_type, aux_logits, aux_labels):
-        if aux_type == "regression":
-            if aux_logits.ndim > 1 and aux_logits.shape[-1] == 1:
-                aux_logits = aux_logits.squeeze(-1)
-            aux_labels = aux_labels.float()
-            return torch.nn.functional.mse_loss(aux_logits, aux_labels)
-
-        elif aux_type == "binary":
-            if aux_logits.ndim > 1 and aux_logits.shape[-1] == 1:
-                aux_logits = aux_logits.squeeze(-1)
-            aux_labels = aux_labels.float()
-            return torch.nn.functional.binary_cross_entropy_with_logits(aux_logits, aux_labels)
-
-        elif aux_type == "multiclass":
-            aux_labels = aux_labels.long()
-            return torch.nn.functional.cross_entropy(aux_logits, aux_labels)
-
-        else:
-            raise ValueError(f"Unsupported auxiliary task type for {aux_name}: {aux_type}")
-
-
-    def _score(self, input_ids, attention_mask,
-               output_attentions=None, output_hidden_states=None, **kwargs):
-        backbone_outputs = self.backbone(
-            input_ids=input_ids, attention_mask=attention_mask, return_dict=True,
-            output_attentions=output_attentions, output_hidden_states=output_hidden_states,
-            **kwargs,
-        )
-        pooled = self._pool_sequence_representation(backbone_outputs, attention_mask=attention_mask)
-        pooled = self.dropout(pooled)
-        return self.main_head(pooled), pooled, backbone_outputs
-
-    def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        labels=None,
-        aux_labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        input_ids_alt=None,
-        attention_mask_alt=None,
-        depth=None,
-        **kwargs,
-    ):
-        if not getattr(self, "_twin_logged", False):
-            self._twin_logged = True
-            print(f"[twin check] input_ids_alt is None? {input_ids_alt is None} "
-                  f"| extra batch keys: {sorted(kwargs.keys())}", flush=True)
-            if getattr(self, "_expect_twin", False) and input_ids_alt is None:
-                raise RuntimeError(
-                    "[twin check] expected a paired (ref_alt) batch but input_ids_alt did not "
-                    "reach forward -- the Trainer/collator dropped it. Set "
-                    "remove_unused_columns=False and check the collator's has_alt branch."
-                )
-
-        # Score the REF window (sequence1).
-        logits, pooled, backbone_outputs = self._score(
-            input_ids, attention_mask,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            **kwargs,
-        )
-
-        # TWIN: if an ALT window is provided, the prediction is the SIGNED contrast
-        # head(alt) - head(ref). Shared weights, two passes, subtract -> deltaSVM-style
-        contrast_vec = None                # set in the symmetric_abs twin branch below
-        symmetric = getattr(self, "contrast_mode", "signed") == "symmetric_abs"
-        if input_ids_alt is not None:
-            logits_alt, pooled_alt, _ = self._score(input_ids_alt, attention_mask_alt, **kwargs)
-            if symmetric:
-                # symmetric contrast for a symmetric target (significance): head(|pool(alt)-pool(ref)|)
-                contrast_vec = torch.abs(pooled_alt - pooled)
-                logits = self.main_head(contrast_vec)
-            else:
-                logits = logits_alt - logits          # signed (deltaSVM-style, regression twin)
-        # LEARNED sigma head -> pack logits as [mu, log_var]. The variance model MUST match
-        # model_io.logits_and_embeddings exactly (train == inference), branching on contrast_mode:
-        #   signed:        Var(Delta)=Var(ref)+Var(alt) -> log_var=logsumexp(lv_ref, lv_alt)
-        #   symmetric_abs: prediction is head(contrast_vec), so sigma reads the SAME contrast_vec
-        #   single-seq:    just lv(ref)
-        if self.predict_sigma and self.sigma_head is not None:
-            c = self.sigma_logvar_clamp
-            if input_ids_alt is not None and symmetric:
-                log_var = self.sigma_head(contrast_vec).clamp(-c, c)
-            elif input_ids_alt is not None:
-                lv_ref = self.sigma_head(pooled).clamp(-c, c)
-                lv_alt = self.sigma_head(pooled_alt).clamp(-c, c)
-                log_var = torch.logsumexp(torch.cat([lv_ref, lv_alt], dim=-1),
-                                          dim=-1, keepdim=True).clamp(-c, c)
-            else:
-                log_var = self.sigma_head(pooled).clamp(-c, c)
-            mu = logits if logits.ndim > 1 else logits.unsqueeze(-1)
-            logits = torch.cat([mu, log_var], dim=-1)                        # [B,2]
-
-        # Auxiliary heads read the REF pooled representation in BOTH paths: per-locus privileged
-        # signals (read depth, p_betabinom, effect magnitude) are properties of the locus, not of the
-        # ref/alt contrast. Computing them on `pooled` keeps twin and aux compatible
-        aux_logits_dict = {}
-        for name in self.aux_task_names:
-            aux_logits_dict[name] = self.aux_heads[name](pooled)
-
-        total_loss = None
-        loss_dict = {}
-
-        # Main loss
-        if labels is not None:
-            main_loss = self._compute_main_loss(logits, labels, depth=depth)
-            total_loss = main_loss
-            loss_dict["main_loss"] = main_loss.detach()
-
-        # Auxiliary losses (for training ONLY)
-        if aux_labels is not None and self.training:
-            if len(aux_labels) != len(self.aux_task_names):
-                raise ValueError(
-                    f"Expected {len(self.aux_task_names)} auxiliary label tensors, "
-                    f"but got {len(aux_labels)}."
-                )
-
-            for i, (name, task_type, weight) in enumerate(
-                zip(self.aux_task_names, self.aux_task_types, self.lambda_aux)
-            ):
-                this_aux_logits = aux_logits_dict[name]
-                this_aux_labels = aux_labels[i]
-
-                aux_loss = self._compute_aux_loss(
-                    aux_name=name,
-                    aux_type=task_type,
-                    aux_logits=this_aux_logits,
-                    aux_labels=this_aux_labels,
-                )
-
-                loss_dict[f"{name}_loss"] = aux_loss.detach()
-
-                weighted_aux_loss = weight * aux_loss
-                total_loss = weighted_aux_loss if total_loss is None else total_loss + weighted_aux_loss
-
-        hidden_states = getattr(backbone_outputs, "hidden_states", None)
-        attentions = getattr(backbone_outputs, "attentions", None)
-
-        # Robust fallback for tuple-style outputs
-        if isinstance(backbone_outputs, (tuple, list)):
-            for item in backbone_outputs:
-                if isinstance(item, (tuple, list)) and len(item) > 0 and torch.is_tensor(item[0]):
-                    if item[0].ndim == 3:
-                        hidden_states = item
-                    elif item[0].ndim == 4:
-                        attentions = item
-
-        return SequenceClassifierOutput(
-            loss=total_loss,
-            logits=logits,
-            hidden_states=hidden_states,
-            attentions=attentions,
-        )
+    return calculate_regression_metrics(predictions, labels) # MODIFIED: regression instead of classification
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    validate_training_args(training_args, data_args) # NEW
-    training_args.label_names = ["labels"] # NEW
+    # NEW: the twin/depth columns are non-standard Trainer inputs -- make sure we keep them!
+    training_args.remove_unused_columns = False
+    ########################################################################################
 
     # load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -1375,107 +340,41 @@ def train():
     if "InstaDeepAI" in model_args.model_name_or_path:
         tokenizer.eos_token = tokenizer.pad_token
 
-    # define datasets and data collator
-    # NEW: modified to include main task, aux task info
-    train_dataset = SupervisedDataset(
-        tokenizer=tokenizer,
-        data_path=os.path.join(data_args.data_path, "train.csv"),
-        kmer=data_args.kmer,
-        task=training_args.task,
-        aux_task_names=training_args.aux_task_names,
-        aux_task_types=training_args.aux_task_types,
-        heteroscedastic=training_args.heteroscedastic,
-    )
+    # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair functionality]]
+        train_dataset = SupervisedDataset(tokenizer=tokenizer,
+                                      data_path=os.path.join(data_args.data_path, "train.csv"),
+                                      kmer=data_args.kmer, input_mode=data_args.input_mode)
+    val_dataset = SupervisedDataset(tokenizer=tokenizer, 
+                                     data_path=os.path.join(data_args.data_path, "dev.csv"), 
+                                     kmer=data_args.kmer, input_mode=data_args.input_mode)
+    test_dataset = SupervisedDataset(tokenizer=tokenizer, 
+                                     data_path=os.path.join(data_args.data_path, "test.csv"), 
+                                     kmer=data_args.kmer, input_mode=data_args.input_mode)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
-    val_dataset = SupervisedDataset(
-        tokenizer=tokenizer,
-        data_path=os.path.join(data_args.data_path, "dev.csv"),
-        kmer=data_args.kmer,
-        task=training_args.task,
-        aux_task_names=training_args.aux_task_names,
-        aux_task_types=training_args.aux_task_types,
-        heteroscedastic=training_args.heteroscedastic,
-    )
 
-    test_dataset = SupervisedDataset(
-        tokenizer=tokenizer,
-        data_path=os.path.join(data_args.data_path, "test.csv"),
-        kmer=data_args.kmer,
-        task=training_args.task,
-        aux_task_names=training_args.aux_task_names,
-        aux_task_types=training_args.aux_task_types,
-        heteroscedastic=training_args.heteroscedastic,
-    )
-
-    data_collator = DataCollatorForSupervisedDataset(
-        tokenizer=tokenizer,
-        main_task=training_args.task,
-        aux_task_types=training_args.aux_task_types,
-    )
-
-    #### NEW: ALTERED FORMAT FOR MODEL LOADING ####
-
-    # main head output dimension
-    if training_args.task in ("regression", "betabinomial"):
-        main_num_labels = 1
-    else:
-        main_num_labels = training_args.main_num_labels
-
-    # load entexBERT-2 model
+    # MODIFIED: load entexBERT-2 model
     model = entexBERT2ForSequencePrediction(
         model_name_or_path=model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
-        main_task=training_args.task,
-        main_num_labels=main_num_labels,
-        aux_task_names=training_args.aux_task_names,
-        aux_task_types=training_args.aux_task_types,
-        aux_num_labels=training_args.aux_num_labels,
-        lambda_aux=training_args.lambda_aux,
-        pooling_mode=training_args.pooling_mode,
-        center_pool_width=training_args.center_pool_width,
-        head_num_layers=training_args.head_num_layers,
-        head_hidden_size=training_args.head_hidden_size,
-        head_activation=training_args.head_activation,
-        head_dropout=training_args.head_dropout,
-        contrast_mode=training_args.contrast_mode,
-        predict_sigma=training_args.predict_sigma,
-        sigma_logvar_clamp=training_args.sigma_logvar_clamp,
+        pooling_mode=model_args.pooling_mode,
+        center_pool_width=model_args.center_pool_width,
+        head_num_layers=model_args.head_num_layers,
+        head_hidden_size=model_args.head_hidden_size,
+        head_activation=model_args.head_activation,
+        head_dropout=model_args.head_dropout,
+        neff_s=model_args.neff_s,
     )
 
-    # For heteroscedastic regression head functionality
-    model.heteroscedastic = training_args.heteroscedastic
-    model.hetero_loss = training_args.hetero_loss   # "nll" | "weighted_mse"
+    # NEW: 2-stage transfer ################################################################################
+        # Load a Stage-1 binding trunk (backbone only) -> optionally freeze it for Stage-2 (twin head train)
+    if model_args.init_backbone_from:
+        model.init_backbone_from(model_args.init_backbone_from)
+    if model_args.freeze_backbone:
+        model.freeze_backbone()
+    ########################################################################################################
 
-    if training_args.predict_sigma and training_args.heteroscedastic:
-        raise ValueError("--predict_sigma (learned test-time sigma) and --heteroscedastic "
-                         "(depth-tied training reweight) are mutually exclusive; pick one.")
-    if training_args.predict_sigma and training_args.task != "regression":
-        raise ValueError("--predict_sigma is regression-only.")
-
-    # Arm the twin assertion for ALL paired runs, regardless of task / class-weighting
-    model._expect_twin = (getattr(data_args, "input_mode", None) == "ref_alt_pair")
-
-    # Optional class weighting for the main classification loss
-    # (full natural-prevalence training without majority-class collapse)
-    # Computed from the TRAIN split only
-    if training_args.task == "classification" and str(training_args.class_weights).lower() != "none":
-        spec = str(training_args.class_weights).lower()
-        n_classes = main_num_labels if main_num_labels > 1 else 2
-        train_labels = pd.read_csv(os.path.join(data_args.data_path, "train.csv"))["label"].astype(int)
-        if spec == "balanced":
-            counts = (train_labels.value_counts()
-                      .reindex(range(n_classes), fill_value=0).to_numpy(dtype=float))
-            n = float(len(train_labels))
-            w = np.where(counts > 0, n / (n_classes * np.maximum(counts, 1.0)), 0.0)
-        else:
-            w = np.array([float(x) for x in spec.split(",")], dtype=float)
-            if len(w) != n_classes:
-                raise ValueError(f"--class_weights {spec!r} has {len(w)} values; expected {n_classes}.")
-        model.class_weights = torch.tensor(w, dtype=torch.float)
-        print(f"Main-loss class weights: {model.class_weights.tolist()} (spec={spec!r}, "
-              f"counts={train_labels.value_counts().to_dict()})")
-
-    # configure LoRA on the backbone only
+    # configure LoRA
     if model_args.use_lora:
         lora_config = LoraConfig(
             r=model_args.lora_r,
@@ -1486,64 +385,43 @@ def train():
             task_type="SEQ_CLS",
             inference_mode=False,
         )
-        model.backbone = get_peft_model(model.backbone, lora_config)
-        model.backbone.print_trainable_parameters()
-    
-    print_trainable_parameters(model) # NEW: print trainable parameters in full model after LoRA wrapping
+        model = get_peft_model(model, lora_config)
+        model.print_trainable_parameters()
 
-    print(
-        f"main task={training_args.task!r}, "
-        f"num_aux_tasks={training_args.num_aux_tasks}, "
-        f"aux_task_names={training_args.aux_task_names}, "
-        f"pooling_mode={training_args.pooling_mode!r}, "
-        f"center_pool_width={training_args.center_pool_width}, "
-        f"head_num_layers={training_args.head_num_layers}, "
-        f"head_hidden_size={training_args.head_hidden_size}, "
-        f"head_activation={training_args.head_activation!r}, "
-        f"head_dropout={training_args.head_dropout}"
-    )
+    # NEW: persist the architecture so model_io.py can rebuild the model exactly for scoring ###
+    os.makedirs(training_args.output_dir, exist_ok=True)
+    with open(os.path.join(training_args.output_dir, "run_config.json"), "w") as f:
+        json.dump({
+            "model_name_or_path": model_args.model_name_or_path,
+            "cache_dir": training_args.cache_dir,
+            "model_max_length": training_args.model_max_length,
+            "pooling_mode": model_args.pooling_mode,
+            "center_pool_width": model_args.center_pool_width,
+            "head_num_layers": model_args.head_num_layers,
+            "head_hidden_size": model_args.head_hidden_size,
+            "head_activation": model_args.head_activation,
+            "head_dropout": model_args.head_dropout,
+            "neff_s": model_args.neff_s,
+            "task": data_args.task,
+            "input_mode": data_args.input_mode,
+            "use_lora": model_args.use_lora,
+        }, f, indent=2)
+    ##############################################################################################
 
     # define trainer
     trainer = transformers.Trainer(model=model,
                                    tokenizer=tokenizer,
                                    args=training_args,
-                                   preprocess_logits_for_metrics=partial(preprocess_logits_for_metrics, training_args.task),
-                                   compute_metrics=partial(compute_metrics, training_args.task),
+                                   preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+                                   compute_metrics=compute_metrics,
                                    train_dataset=train_dataset,
                                    eval_dataset=val_dataset,
                                    data_collator=data_collator)
-
     trainer.train()
 
     if training_args.save_model:
         trainer.save_state()
         safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
-
-        # Persist architecture/task config so analysis + plotting rebuild the exact model
-        run_config = {
-            "model_name_or_path": model_args.model_name_or_path,
-            "use_lora": model_args.use_lora,
-            "cache_dir": training_args.cache_dir,
-            "model_max_length": training_args.model_max_length,
-            "task": training_args.task,
-            "main_num_labels": training_args.main_num_labels,
-            "pooling_mode": training_args.pooling_mode,
-            "center_pool_width": training_args.center_pool_width,
-            "head_num_layers": training_args.head_num_layers,
-            "head_hidden_size": training_args.head_hidden_size,
-            "head_activation": training_args.head_activation,
-            "head_dropout": training_args.head_dropout,
-            "predict_sigma": training_args.predict_sigma,
-            "sigma_logvar_clamp": training_args.sigma_logvar_clamp,
-            "num_aux_tasks": training_args.num_aux_tasks,
-            "aux_task_names": training_args.aux_task_names,
-            "aux_task_types": training_args.aux_task_types,
-            "aux_num_labels": training_args.aux_num_labels,
-            "run_name": training_args.run_name,
-            "contrast_mode": training_args.contrast_mode,
-        }
-        with open(os.path.join(training_args.output_dir, "run_config.json"), "w") as f:
-            json.dump(run_config, f, indent=2)
 
     # get the evaluation results from trainer
     if training_args.eval_and_save_results:
@@ -1552,6 +430,9 @@ def train():
         os.makedirs(results_path, exist_ok=True)
         with open(os.path.join(results_path, "eval_results.json"), "w") as f:
             json.dump(results, f)
+
+
+
 
 if __name__ == "__main__":
     train()

@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 
 """
-Shared model I/O for entexBERT-2 evaluation and plotting.
+Shared model I/O for entexBERT-2 evaluation, scoring, and the frozen-trunk pre-check.
 
-This is the single place that knows how to rebuild a trained entexBERT-2 model and run
-inference. analyze.py and both plotters import it, so the architecture is never re-specified
+The single place that knows how to rebuild a trained entexBERT-2 model and run inference.
+score_asb.py and probe_frozen_trunk.py import it, so the architecture is never re-specified.
 
-The architecture/task config is read from run_config.json (written by the trainer at save
-time), so the model is reconstructed exactly as trained. CLI flags can override individual
-fields, but the default is to trust run_config.json.
+The architecture is read from run_config.json (written by the trainer at save time), so the
+model is reconstructed exactly as trained. CLI flags can override individual fields, but the
+default is to trust run_config.json.
+
+The model itself lives in entexbert2.model (backbone f_theta + twin head g_phi + precision-
+weighted loss). This module only handles config/weights loading and the twin inference helper.
 """
 
 import glob
@@ -19,9 +22,8 @@ from typing import Optional
 import torch
 import transformers
 
-# The trained model class. Importing the trainer module is side-effect-free
-# (train() is guarded by __main__), so this just pulls in the class definition.
-from entexbert2.finetune_entexbert2 import entexBERT2ForSequencePrediction
+# The trained model class (importing entexbert2.model is side-effect-free).
+from entexbert2.model import entexBERT2ForSequencePrediction
 
 # ---------------------------------------------------------------------------
 # Config
@@ -125,32 +127,17 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
             "wired up here yet. Train without LoRA or extend build_model."
         )
 
-    aux_names = run_config.get("aux_task_names") or []
-    aux_types = run_config.get("aux_task_types") or []
-    aux_num = run_config.get("aux_num_labels") or []
-
     model = entexBERT2ForSequencePrediction(
         model_name_or_path=run_config["model_name_or_path"],
         cache_dir=run_config.get("cache_dir"),
-        main_task=run_config["task"],
-        main_num_labels=run_config["main_num_labels"],
-        aux_task_names=aux_names,
-        aux_task_types=aux_types,
-        aux_num_labels=aux_num,
-        lambda_aux=[1.0] * len(aux_names),  # unused at inference; length must match
         pooling_mode=run_config["pooling_mode"],
         center_pool_width=run_config["center_pool_width"],
         head_num_layers=run_config["head_num_layers"],
         head_hidden_size=run_config["head_hidden_size"],
-        head_activation=run_config["head_activation"],
-        head_dropout=run_config["head_dropout"],
-        predict_sigma=run_config.get("predict_sigma", False),
-        sigma_logvar_clamp=run_config.get("sigma_logvar_clamp", 10.0),
+        head_activation=run_config.get("head_activation", "gelu"),
+        head_dropout=run_config.get("head_dropout", 0.1),
+        neff_s=run_config.get("neff_s", 50.0),
     )
-    # Twin contrast mode (signed = head(alt)-head(ref); symmetric_abs = head(|pool(alt)-pool(ref)|)).
-    # Set as an attribute so logits_and_embeddings mirrors training even if the constructor
-    # predates this field.
-    model.contrast_mode = run_config.get("contrast_mode", "signed")
     return model.to(device)
 
 
@@ -182,54 +169,111 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
 
 @torch.no_grad()
 def logits_and_embeddings(model, input_ids, attention_mask,
-                          input_ids_alt=None, attention_mask_alt=None):
+                          input_ids_alt=None, attention_mask_alt=None,
+                          return_pools=False):
     """
-    Score a sequence with the model's own backbone + pooling + head (eval mode -> dropout is
+    Score sequence(s) with the model's own backbone + pooling + head (eval mode -> dropout is
     identity, so this matches the trained forward exactly).
 
-    TWIN / score-and-subtract: if alt inputs are given (ref_alt_pair), the prediction is the
-    SIGNED contrast head(alt) - head(ref), and the returned embedding is the contrast
-    pool(alt) - pool(ref) -- the representation the head's prediction is actually based on.
-    Single-sequence inference (alt=None) is unchanged.
-    """
-    predict_sigma = getattr(model, "predict_sigma", False) and getattr(model, "sigma_head", None) is not None
-    clamp = getattr(model, "sigma_logvar_clamp", 10.0)
+    TWIN / score-and-subtract: with alt inputs given (hap_pair), the prediction is the SIGNED
+    contrast mu = head(window1) - head(window2), EXACTLY matching model.forward
+    (input_ids = window 1 = hap1, input_ids_alt = window 2 = hap2; mu = g(pool1) - g(pool2)
+    = logit P(hap1)). The returned embedding is the contrast pool1 - pool2.
 
+    return_pools: also return the RAW per-window pools (pool1, pool2). These are what the
+    frozen-trunk pre-check dumps: an MLP head cannot be reconstructed from the contrast alone
+    (g(a) - g(b) != g(a - b)), so probe_frozen_trunk needs both pools, not just their difference.
+
+    Returns:
+        return_pools=False:  (logits, pooled_contrast)
+        return_pools=True:   (logits, pooled_contrast, pool1, pool2)   (pool2=None if single-seq)
+    """
     def _score(ids, mask):
         backbone_outputs = model.backbone(input_ids=ids, attention_mask=mask, return_dict=True)
-        pooled = model._pool_sequence_representation(backbone_outputs, attention_mask=mask)
+        pooled = model._pool(backbone_outputs, attention_mask=mask)
         return model.main_head(pooled), pooled
 
-    logits, pooled = _score(input_ids, attention_mask)
-    log_var = None
+    logits1, pool1 = _score(input_ids, attention_mask)
+    logits = logits1
+    pooled = pool1
+    pool2 = None
 
     if input_ids_alt is not None:
-        logits_alt, pooled_alt = _score(input_ids_alt, attention_mask_alt)
-        if getattr(model, "contrast_mode", "signed") == "symmetric_abs":
-            # Symmetric target: prediction is head(|pool(alt)-pool(ref)|); sigma reads the SAME
-            # contrast vector (identical to training forward()).
-            contrast = torch.abs(pooled_alt - pooled)
-            logits = model.main_head(contrast)
-            if predict_sigma:
-                log_var = model.sigma_head(contrast).clamp(-clamp, clamp)
-            pooled = contrast
-        else:
-            # Signed twin: Var(Delta)=Var(ref)+Var(alt) -> logsumexp(lv_ref, lv_alt), computed
-            # from the raw ref/alt pools BEFORE pooled is overwritten (identical to training).
-            if predict_sigma:
-                lv_ref = model.sigma_head(pooled).clamp(-clamp, clamp)
-                lv_alt = model.sigma_head(pooled_alt).clamp(-clamp, clamp)
-                log_var = torch.logsumexp(torch.cat([lv_ref, lv_alt], dim=-1),
-                                          dim=-1, keepdim=True).clamp(-clamp, clamp)
-            logits = logits_alt - logits
-            pooled = pooled_alt - pooled
-    
-    elif predict_sigma:
-        # single-sequence inference
-        log_var = model.sigma_head(pooled).clamp(-clamp, clamp)
-    if predict_sigma:
-        # pack [mu, log_var] so the caller can score Delta/sigma; sigma = exp(0.5*log_var)
-        mu = logits if logits.ndim > 1 else logits.unsqueeze(-1)
-        logits = torch.cat([mu, log_var], dim=-1)
+        logits2, pool2 = _score(input_ids_alt, attention_mask_alt)
+        logits = logits1 - logits2       # mu = g(window1) - g(window2) = logit P(hap1)  (matches model.forward)
+        pooled = pool1 - pool2           # contrast representation (hap1 - hap2)
 
+    if return_pools:
+        return logits, pooled, pool1, pool2
     return logits, pooled
+
+
+# ---------------------------------------------------------------------------
+# Batched inference over a list of sequences (or [ref, alt] pairs)
+# ---------------------------------------------------------------------------
+
+def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
+                  overrides=None, dump_pools=False):
+    """
+    Load a checkpoint and score a list of inputs. Each input is either a single sequence
+    or a [window1, window2] pair (hap_pair / ref_alt). Pair inputs are tokenized SEPARATELY
+    and score-and-subtracted (TWIN) exactly as trained -- never [SEP]-concatenated, which
+    would bury the single-base allelic difference.
+
+    dump_pools=False (default):
+        returns (logits, emb, run_config)
+          logits : (N, 1) signed contrast mu = head(window1) - head(window2)
+          emb    : (N, H) contrast pool = pool1 - pool2
+    dump_pools=True (pair inputs only):
+        returns (logits, emb, pool_ref, pool_alt, run_config)
+          pool_ref = pool(window1), pool_alt = pool(window2)  -- the RAW per-window pools the
+          frozen-trunk pre-check needs (an MLP head can't be rebuilt from the contrast alone).
+
+    Convention: window1 is the ref / hap1 window, window2 is the alt / hap2 window, so
+    mu = logit P(hap1) and pool_ref/pool_alt line up with model.forward + the training label.
+    """
+    model, tokenizer, run_config = load_model_and_tokenizer(
+        checkpoint_dir, device=device, overrides=overrides)
+
+    is_pair = len(texts) > 0 and isinstance(texts[0], (list, tuple))
+    if dump_pools and not is_pair:
+        raise ValueError("dump_pools=True requires paired inputs ([window1, window2]).")
+    mml = run_config.get("model_max_length", 512)
+
+    all_logits, all_emb, all_ref, all_alt = [], [], [], []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        if is_pair:
+            ref = [b[0] for b in batch]
+            alt = [b[1] for b in batch]
+            enc_r = tokenizer(ref, return_tensors="pt", padding="longest",
+                              max_length=mml, truncation=True)
+            enc_a = tokenizer(alt, return_tensors="pt", padding="longest",
+                              max_length=mml, truncation=True)
+            out = logits_and_embeddings(
+                model, enc_r["input_ids"].to(device), enc_r["attention_mask"].to(device),
+                input_ids_alt=enc_a["input_ids"].to(device),
+                attention_mask_alt=enc_a["attention_mask"].to(device),
+                return_pools=dump_pools)
+            if dump_pools:
+                logits, pooled, pool1, pool2 = out
+                all_ref.append(pool1.detach().cpu().numpy())
+                all_alt.append(pool2.detach().cpu().numpy())
+            else:
+                logits, pooled = out
+        else:
+            enc = tokenizer(batch, return_tensors="pt", padding="longest",
+                            max_length=mml, truncation=True)
+            logits, pooled = logits_and_embeddings(
+                model, enc["input_ids"].to(device), enc["attention_mask"].to(device))
+        all_logits.append(logits.detach().cpu().numpy())
+        all_emb.append(pooled.detach().cpu().numpy())
+
+    import numpy as np
+    logits_out = np.concatenate(all_logits, axis=0)
+    emb_out = np.concatenate(all_emb, axis=0)
+    if dump_pools:
+        return (logits_out, emb_out,
+                np.concatenate(all_ref, axis=0), np.concatenate(all_alt, axis=0),
+                run_config)
+    return logits_out, emb_out, run_config

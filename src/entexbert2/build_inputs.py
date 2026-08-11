@@ -1,3 +1,21 @@
+"""
+entexbert2.build_inputs -- dataset construction for the 2-stage ASB pipeline.
+
+Composes a RowSource (where the loci + counts/peaks come from) with a LabelSpec
+(what the training target is) into leak-free train/dev/test CSVs. Two live sources:
+
+  MultiTissuePeakRowSource  -- Stage 1: binding-affinity regression from ENCODE peaks
+                               + fold-change bigWigs, consensus-merged across tissues.
+  BetabinomCountRowSource   -- Stage 2: per-(donor,locus) allelic read counts (k, n)
+                               from build_betabinom_counts.py, for the ASB twin head.
+
+Label for Stage 2 is make_logit_ratio_label_spec: y = logit((k+0.5)/(n+1)) (Jeffreys),
+with n carried through as the privileged `depth` weight column (see model.py: w=n_eff(n)).
+
+New sources/labels plug in by adding a RowSource / make_*_label_spec here and registering
+it in run_experiment.ROW_SOURCE_BUILDERS / LABEL_BUILDERS. New experiments need no code.
+"""
+
 import os
 import math
 import hashlib
@@ -8,12 +26,8 @@ import pyBigWig
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Dict, List, Any, Literal
 
-######################
-# Global Specs & Utils
-######################
-
 TaskType = Literal["classification", "regression"]
-AuxTaskType = Literal["binary", "multiclass", "regression"]
+
 
 @dataclass
 class LabelSpec:
@@ -88,7 +102,6 @@ class PartitionSpec:
     #     crosses a bin edge (near-identical windows can otherwise land in different splits) ---
     exclude_boundary: bool = False
     boundary_bp: int = 0           # half-window; set to max(left_bp, right_bp)
-
 
 def genomic_bin_id(chrom: str, pos: int, bin_size: int) -> str:
     """
@@ -440,10 +453,6 @@ def split_and_write_csvs(
         print(f"\nAux label summary: {aux_col}")
         print(combined[aux_col].describe())
 
-######################
-# AS Experiment Utils
-######################
-
 def get_base_count(row: pd.Series, allele: str) -> float:
     """
     Return count for allele A/C/G/T from EN-TEx AS columns cA/cC/cG/cT
@@ -467,41 +476,12 @@ def total_allele_reads(row: pd.Series) -> float:
 
 def log_total_count(row: pd.Series, pseudocount: float = 1.0) -> float:
     """
-    Total binding depth at the SNV: log(ref_count + alt_count + 1) = log(total_allele_reads + 1).
+    Total binding depth at the SNV: log(total_allele_reads + 1).
     NOT an allelic contrast -- it's a per-locus magnitude. Used as a single-sequence CONTROL
     (ref_single input, no twin): if the backbone+head can't learn even this easy target, the
     failure is systemic (LR / frozen backbone / scaling), not "the allelic contrast is too subtle."
     """
     return math.log(total_allele_reads(row) + pseudocount)
-
-def hap1_ratio(row: pd.Series) -> float:
-    total = total_allele_reads(row)
-    if total <= 0:
-        return 0.0
-    return hap1_count(row) / total
-
-def signed_log_count_ratio(row: pd.Series, pseudocount: float = 1.0) -> float:
-    """
-    Positive means hap1 has more reads than hap2
-    Negative means hap2 has more reads than hap1
-    """
-    return math.log(hap1_count(row) + pseudocount) - math.log(hap2_count(row) + pseudocount)
-
-def abs_log_count_ratio(row: pd.Series, pseudocount: float = 1.0) -> float:
-    return abs(signed_log_count_ratio(row, pseudocount=pseudocount))
-
-def as_magnitude_from_ratio(row: pd.Series) -> float:
-    """
-    0 means perfectly balanced hap1/hap2
-    1 means all reads are on one haplotype
-    """
-    return abs(hap1_ratio(row) - 0.5) * 2.0
-
-def imbalance_significance_label(row: pd.Series) -> int:
-    return int(row["imbalance_significance"])
-
-def ref_allele_ratio_label(row: pd.Series) -> float:
-    return float(row["ref_allele_ratio"])
 
 def alt_allele_of(row: pd.Series) -> Optional[str]:
     """
@@ -517,137 +497,6 @@ def alt_allele_of(row: pd.Series) -> Optional[str]:
     if len(set(non_ref)) != 1:        # 0 (homozygous-ref) or 2 distinct (multiallelic) -> undefined
         return None
     return non_ref[0]
-
-def ref_count(row: pd.Series) -> float:
-    return get_base_count(row, row["ref_allele"])
-
-def alt_count(row: pd.Series) -> float:
-    alt = alt_allele_of(row)
-    if alt is None:
-        return float("nan")
-    return get_base_count(row, alt)
-
-def signed_log_alt_ref(row: pd.Series, pseudocount: float = 1.0) -> float:
-    """
-    deltaSVM-style signed allelic effect, REFERENCE-oriented:
-        log(alt_count + pc) - log(ref_count + pc)
-    Positive  -> the ALT allele binds more than REF (variant increases binding)
-    Negative  -> the ALT allele binds less than REF (variant decreases binding)
-    Returns NaN where alt is undefined (see alt_allele_of); such rows are dropped at
-    label-attach time. Pair this ONLY with a ref-first input (ref_alt_pair) so the
-    target sign and the input ordering agree.
-    """
-    alt = alt_allele_of(row)
-    if alt is None:
-        return float("nan")
-    return math.log(get_base_count(row, alt) + pseudocount) - math.log(ref_count(row) + pseudocount)
-
-def _neg_log10_bb(p, eps: float = 1e-300) -> float:
-    return -math.log10(max(float(p), eps))
-
-def neg_log10_p_betabinom(row: pd.Series) -> float:
-    """Privileged LUPI significance target -- NaN-EXCLUDE variant. -log10(p_betabinom); returns
-    NaN when p is missing so the row is DROPPED at label-attach (drop_aux_nan=True). This is the
-    baseline policy: untested sites are excluded, not relabeled 'balanced'. p_betabinom is a
-    per-SNV MEASUREMENT property (known at train, absent for a novel sequence) -> privileged.
-    Never use as a MAIN-task input."""
-    p = row["p_betabinom"]
-    return float("nan") if pd.isna(p) else _neg_log10_bb(p)
-
-def neg_log10_p_betabinom_fill0(row: pd.Series) -> float:
-    """Privileged LUPI significance target -- KEEP variant. -log10(p_betabinom), or 0.0 when p is
-    missing. Use ONLY together with the p_tested flag, so the model can distinguish a real 0
-    (tested & balanced) from a placeholder 0 (untested). For the 'keep untested rows as
-    negatives' policy."""
-    p = row["p_betabinom"]
-    return 0.0 if pd.isna(p) else _neg_log10_bb(p)
-
-def p_tested(row: pd.Series) -> int:
-    """Privileged binary flag: 1 if the site had a beta-binomial test (p_betabinom present) else 0.
-    Binary-valued; use it as an aux head with aux_task_type='binary'. Pairs with
-    neg_log10_p_betabinom_fill0 so 'testability' (a depth/power proxy) is its own privileged signal."""
-    return int(not pd.isna(row["p_betabinom"]))
-
-def load_as_table(
-    input_tsv: str,
-    assay: str,
-    donor: str,
-    tissue: Optional[str] = None,
-    min_total_reads: Optional[int] = None,
-    chunksize: int = 100000,
-) -> pd.DataFrame:
-    """
-    Load and filter EN-TEx hetSNVs_default_AS.tsv for one assay/donor, optionally one tissue
-
-    Adds:
-        total_reads
-        hap1_count
-        hap2_count
-        hap1_ratio
-        as_magnitude
-        signed_log_count_ratio
-        abs_log_count_ratio
-    """
-    usecols = [
-        "chr", "ref_start", "ref_end",
-        "ref_allele", "hap1_allele", "hap2_allele",
-        "experiment_accession", "donor", "tissue", "assay",
-        "cA", "cC", "cG", "cT",
-        "ref_allele_ratio", "p_betabinom", "imbalance_significance",
-    ]
-
-    chunks = []
-
-    for chunk in pd.read_csv(
-        input_tsv,
-        sep="\t",
-        usecols=usecols,
-        chunksize=chunksize,
-    ):
-        # assay: a single value; "ALL"/None to pool every assay for the donor;
-        # or a comma-separated string / list to pool a chosen subset.
-        donor_mask = chunk["donor"] == donor
-        if assay is None or (isinstance(assay, str) and assay.strip().upper() == "ALL"):
-            mask = donor_mask
-        elif isinstance(assay, (list, tuple, set)):
-            mask = donor_mask & chunk["assay"].isin(list(assay))
-        elif isinstance(assay, str) and "," in assay:
-            wanted = [a.strip() for a in assay.split(",") if a.strip()]
-            mask = donor_mask & chunk["assay"].isin(wanted)
-        else:
-            mask = donor_mask & (chunk["assay"] == assay)
-
-        if tissue is not None and str(tissue).strip().upper() != "ALL":
-            mask &= chunk["tissue"].eq(tissue)
-
-        sub = chunk[mask].copy()
-
-        if sub.empty:
-            continue
-
-        sub["hap1_count"] = sub.apply(hap1_count, axis=1)
-        sub["hap2_count"] = sub.apply(hap2_count, axis=1)
-        sub["total_reads"] = sub["hap1_count"] + sub["hap2_count"]
-
-        if min_total_reads is not None:
-            sub = sub[sub["total_reads"] >= min_total_reads].copy()
-
-        if sub.empty:
-            continue
-
-        sub["hap1_ratio"] = sub.apply(hap1_ratio, axis=1)
-        sub["as_magnitude"] = sub.apply(as_magnitude_from_ratio, axis=1)
-        sub["signed_log_count_ratio"] = sub.apply(signed_log_count_ratio, axis=1)
-        sub["abs_log_count_ratio"] = sub.apply(abs_log_count_ratio, axis=1)
-
-        chunks.append(sub)
-
-    if not chunks:
-        raise ValueError(
-            f"No AS rows found for assay={assay}, donor={donor}, tissue={tissue}."
-        )
-
-    return pd.concat(chunks, ignore_index=True)
 
 def balance_as_table(
     df: pd.DataFrame,
@@ -829,9 +678,8 @@ def add_label_columns(
     Rows whose PRIMARY label is NaN are always dropped (undefined target).
     If drop_aux_nan is True (default), rows with a NaN in ANY auxiliary label are also dropped --
     a NaN aux value would otherwise be written to the training CSV and yield a NaN loss/gradient.
-    This is also the mechanism behind the 'exclude untested sites' p_betabinom policy
-    (neg_log10_p_betabinom returns NaN for untested sites). Set drop_aux_nan=False to keep NaN aux
-    rows (e.g. when using neg_log10_p_betabinom_fill0 + p_tested instead).
+    Set drop_aux_nan=False to keep rows whose auxiliary label is NaN (default True drops them,
+    since a NaN aux value would otherwise be written to the CSV and yield a NaN loss/gradient).
     """
     df = df.copy()
     aux_labels = aux_labels or []
@@ -845,8 +693,8 @@ def add_label_columns(
             values.append(spec.transform_fn(raw))
         df[spec.name] = values
 
-    # Drop rows whose PRIMARY label is undefined (e.g. signed_log_alt_ref returns NaN where
-    # alt is undefined). Safety net; ref_alt_pair already pre-filters these in add_sequence_inputs.
+    # Drop rows whose PRIMARY label is undefined (NaN). Safety net; the hap_pair sequence
+    # builder already pre-filters undefined-alt loci in add_sequence_inputs.
     before = len(df)
     df = df[pd.notna(df[primary_label.name])].copy()
     dropped = before - len(df)
@@ -935,7 +783,7 @@ def add_sequence_inputs(
 
     # ref_alt_pair builds a REFERENCE-vs-ALTERNATE contrast (sequence1=ref, sequence2=alt).
     # It needs ref + haplotype alleles, and we drop rows where alt is undefined (homozygous-ref
-    # or multiallelic) so the contrast -- and the signed_log_alt_ref target -- stay well-posed.
+    # or multiallelic) so the haplotype contrast stays well-posed.
     if input_mode == "ref_alt_pair":
         if not (has_alleles and has_ref_allele):
             raise ValueError("ref_alt_pair needs ref_allele + hap1_allele/hap2_allele columns.")
@@ -1072,10 +920,6 @@ def add_sequence_inputs(
 
     return df
 
-###############################
-# Sequence Window Overlap Utils
-###############################
-
 def summarize_overlaps(overlaps, qstart, qend, mode: str):
     """
     Summarize a list of overlaps according to mode
@@ -1190,68 +1034,37 @@ def add_locus_and_example_ids(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
 #############################
-# AS label-spec factories
+# Label-spec factories
 #############################
 
-# Continuous AS targets derived directly from the hetSNV table columns.
-AS_REGRESSION_TARGETS: Dict[str, Callable[[pd.Series], float]] = {
-    "hap1_ratio": hap1_ratio,
-    "ref_allele_ratio": ref_allele_ratio_label,
-    "signed_log_count_ratio": signed_log_count_ratio,
-    "signed_log_alt_ref": signed_log_alt_ref,
-    "log_total_count": log_total_count,
-    "abs_log_count_ratio": abs_log_count_ratio,
-    "as_magnitude": as_magnitude_from_ratio,
-    "neg_log10_p_betabinom": neg_log10_p_betabinom,
-    "neg_log10_p_betabinom_fill0": neg_log10_p_betabinom_fill0,
-    "p_tested": p_tested, # binary-valued; use with aux_task_type='binary'
-}
-
-# Columns each target needs present on a row (for compose-time validation).
-_AS_COUNT_COLS = ["cA", "cC", "cG", "cT", "hap1_allele", "hap2_allele"]
-_AS_TARGET_REQUIREMENTS: Dict[str, List[str]] = {
-    "hap1_ratio": _AS_COUNT_COLS,
-    "signed_log_count_ratio": _AS_COUNT_COLS,
-    "signed_log_alt_ref": _AS_COUNT_COLS + ["ref_allele"],
-    "log_total_count": _AS_COUNT_COLS,
-    "abs_log_count_ratio": _AS_COUNT_COLS,
-    "as_magnitude": _AS_COUNT_COLS,
-    "ref_allele_ratio": ["ref_allele_ratio"],
-    "neg_log10_p_betabinom": ["p_betabinom"],
-    "neg_log10_p_betabinom_fill0": ["p_betabinom"],
-    "p_tested": ["p_betabinom"],
-}
+def _logit_ratio_jeffreys(row: pd.Series) -> float:
+    """
+    Stage-2 ASB target: the observed allelic log-odds with a Jeffreys (a=0.5) pseudocount,
+        y = logit((k + 0.5) / (n + 1)) = log((k + 0.5) / (n - k + 0.5)),
+    where k = hap1 reads and n = total reads. Finite at k=0 and k=n (the +0.5/+1 shrinks
+    extremes toward log-odds 0 with weight ~1/n -- regularizing at low depth, negligible at
+    high depth). This is a LOG-ODDS in R, on the same scale as the model's twin output mu.
+    """
+    k = float(row["k"]); n = float(row["n"])
+    return math.log((k + 0.5) / (n - k + 0.5))
 
 
-def make_as_class_label_spec(name: str = "imbalance_significance") -> LabelSpec:
-    """Binary/multi-level AS classification from the precomputed imbalance_significance column."""
+def make_logit_ratio_label_spec(name: str = "logit_ratio") -> LabelSpec:
+    """
+    Jeffreys-smoothed allelic log-odds target for the Stage-2 ASB twin head (regression).
+    Reads k, n (emitted by BetabinomCountRowSource). The read depth n should ALSO be passed
+    through as the `depth` column (depth_col='n' in the build) so the finetune loss can form
+    the privileged precision weight w = n_eff(n); this spec produces only the label y.
+    """
     return LabelSpec(
         name=name,
-        fn=imbalance_significance_label,
-        task_type="classification",
-        required_columns=["imbalance_significance"],
-    )
-
-
-def make_as_regression_label_spec(
-    target: str,
-    name: Optional[str] = None,
-    transform_fn: Callable[[float], float] = lambda x: x,
-) -> LabelSpec:
-    """Continuous AS regression target (allelic ratio, signed log count ratio, etc.)."""
-    if target not in AS_REGRESSION_TARGETS:
-        raise ValueError(
-            f"Unsupported AS regression target {target!r}. "
-            f"Choose from {sorted(AS_REGRESSION_TARGETS)}."
-        )
-    return LabelSpec(
-        name=name or target,
-        fn=AS_REGRESSION_TARGETS[target],
+        fn=_logit_ratio_jeffreys,
         task_type="regression",
-        transform_fn=transform_fn,
-        required_columns=list(_AS_TARGET_REQUIREMENTS[target]),
+        required_columns=["k", "n"],
     )
+
 
 def make_column_label_spec(
     column: str,
@@ -1274,10 +1087,6 @@ def make_column_label_spec(
         transform_fn=transform_fn,
         required_columns=[col],
     )
-
-#############################
-# Row sources
-#############################
 
 class RowSource:
     """
@@ -1303,191 +1112,6 @@ class RowSource:
 
     def describe(self) -> dict:
         return {"source_type": self.source_type, "has_variants": self.has_variants}
-
-
-class SNVRowSource(RowSource):
-    """SNV row source: wraps load_as_table (one row per het SNV per tissue)."""
-
-    source_type = "snv_tsv"
-    has_variants = True
-    supported_input_modes = {
-        "ref_single", "hap1_single", "hap2_single",
-        "hap_pair", "ref_hap1_pair", "ref_hap2_pair", "ref_alt_pair",
-    }
-
-    def __init__(
-        self,
-        input_tsv: str,
-        assay: str,
-        donor: str,
-        tissue: Optional[str] = None,
-        min_total_reads: Optional[int] = None,
-        chunksize: int = 100000,
-    ):
-        self.input_tsv = input_tsv
-        self.assay = assay
-        self.donor = donor
-        self.tissue = tissue
-        self.min_total_reads = min_total_reads
-        self.chunksize = chunksize
-
-    def load(self) -> pd.DataFrame:
-        df = load_as_table(
-            input_tsv=self.input_tsv,
-            assay=self.assay,
-            donor=self.donor,
-            tissue=self.tissue,
-            min_total_reads=self.min_total_reads,
-            chunksize=self.chunksize,
-        )
-        df["anchor"] = df["ref_start"].astype(int)
-        return df
-
-    def describe(self) -> dict:
-        return {
-            "source_type": self.source_type,
-            "has_variants": self.has_variants,
-            "input_tsv": self.input_tsv,
-            "assay": self.assay,
-            "donor": self.donor,
-            "tissue": self.tissue,
-            "min_total_reads": self.min_total_reads,
-        }
-
-class PeakBedRowSource(RowSource):
-    """
-    Binding row source: peak summits (positives) + matched non-peak windows
-    (background) as anchored loci, for BINDING-SIGNAL regression.
-
-    Unlike SNVRowSource (one row per het SNV), this source produces genomic
-    anchors from a narrowPeak/BED file plus an equal number of length-matched
-    background windows drawn from the genome outside the peaks. The continuous
-    regression target (e.g. BigWig fold-change) is attached downstream by the
-    label spec's annotator over each windowed locus, so this source only needs
-    to emit the anchor coordinates + provenance.
-
-    Emitted columns (consumed by add_snv_windows / add_sequence_inputs):
-        chr, anchor (0-based center), ref_start, ref_end,
-        donor, tissue, assay, feature_type ("peak" | "background")
-
-    No ref_allele column is emitted: ref_single treats ref_allele as optional
-    (has_ref_allele guard), so it extracts the reference window with no variant
-    substitution and no allele sanity-check.
-
-    supported_input_modes is DELIBERATELY {"ref_single"} only (has_variants=
-    False): this source's job is to produce reference training windows for the
-    binding regressor. It does NOT emit ref/alt pairs. The ref-vs-alt Delta used
-    at ASB-benchmark eval time is computed by the scoring script (which
-    substitutes the alt allele at the window center and re-runs the model),
-    not by this source at training time.
-    """
-
-    source_type = "peak_bed"
-    has_variants = False
-    supported_input_modes = {"ref_single"}
-
-    def __init__(
-        self,
-        peak_path: str,
-        assay: str,
-        donor: str,
-        tissue: Optional[str] = None,
-        genome_sizes_path: Optional[str] = None,
-        is_narrowpeak: bool = True,
-        summit_mode: str = "summit",            # "summit" | "center"
-        background_ratio: float = 1.0,          # #background = ratio * #peaks
-        background_gap_bp: int = 1000,          # min distance of background from any peak
-        exclude_chroms: Optional[List[str]] = None,
-        seed: int = 42,
-    ):
-        self.peak_path = peak_path
-        self.assay = assay
-        self.donor = donor
-        self.tissue = tissue
-        self.genome_sizes_path = genome_sizes_path
-        self.is_narrowpeak = is_narrowpeak
-        self.summit_mode = summit_mode
-        self.background_ratio = float(background_ratio)
-        self.background_gap_bp = int(background_gap_bp)
-        self.exclude_chroms = set(exclude_chroms or [])
-        self.seed = int(seed)
-
-    def _load_peaks(self) -> pd.DataFrame:
-        cols = (["chr", "start", "end", "name", "score", "strand",
-                 "signalValue", "pValue", "qValue", "peak"]
-                if self.is_narrowpeak else ["chr", "start", "end"])
-        df = pd.read_csv(
-            self.peak_path, sep="\t", header=None, comment="#",
-            usecols=range(len(cols)), names=cols,
-        )
-        df = df[~df["chr"].isin(self.exclude_chroms)].copy()
-        df["start"] = df["start"].astype(int)
-        df["end"] = df["end"].astype(int)
-        if self.summit_mode == "summit" and self.is_narrowpeak and "peak" in df:
-            off = df["peak"].astype(int)
-            off = off.where(off >= 0, ((df["end"] - df["start"]) // 2))
-            df["anchor"] = df["start"] + off
-        else:
-            df["anchor"] = (df["start"] + df["end"]) // 2
-        df["feature_type"] = "peak"
-        return df[["chr", "anchor", "start", "end", "feature_type"]]
-
-    def _sample_background(self, peaks: pd.DataFrame) -> pd.DataFrame:
-        sizes = load_chrom_sizes(self.genome_sizes_path)
-        rng = np.random.default_rng(self.seed)
-        n_target = int(round(self.background_ratio * len(peaks)))
-        gap = self.background_gap_bp
-        forbid = {}
-        for c, sub in peaks.groupby("chr"):
-            forbid[c] = (sub["start"].to_numpy() - gap, sub["end"].to_numpy() + gap)
-        chrom_counts = peaks["chr"].value_counts()
-        chroms = chrom_counts.index.to_numpy()
-        weights = (chrom_counts / chrom_counts.sum()).to_numpy()
-        out_chr, out_anchor = [], []
-        tries, max_tries = 0, n_target * 50
-        while len(out_chr) < n_target and tries < max_tries:
-            tries += 1
-            c = rng.choice(chroms, p=weights)
-            csize = sizes.get(c)
-            if not csize:
-                continue
-            a = int(rng.integers(1000, csize - 1000))
-            lo, hi = forbid.get(c, (np.array([]), np.array([])))
-            if lo.size and np.any((a >= lo) & (a <= hi)):
-                continue
-            out_chr.append(c)
-            out_anchor.append(a)
-        bg = pd.DataFrame({"chr": out_chr, "anchor": out_anchor})
-        bg["start"] = bg["anchor"]
-        bg["end"] = bg["anchor"] + 1
-        bg["feature_type"] = "background"
-        return bg
-
-    def load(self) -> pd.DataFrame:
-        peaks = self._load_peaks()
-        bg = self._sample_background(peaks)
-        df = pd.concat([peaks, bg], ignore_index=True)
-        df["ref_start"] = df["anchor"].astype(int)
-        df["ref_end"] = df["anchor"].astype(int) + 1
-        df["donor"] = self.donor
-        df["tissue"] = self.tissue if self.tissue is not None else "all"
-        df["assay"] = self.assay
-        return df.reset_index(drop=True)
-
-    def describe(self) -> dict:
-        return {
-            "source_type": self.source_type,
-            "has_variants": self.has_variants,
-            "peak_path": self.peak_path,
-            "assay": self.assay,
-            "donor": self.donor,
-            "tissue": self.tissue,
-            "is_narrowpeak": self.is_narrowpeak,
-            "summit_mode": self.summit_mode,
-            "background_ratio": self.background_ratio,
-            "background_gap_bp": self.background_gap_bp,
-            "exclude_chroms": sorted(self.exclude_chroms),
-        }
 
 class BetabinomCountRowSource(RowSource):
     """
@@ -1792,10 +1416,6 @@ class MultiTissuePeakRowSource(RowSource):
                 "merge_window_bp": self.merge_window_bp, "label_radius_bp": self.label_radius_bp,
                 "background_ratio": self.background_ratio}
 
-#############################
-# Source-agnostic builder
-#############################
-
 def build_dataset(
     row_source: RowSource,
     output_dir: str,
@@ -1929,11 +1549,6 @@ def build_dataset(
     )
 
     return df
-
-
-#####################
-# BigWig Signal Utils
-#####################
 
 def summarize_bigwig_values(
     values,
@@ -2153,69 +1768,6 @@ class BigWigSignalAnnotator:
             missing_value=self.missing_value,
         )
 
-class TissueAwareBigWigSignalAnnotator:
-    """
-    Tissue-aware BigWig signal annotator
-
-    Selects the BigWig file based on row["tissue"]
-    """
-
-    def __init__(
-        self,
-        bigwig_paths_by_tissue: Dict[str, str],
-        mode: str = "mean",
-        region: str = "window",
-        radius_bp: int = 0,
-        missing_value: float = 0.0,
-        use_values: bool = True,
-        exact: bool = True,
-    ):
-        self.bigwig_paths_by_tissue = bigwig_paths_by_tissue
-        self.mode = mode
-        self.region = region
-        self.radius_bp = radius_bp
-        self.missing_value = missing_value
-        self.use_values = use_values
-        self.exact = exact
-
-        self.annotators = {}
-
-        missing = []
-        for tissue, path in bigwig_paths_by_tissue.items():
-            if path is None or not os.path.exists(path):
-                missing.append((tissue, path))
-                continue
-
-            self.annotators[tissue] = BigWigSignalAnnotator(
-                bigwig_path=path,
-                mode=mode,
-                region=region,
-                radius_bp=radius_bp,
-                missing_value=missing_value,
-                use_values=use_values,
-                exact=exact,
-            )
-
-        if not self.annotators:
-            raise ValueError("No valid BigWig files were provided for any tissue.")
-
-        if missing:
-            print("Warning: missing BigWigs for some tissues:")
-            for tissue, path in missing:
-                print(f"  {tissue}: {path}")
-
-    def close(self):
-        for annotator in self.annotators.values():
-            annotator.close()
-
-    def __call__(self, row: pd.Series) -> float:
-        tissue = row["tissue"]
-
-        if tissue not in self.annotators:
-            return float(self.missing_value)
-
-        return self.annotators[tissue](row)
-
 def make_bigwig_label_spec(
     name: str,
     bigwig_path: str,
@@ -2244,226 +1796,6 @@ def make_bigwig_label_spec(
         name=name,
         fn=annotator,
         task_type="regression",
-        transform_fn=transform_fn,
-        required_columns=["chr"],
-    )
-
-def make_tissue_aware_bigwig_label_spec(
-    name: str,
-    bigwig_paths_by_tissue: Dict[str, str],
-    mode: str = "mean",
-    region: str = "window",
-    radius_bp: int = 0,
-    transform_fn: Callable[[float], float] = lambda x: x,
-    missing_value: float = 0.0,
-    use_values: bool = True,
-    exact: bool = True,
-) -> LabelSpec:
-    """
-    Build a regression LabelSpec from tissue-specific BigWig files
-    """
-    annotator = TissueAwareBigWigSignalAnnotator(
-        bigwig_paths_by_tissue=bigwig_paths_by_tissue,
-        mode=mode,
-        region=region,
-        radius_bp=radius_bp,
-        missing_value=missing_value,
-        use_values=use_values,
-        exact=exact,
-    )
-
-    return LabelSpec(
-        name=name,
-        fn=annotator,
-        task_type="regression",
-        transform_fn=transform_fn,
-        required_columns=["chr", "tissue"],
-    )
-
-#####################
-# Peak BED Signal Utils
-#####################
-
-class PeakBedAnnotator:
-    """
-    Annotator for deriving labels from a peak BED / ENCODE narrowPeak file.
-
-    Supports:
-        - "binary":       1.0 if the queried region overlaps any peak, else 0.0   (classification)
-        - "count":        number of overlapping peaks
-        - "max_score":    max peak score among overlaps (e.g. narrowPeak signalValue)
-        - "sum_score":    sum of peak scores among overlaps
-        - "frac_covered": fraction of the queried region covered by peaks
-
-    Region (mirrors BigWigSignalAnnotator):
-        - "window":     [bed_start, bed_end)
-        - "snv":        [SNV, SNV + 1)
-        - "snv_radius": [SNV - radius_bp, SNV + radius_bp + 1)
-
-    Coordinates are 0-based half-open (BED), matching the SNV coordinates the engine
-    has already validated against the reference FASTA.
-
-    narrowPeak score fields (BED6+4): score=col5, signalValue=col7, pValue=col8, qValue=col9
-    (0-based column indices 4/6/7/8). Generic BED uses col5 (index 4) if present.
-    """
-
-    NARROWPEAK_FIELDS = {"score": 4, "signalValue": 6, "pValue": 7, "qValue": 8}
-
-    def __init__(
-        self,
-        bed_path: str,
-        mode: str = "binary",
-        region: str = "snv",
-        radius_bp: int = 0,
-        score_field: str = "signalValue",
-        is_narrowpeak: bool = True,
-        missing_value: float = 0.0,
-    ):
-        self.bed_path = bed_path
-        self.mode = mode
-        self.region = region
-        self.radius_bp = radius_bp
-        self.score_field = score_field
-        self.is_narrowpeak = is_narrowpeak
-        self.missing_value = missing_value
-        self._load(bed_path)
-
-    def _load(self, bed_path: str):
-        df = pd.read_csv(
-            bed_path, sep="\t", header=None, comment="#", compression="infer", dtype=str
-        )
-        if df.shape[1] < 3:
-            raise ValueError(
-                f"{bed_path}: expected at least 3 BED columns, got {df.shape[1]}."
-            )
-
-        chroms = df[0].astype(str).to_numpy()
-        starts = pd.to_numeric(df[1], errors="coerce").to_numpy()
-        ends = pd.to_numeric(df[2], errors="coerce").to_numpy()
-
-        if self.is_narrowpeak:
-            if self.score_field not in self.NARROWPEAK_FIELDS:
-                raise ValueError(
-                    f"Unsupported narrowPeak score_field {self.score_field!r}. "
-                    f"Choose from {sorted(self.NARROWPEAK_FIELDS)}."
-                )
-            score_col = self.NARROWPEAK_FIELDS[self.score_field]
-        else:
-            score_col = 4  # generic BED score column
-
-        if score_col is not None and score_col < df.shape[1]:
-            scores = pd.to_numeric(df[score_col], errors="coerce").fillna(0.0).to_numpy()
-        else:
-            scores = np.zeros(len(df), dtype=float)
-
-        valid = np.isfinite(starts) & np.isfinite(ends)
-        chroms = chroms[valid]
-        starts = starts[valid].astype(np.int64)
-        ends = ends[valid].astype(np.int64)
-        scores = scores[valid].astype(float)
-
-        self.n_peaks = int(len(starts))
-        self.max_width = int((ends - starts).max()) if self.n_peaks else 0
-
-        # Per-chrom arrays, sorted by start for searchsorted-based overlap queries.
-        self.by_chrom = {}
-        for c in np.unique(chroms):
-            m = chroms == c
-            cs, ce, csc = starts[m], ends[m], scores[m]
-            order = np.argsort(cs, kind="stable")
-            self.by_chrom[c] = (cs[order], ce[order], csc[order])
-
-        # Sanity: warn if the chosen score column is degenerate (e.g. all-zero col5 score).
-        if self.mode in {"max_score", "sum_score"} and self.n_peaks and np.allclose(scores, scores[0]):
-            print(
-                f"PeakBedAnnotator WARNING: score_field={self.score_field!r} is constant "
-                f"({scores[0]}) across all peaks in {bed_path}; the resulting label will be "
-                f"degenerate. Did you mean a different score_field?"
-            )
-
-    def _region_from_row(self, row: pd.Series):
-        chrom = row["chr"]
-
-        if self.region == "window":
-            start = int(row["bed_start"])
-            end = int(row["bed_end"])
-        elif self.region == "snv":
-            snv = int(row["SNV"])
-            start = snv
-            end = snv + 1
-        elif self.region == "snv_radius":
-            snv = int(row["SNV"])
-            start = snv - self.radius_bp
-            end = snv + self.radius_bp + 1
-        else:
-            raise ValueError(
-                f"Unsupported peak query region {self.region!r}. "
-                "Choose from {'window', 'snv', 'snv_radius'}."
-            )
-
-        start = max(0, start)
-        if end <= start:
-            return chrom, None, None
-        return chrom, start, end
-
-    def _overlaps(self, chrom, qstart, qend):
-        """Peaks with start < qend and end > qstart. Returns [(start, end, score), ...]."""
-        if chrom not in self.by_chrom:
-            return []
-        starts, ends, scores = self.by_chrom[chrom]
-        # Candidates start in [qstart - max_width, qend); max_width bounds the lower edge so a
-        # peak that starts well before qstart but extends into it is still considered.
-        lo = int(np.searchsorted(starts, qstart - self.max_width, side="left"))
-        hi = int(np.searchsorted(starts, qend, side="left"))
-        out = []
-        for i in range(lo, hi):
-            if ends[i] > qstart:
-                out.append((int(starts[i]), int(ends[i]), float(scores[i])))
-        return out
-
-    def __call__(self, row: pd.Series) -> float:
-        chrom, qstart, qend = self._region_from_row(row)
-        if qstart is None:
-            # Degenerate region: no overlaps. summarize_overlaps handles the empty case.
-            return float(summarize_overlaps([], 0, 1, self.mode))
-        overlaps = self._overlaps(chrom, qstart, qend)
-        return float(summarize_overlaps(overlaps, qstart, qend, self.mode))
-
-
-def make_peak_bed_label_spec(
-    name: str,
-    bed_path: str,
-    mode: str = "binary",
-    region: str = "snv",
-    radius_bp: int = 0,
-    score_field: str = "signalValue",
-    is_narrowpeak: bool = True,
-    missing_value: float = 0.0,
-    transform_fn: Callable[[float], float] = lambda x: x,
-    task_type: Optional[str] = None,
-) -> LabelSpec:
-    """
-    Build a LabelSpec from a peak BED / narrowPeak file.
-
-    task_type defaults to "classification" for mode="binary", else "regression".
-    """
-    annotator = PeakBedAnnotator(
-        bed_path=bed_path,
-        mode=mode,
-        region=region,
-        radius_bp=radius_bp,
-        score_field=score_field,
-        is_narrowpeak=is_narrowpeak,
-        missing_value=missing_value,
-    )
-
-    if task_type is None:
-        task_type = "classification" if mode == "binary" else "regression"
-
-    return LabelSpec(
-        name=name,
-        fn=annotator,
-        task_type=task_type,
         transform_fn=transform_fn,
         required_columns=["chr"],
     )
