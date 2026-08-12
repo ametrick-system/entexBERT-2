@@ -255,14 +255,24 @@ def eval_adastra(args):
         results.append(report("leak_free", ev.loc[~leaky]))
 
     if args.reference_csv and os.path.exists(args.reference_csv):
-        ref = pd.read_csv(args.reference_csv).sort_values("CTCF_AUROC", ascending=False)
+        ref = pd.read_csv(args.reference_csv)
+        # NEW: the benchmark AUROC column is TF-prefixed (CTCF_AUROC, EP300_AUROC, ...).
+        # Derive it from --assay; fall back to the single *_AUROC column if the exact name is absent.
+        acol = f"{args.assay}_AUROC"
+        if acol not in ref.columns:
+            cand = [c for c in ref.columns if c.endswith("_AUROC")]
+            if len(cand) != 1:
+                raise KeyError(f"reference_csv has no '{acol}' and {len(cand)} *_AUROC columns {cand}; "
+                               f"pass a reference matching --assay={args.assay}")
+            acol = cand[0]
+        ref = ref.sort_values(acol, ascending=False)
         eb2 = results[-1]["auroc"]
-        print(f"\n=== entexBERT-2 vs benchmark models (CTCF AUROC, {len(ref)} with valid CTCF) ===")
+        print(f"\n=== entexBERT-2 vs benchmark models ({acol}, {len(ref)} models) ===")
         placed = False
         for _, r in ref.iterrows():
-            if not placed and eb2 >= r["CTCF_AUROC"]:
+            if not placed and eb2 >= r[acol]:
                 print(f"  >>> entexBERT-2 (this run)   {eb2:.4f}  <<<"); placed = True
-            print(f"      {r['model']:20s} {r['family']:9s} {r['CTCF_AUROC']:.4f}")
+            print(f"      {r['model']:20s} {r['family']:9s} {r[acol]:.4f}")
         if not placed:
             print(f"  >>> entexBERT-2 (this run)   {eb2:.4f}  (below all listed) <<<")
 

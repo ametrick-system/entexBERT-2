@@ -20,7 +20,6 @@ import torch
 import transformers
 from transformers.modeling_outputs import SequenceClassifierOutput
 
-
 # ---------------------------------------------------------------------------
 # Prediction head (g_phi): linear (num_layers=1) or MLP (num_layers>=2)
 # ---------------------------------------------------------------------------
@@ -215,15 +214,12 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         depth=None,                # n = total read depth (privileged; weight only)
         **kwargs,
     ):
-        if input_ids_alt is None:
-            raise RuntimeError(
-                "entexBERT2 ASB model requires a paired (hap1, hap2) batch, but input_ids_alt "
-                "did not reach forward. Set remove_unused_columns=False and use the twin collator."
-            )
-
         logit_hap1, _ = self._score_one(input_ids, attention_mask, **kwargs)
-        logit_hap2, _ = self._score_one(input_ids_alt, attention_mask_alt, **kwargs)
-        mu = logit_hap1 - logit_hap2                       # signed contrast = logit P(hap1)
+        if input_ids_alt is None:
+            mu = logit_hap1                                # single-window binding score
+        else:
+            logit_hap2, _ = self._score_one(input_ids_alt, attention_mask_alt, **kwargs)
+            mu = logit_hap1 - logit_hap2                   # signed contrast = logit P(hap1)
 
         loss = None
         if labels is not None:
