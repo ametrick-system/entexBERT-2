@@ -521,6 +521,10 @@ def train():
                                    args=training_args,
                                    preprocess_logits_for_metrics=preprocess_logits_for_metrics,
                                    compute_metrics=make_compute_metrics(data_args.task),
+                                   train_dataset=train_dataset,
+                                   eval_dataset=val_dataset,
+                                   data_collator=data_collator)
+                                   
     trainer.train()
 
     if training_args.save_model:
