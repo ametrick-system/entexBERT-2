@@ -121,6 +121,7 @@ _DEFAULT_TRANSFORM = {
     "logit_ratio": "identity",
     "bigwig": "log1p",
     "column": "identity",
+    "as_class": "identity",     # binary AS label: read as-is (0/1), no transform
 }
 
 
@@ -151,10 +152,23 @@ def _build_column(cfg, tf):
         column=cfg["column"], name=cfg.get("name"), transform_fn=tf
     )
 
+
+def _build_as_class(cfg, tf):
+    # Binary allele-specific-binding label (e.g. imbalance_significance, 0/1) read directly
+    # from a precomputed source column. task_type="classification" drives the contrast head.
+    # Default column matches the betabinom_counts source's significance column.
+    return make_column_label_spec(
+        column=cfg.get("column", "imbalance_significance"),
+        name=cfg.get("name", "as_class"),
+        task_type="classification",
+        transform_fn=tf,
+    )
+
 LABEL_BUILDERS = {
-    "logit_ratio": _build_logit_ratio,     # Stage 2 ASB target
+    "logit_ratio": _build_logit_ratio,     # Stage 2 ASB target (regression, signed twin)
     "bigwig": _build_bigwig,               # Stage 1 binding signal
-    "column": _build_column,               # precomputed source column (e.g. consensus fold-change)
+    "column": _build_column,               # precomputed source column (regression)
+    "as_class": _build_as_class,           # Stage 2 ASB target (classification, contrast head)
 }
 
 
@@ -255,7 +269,10 @@ def resolve_head(head, primary_label):
     """
     Derive/validate the finetune head config from the primary label's task_type so the two
     can't disagree. The config's `head` block only needs architecture (head_num_layers,
-    head_hidden_size). The 2-stage ASB model is regression-only (num_labels=1).
+    head_hidden_size, and for classification proj_dim). The 2-stage ASB model supports:
+      - task="regression"     : signed twin head, num_labels=1 (Stage-1 binding + Stage-2 ASB Δ)
+      - task="classification"  : symmetric contrast head, s=||P(h1)-P(h2)||, p=σ(a·s+b)
+    task is authoritative from the label's task_type and also selects the model head TOPOLOGY.
     """
     head = dict(head or {})
     task = primary_label.task_type  # authoritative: comes from the label
@@ -267,16 +284,20 @@ def resolve_head(head, primary_label):
         )
     head["task"] = task
 
-    if task != "regression":
+    if task not in ("regression", "classification"):
         raise ValueError(
-            f"The streamlined 2-stage model supports task='regression' only, got {task!r}."
+            f"Supported tasks: 'regression' | 'classification'; got {task!r}."
         )
+    # Both heads emit a single scalar (regression: μ; classification: the P(ASB) logit).
     if head.get("num_labels", 1) != 1:
-        print(f"  note: regression forces num_labels=1 (config had {head.get('num_labels')}).")
+        print(f"  note: this model forces num_labels=1 (config had {head.get('num_labels')}).")
     head["num_labels"] = 1
 
     head.setdefault("head_num_layers", 1)
     head.setdefault("head_hidden_size", -1)
+    if task == "classification":
+        # projection dim d for the shared P: hidden -> d used to form the contrast distance.
+        head.setdefault("proj_dim", 128)
     return head
 
 
@@ -284,12 +305,14 @@ def emit_finetune_settings(head, output_dir, primary_name, depth_col):
     """Print the finetune settings recorded for this dataset (verified flags only)."""
     print("\nFinetune settings (map to finetune_entexbert2.py):")
     print(f"  --task {head['task']}")
-    print(f"  --main_num_labels {head['num_labels']}")
     print(f"  --head_num_layers {head['head_num_layers']}  (1 = linear, >1 = MLP)")
     if head["head_hidden_size"] != -1:
         print(f"  --head_hidden_size {head['head_hidden_size']}")
+    if head["task"] == "classification":
+        print(f"  --proj_dim {head.get('proj_dim', 128)}   (shared projection dim d for the contrast distance)")
+        print(f"  --balanced_sampler True   (class-balanced batches: AS is rare, ~5-6% positive)")
     if depth_col:
-        print(f"  --hetero_loss precision_neff --neff_s <s>   (privileged weight from '{depth_col}' -> depth)")
+        print(f"  --neff_s <s>   (privileged precision weight from '{depth_col}' -> depth; LUPI)")
     print(f"  trainer data path: {output_dir}")
     print(f"  primary label column: {primary_name}")
 

@@ -232,6 +232,13 @@ def eval_adastra(args):
         a1_col="ref", a2_col="alt", pos_is_1based=True)
     ev, run_config, pool_ref, pool_alt = score_pairs(ev, seqs1, seqs2, keep, args, "snp")
 
+    # NEW: task-aware ranking score. regression -> |mu| (signed contrast; magnitude is the
+    # ASB signal). classification -> ell = logit P(ASB), already correctly signed (higher =
+    # more ASB), so rank on delta directly; abs() would corrupt ranking where the bias b<0.
+    task = run_config.get("task", "regression")
+    score_col = "delta" if task == "classification" else "abs_delta"
+    print(f"[score] task={task} -> ranking AUROC on '{score_col}'")
+
     seen = seen_bins_from_meta(args.train_coords, args.bin_size)
     leaky = flag_leaky(ev, seen, args.bin_size, "chr", "pos", pos_is_1based=True)
     ev["leaky"] = leaky
@@ -244,7 +251,7 @@ def eval_adastra(args):
               "For leak-free, pass fold0/train.meta.csv fold0/dev.meta.csv.")
 
     def report(tag, sub):
-        pt, aupr, (lo, hi), m = balanced_auroc(sub["abs_delta"].to_numpy(), sub["label"].to_numpy())
+        pt, aupr, (lo, hi), m = balanced_auroc(sub[score_col].to_numpy(), sub["label"].to_numpy())
         print(f"[AUROC:{tag}] balanced {m} pos + {m} neg  AUROC={pt:.4f} "
               f"95%CI[{lo:.4f},{hi:.4f}]  AUPRC={aupr:.4f}")
         return {"regime": tag, "auroc": pt, "auroc_lo": lo, "auroc_hi": hi,
@@ -299,6 +306,10 @@ def eval_hetsnv(args):
     seen = seen_bins_from_meta(args.train_coords, args.bin_size)
 
     all_rows, summary = [], []
+    # NEW: task-aware ranking score + whether signed/mag calibration is meaningful.
+    # classification score = ell (logit P(ASB)), symmetric distance-based -> signed/mag
+    # Spearman vs the signed count-ratio are meaningless, so they are reported as NaN.
+    _task = {"t": "regression"}   # filled from run_config after the first score_pairs call
     for donor in args.donors:
         d = full[full["donor"] == donor].reset_index(drop=True)
         if len(d) == 0:
@@ -309,7 +320,8 @@ def eval_hetsnv(args):
             d, args.ref_fasta, args.left_bp, args.right_bp,
             chrom_col="chr", pos_col="ref_start", refbase_col="ref_allele",
             a1_col="hap1_allele", a2_col="hap2_allele", pos_is_1based=False)
-        d, _cfg, pool_ref, pool_alt = score_pairs(d, seqs1, seqs2, keep, args, "chr")
+        d, run_config, pool_ref, pool_alt = score_pairs(d, seqs1, seqs2, keep, args, "chr")
+        _task["t"] = run_config.get("task", "regression")
         d["donor"] = donor
         d["donor_kind"] = "matched" if donor == args.matched_donor else "cross-donor"
         leaky = flag_leaky(d, seen, args.bin_size, "chr", "ref_start", pos_is_1based=False)
@@ -320,11 +332,16 @@ def eval_hetsnv(args):
                   f"({int(leaky[d.label.to_numpy()==1].sum())} positive).")
 
         def rep(tag, sub):
-            pt, aupr, (lo, hi), m = balanced_auroc(sub["abs_delta"].to_numpy(), sub["label"].to_numpy())
-            mag = (spearmanr(sub["abs_delta"], sub["signed_log_count_ratio"].abs()).correlation
-                   if len(sub) > 10 else np.nan)
-            sgn = (spearmanr(sub["delta"], sub["signed_log_count_ratio"]).correlation
-                   if len(sub) > 10 else np.nan)
+            _sc = "delta" if _task["t"] == "classification" else "abs_delta"
+            pt, aupr, (lo, hi), m = balanced_auroc(sub[_sc].to_numpy(), sub["label"].to_numpy())
+            # signed/mag calibration only meaningful for the regression contrast; NaN for classification.
+            if _task["t"] == "classification":
+                mag = sgn = np.nan
+            else:
+                mag = (spearmanr(sub["abs_delta"], sub["signed_log_count_ratio"].abs()).correlation
+                       if len(sub) > 10 else np.nan)
+                sgn = (spearmanr(sub["delta"], sub["signed_log_count_ratio"]).correlation
+                       if len(sub) > 10 else np.nan)
             print(f"  [{donor}:{tag}] AUROC={pt:.4f} CI[{lo:.4f},{hi:.4f}] AUPRC={aupr:.4f} "
                   f"n_pos={m} | mag_Spearman={mag:.4f} signed_Spearman={sgn:.4f}")
             summary.append(dict(donor=donor, donor_kind=d["donor_kind"].iloc[0], regime=tag,
@@ -341,8 +358,10 @@ def eval_hetsnv(args):
             npos = int((sub.label == 1).sum()); nneg = int((sub.label == 0).sum())
             if npos < args.min_tissue_pos or nneg < args.min_tissue_pos:
                 continue
-            pt, aupr, (lo, hi), m = balanced_auroc(sub["abs_delta"].to_numpy(), sub["label"].to_numpy())
-            mag = spearmanr(sub["abs_delta"], sub["signed_log_count_ratio"].abs()).correlation
+            _sc = "delta" if _task["t"] == "classification" else "abs_delta"
+            pt, aupr, (lo, hi), m = balanced_auroc(sub[_sc].to_numpy(), sub["label"].to_numpy())
+            mag = (np.nan if _task["t"] == "classification"
+                   else spearmanr(sub["abs_delta"], sub["signed_log_count_ratio"].abs()).correlation)
             print(f"    {tis:32s} AUROC={pt:.4f} n_pos={m} mag_Sp={mag:.4f}")
             summary.append(dict(donor=donor, donor_kind=d["donor_kind"].iloc[0], regime=tis_regime,
                                 tissue=tis, auroc=pt, auroc_lo=lo, auroc_hi=hi, auprc=aupr,

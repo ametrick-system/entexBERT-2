@@ -1,17 +1,28 @@
 """
 entexbert2.model — the streamlined 2-stage ASB model.
 
-ONE model class, ONE task: a DNABERT-2 trunk (f_theta) with a twin prediction head
-(g_phi) that scores allele-specific binding as a signed contrast between the two
-haplotype windows, trained with a privileged read-count precision weight.
+ONE trunk (f_theta = DNABERT-2), TWO Stage-2 heads selectable by `task`:
 
-    mu = g_phi(f_theta(seq_hap1)) - g_phi(f_theta(seq_hap2))            # predicted allelic log-odds
+  * task="regression"  (signed twin):  mu = g(f(seq_hap1)) - g(f(seq_hap2))
+        predicts the signed allelic log-odds; precision-weighted MSE on the
+        Jeffreys logit-ratio label. Direction-aware, deployable. (Also the
+        single-sequence Stage-1 binding trunk: input_ids_alt=None -> mu = g(f(seq)).)
 
-At inference mu is produced from sequence alone (no counts) -> fully deployable.
-The read counts enter ONLY through the loss weight (LUPI: privileged at train, absent
-at test). Everything that served the abandoned approaches -- classification, the sigma
-head, the LUPI aux-task multi-head machinery, the depth-tied heteroscedastic NLL, the
-betabinomial task, the symmetric_abs contrast -- is intentionally absent.
+  * task="classification"  (symmetric contrast):  s = ||P(h1) - P(h2)||,
+        p = sigmoid(a*s + b); predicts P(ASB) from the DISTANCE between the two
+        haplotype representations in a learned projection. Symmetric by
+        construction (swapping alleles leaves s, hence p, unchanged) -- correct
+        for the symmetric AS label. Precision-weighted BCE.
+
+Both Stage-2 heads are trained with the LUPI read-count precision weight
+w = n_eff(n) = n(1+s)/(n+s): privileged at train, absent at test (mu / s are
+sequence-only -> fully deployable). Stage 2a freezes the trunk; 2b unfreezes it.
+
+The regression head is the antisymmetric head-then-subtract comparator (encodes
+DIRECTION). The classification head is a distance in a shared projection (encodes
+MAGNITUDE only) -- the two topologies are different because the ASB label is
+symmetric (imbalanced regardless of which allele wins) but the logit-ratio label
+is signed. `task` therefore selects the head TOPOLOGY, not just the loss.
 """
 
 from typing import Optional
@@ -19,6 +30,7 @@ from typing import Optional
 import torch
 import transformers
 from transformers.modeling_outputs import SequenceClassifierOutput
+
 
 # ---------------------------------------------------------------------------
 # Prediction head (g_phi): linear (num_layers=1) or MLP (num_layers>=2)
@@ -75,24 +87,32 @@ def build_prediction_head(
 
 
 # ---------------------------------------------------------------------------
-# The model: f_theta (shared trunk) + g_phi (twin head) + precision-weighted loss
+# The model: f_theta (shared trunk) + task-selected Stage-2 head + LUPI loss
 # ---------------------------------------------------------------------------
 
 class entexBERT2ForSequencePrediction(torch.nn.Module):
     """
-    Stage-1 trunk (fine-tuned on binding affinity) + Stage-2 twin ASB head.
+    Stage-1 trunk (fine-tuned on binding affinity) + Stage-2 head (task-selected).
 
-    forward scores both haplotype windows through the SAME trunk and head and returns
-    the signed contrast mu = head(pool(seq1)) - head(pool(seq2)). With seq1 = hap1 and
-    seq2 = hap2, mu is the predicted logit P(hap1): mu > 0  <=>  P(hap1) > 1/2.
+    task="regression":
+        forward scores both windows through the SAME trunk and head and returns the
+        signed contrast mu = head(pool(seq1)) - head(pool(seq2)); with seq1=hap1,
+        seq2=hap2, mu is the predicted logit P(hap1). Single-window (input_ids_alt=None)
+        -> mu = head(pool(seq)) is the Stage-1 binding score.
+        Loss: precision-weighted MSE, L = sum_i w_i (mu_i - y_i)^2 / sum_i w_i.
 
-    Loss (when labels given): precision-weighted MSE on the logit scale,
-        L = sum_i w_i (mu_i - y_i)^2 / sum_i w_i,
-        w_i = n_eff(n_i) = n_i (1 + s) / (n_i + s),  normalized to mean 1,
-    where y_i is the (build-time, Jeffreys-smoothed) observed log-odds label and n_i is
-    the privileged total read depth (passed in as `depth`). w saturates at 1 + s so
-    ultra-deep loci cannot dominate the gradient; low-depth loci are down-weighted, not
-    discarded. s = neff_s is a fixed hyperparameter (dispersion of the beta-binomial).
+    task="classification":
+        forward projects each window's pooled representation with a SHARED projection
+        P (768 -> proj_dim), forms the distance s = ||P(h1) - P(h2)||_2, and returns
+        the logit ell = a*s + b so that p = sigmoid(ell) = P(ASB). Symmetric in the two
+        haplotypes by construction.
+        Loss: precision-weighted BCE, L = sum_i w_i BCE(sigmoid(ell_i), y_i) / sum_i w_i.
+
+    In both cases w_i = n_eff(n_i) = n_i (1 + s) / (n_i + s), normalized to mean 1,
+    with n_i the privileged total read depth (passed as `depth`). w saturates at 1 + s
+    so ultra-deep loci cannot dominate; low-depth loci are down-weighted, not discarded.
+    For classification this down-weights UNDERPOWERED NEGATIVES (loci called non-AS only
+    because the test lacked depth) -- the main label-contamination source. s = neff_s.
     """
 
     def __init__(
@@ -107,6 +127,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         head_dropout: float = 0.1,
         neff_s: float = 50.0,
         freeze_backbone: bool = False,
+        task: str = "regression",                 # NEW: 'regression' | 'classification'
+        proj_dim: int = 128,                       # NEW: classification projection dim d
     ):
         super().__init__()
         if pooling_mode not in ("cls", "center_mean"):
@@ -115,10 +137,13 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             raise ValueError("center_pool_width must be odd for symmetric center pooling.")
         if neff_s <= 0:
             raise ValueError(f"neff_s (beta-binomial concentration) must be > 0, got {neff_s}.")
+        if task not in ("regression", "classification"):
+            raise ValueError(f"task must be 'regression' or 'classification', got {task!r}.")
 
         self.pooling_mode = pooling_mode
         self.center_pool_width = int(center_pool_width)
         self.neff_s = float(neff_s)
+        self.task = task                                    # NEW
 
         # Shared pretrained trunk f_theta.
         self.backbone = transformers.AutoModel.from_pretrained(
@@ -128,18 +153,36 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         dropout_prob = getattr(self.backbone.config, "hidden_dropout_prob", 0.1)
         self.dropout = torch.nn.Dropout(dropout_prob)
 
-        # Twin head g_phi: scalar output (a per-window binding logit).
-        self.main_head = build_prediction_head(
-            input_size=hidden_size, output_size=1, num_layers=head_num_layers,
-            hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
-        )
+        if task == "regression":
+            # Twin head g_phi: scalar per-window binding logit; subtracted across haplotypes.
+            self.main_head = build_prediction_head(
+                input_size=hidden_size, output_size=1, num_layers=head_num_layers,
+                hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
+            )
+            self.proj = None
+            self.dist_a = None
+            self.dist_b = None
+        else:
+            # NEW: classification contrast head.
+            # Shared projection P: hidden -> proj_dim (num_layers>=2 => nonlinear projection).
+            if proj_dim <= 0:
+                raise ValueError(f"proj_dim must be > 0 for classification, got {proj_dim}.")
+            self.proj = build_prediction_head(
+                input_size=hidden_size, output_size=proj_dim, num_layers=head_num_layers,
+                hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
+            )
+            # logit = a * ||P(h1) - P(h2)|| + b ; a>0 enforced via softplus at forward time.
+            # a_raw init so softplus(a_raw) ~ 1.0; b init 0 -> p starts ~ 0.5 at small distances.
+            self.dist_a = torch.nn.Parameter(torch.tensor(0.5413))   # softplus(0.5413) ~ 1.0
+            self.dist_b = torch.nn.Parameter(torch.tensor(0.0))
+            self.main_head = None
 
         if freeze_backbone:
             self.freeze_backbone()
 
     # ---- Stage-1 -> Stage-2 transfer ---------------------------------------
     def freeze_backbone(self):
-        """Stage 2a: freeze the trunk so only g_phi trains (no collapse risk, reuses Stage 1)."""
+        """Stage 2a: freeze the trunk so only the head trains (no collapse risk, reuses Stage 1)."""
         for p in self.backbone.parameters():
             p.requires_grad = False
 
@@ -150,8 +193,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
     def init_backbone_from(self, checkpoint_path: str, map_location="cpu") -> int:
         """
         Load ONLY the `backbone.*` weights from a Stage-1 checkpoint state_dict into this
-        (fresh-head) model. The old Stage-1 head keys are dropped; g_phi keeps its random
-        init. Returns the number of backbone tensors loaded. strict=False by design.
+        (fresh-head) model. The Stage-1 head keys are dropped; the Stage-2 head keeps its
+        random init. Returns the number of backbone tensors loaded. strict=False by design.
         """
         sd = torch.load(checkpoint_path, map_location=map_location)
         if isinstance(sd, dict) and "state_dict" in sd and "backbone.embeddings" not in str(sd.keys()):
@@ -163,7 +206,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 f"{sorted({k.split('.')[0] for k in sd})}. Is this an entexBERT2 checkpoint?"
             )
         missing, unexpected = self.load_state_dict(backbone_sd, strict=False)
-        # 'missing' will list main_head.* (expected: fresh head); 'unexpected' should be empty.
+        # 'missing' lists the fresh head params (expected); 'unexpected' should be empty.
         if unexpected:
             raise ValueError(f"Unexpected keys while loading backbone: {unexpected[:5]} ...")
         return len(backbone_sd)
@@ -196,24 +239,64 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             pooled.append(seq[b, start:end, :].mean(dim=0))
         return torch.stack(pooled, dim=0)
 
-    def _score_one(self, input_ids, attention_mask, **kwargs):
-        """One window -> scalar binding logit + pooled representation."""
+    def _pool_one(self, input_ids, attention_mask, **kwargs):
+        """One window -> pooled (dropout-applied) representation h in R^hidden."""
         out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
                             return_dict=True, **kwargs)
-        pooled = self.dropout(self._pool(out, attention_mask=attention_mask))
+        return self.dropout(self._pool(out, attention_mask=attention_mask))
+
+    def _score_one(self, input_ids, attention_mask, **kwargs):
+        """One window -> scalar binding logit + pooled representation (regression head)."""
+        pooled = self._pool_one(input_ids, attention_mask, **kwargs)
         return self.main_head(pooled).squeeze(-1), pooled
 
-    # ---- Forward: twin contrast + precision-weighted loss ------------------
+    # ---- LUPI precision weight --------------------------------------------
+    def _neff_weight(self, depth, like):
+        """w_i = n_eff(n_i) normalized to mean 1; falls back to ones if depth is None."""
+        if depth is None:
+            return torch.ones_like(like)
+        n = depth.float().view_as(like).clamp(min=1.0)
+        s = self.neff_s
+        w = n * (1.0 + s) / (n + s)          # n_eff, saturates at 1 + s
+        return w / w.mean()                  # normalize to mean 1 (LR-invariant)
+
+    # ---- Forward -----------------------------------------------------------
     def forward(
         self,
         input_ids=None,            # hap1 window  (sequence1)
         attention_mask=None,
         input_ids_alt=None,        # hap2 window  (sequence2)
         attention_mask_alt=None,
-        labels=None,               # y = logit((k+0.5)/(n+1))  (build-time, Jeffreys)
+        labels=None,               # regression: Jeffreys logit-ratio ; classification: 0/1 AS
         depth=None,                # n = total read depth (privileged; weight only)
         **kwargs,
     ):
+        # ================= classification: symmetric contrast (distance) =================
+        if self.task == "classification":
+            if input_ids_alt is None:
+                raise RuntimeError(
+                    "classification (contrast) head requires a paired (hap1, hap2) batch, but "
+                    "input_ids_alt did not reach forward. Use --input_mode hap_pair and the twin collator."
+                )
+            h1 = self._pool_one(input_ids, attention_mask, **kwargs)
+            h2 = self._pool_one(input_ids_alt, attention_mask_alt, **kwargs)
+            z1 = self.proj(h1)
+            z2 = self.proj(h2)
+            s = torch.linalg.vector_norm(z1 - z2, dim=-1)          # >= 0, symmetric in (h1,h2)
+            a = torch.nn.functional.softplus(self.dist_a)          # a > 0: distance monotone in P(ASB)
+            ell = a * s + self.dist_b                              # logit of P(ASB)
+
+            loss = None
+            if labels is not None:
+                y = labels.float().view_as(ell)
+                w = self._neff_weight(depth, ell)
+                bce = torch.nn.functional.binary_cross_entropy_with_logits(ell, y, reduction="none")
+                loss = (w * bce).mean()
+            return SequenceClassifierOutput(loss=loss, logits=ell.unsqueeze(-1))
+
+        # ================= regression: signed twin (+ single-seq Stage-1) =================
+        # single-sequence branch = Stage-1 binding regression (one window -> one score).
+        # Stage-2 ASB still passes hap2 (input_ids_alt) and gets the signed twin contrast.
         logit_hap1, _ = self._score_one(input_ids, attention_mask, **kwargs)
         if input_ids_alt is None:
             mu = logit_hap1                                # single-window binding score
@@ -224,14 +307,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         loss = None
         if labels is not None:
             y = labels.float().view_as(mu)
-            if depth is None:
-                # fall back to unweighted MSE (still valid; no privileged weighting)
-                loss = torch.nn.functional.mse_loss(mu, y)
-            else:
-                n = depth.float().view_as(mu).clamp(min=1.0)
-                s = self.neff_s
-                w = n * (1.0 + s) / (n + s)               # n_eff, saturates at 1 + s
-                w = w / w.mean()                          # normalize to mean 1 (LR-invariant)
-                loss = (w * (mu - y) ** 2).mean()
+            w = self._neff_weight(depth, mu)
+            loss = (w * (mu - y) ** 2).mean()
 
         return SequenceClassifierOutput(loss=loss, logits=mu.unsqueeze(-1))

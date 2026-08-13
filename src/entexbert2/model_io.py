@@ -10,8 +10,13 @@ The architecture is read from run_config.json (written by the trainer at save ti
 model is reconstructed exactly as trained. CLI flags can override individual fields, but the
 default is to trust run_config.json.
 
-The model itself lives in entexbert2.model (backbone f_theta + twin head g_phi + precision-
-weighted loss). This module only handles config/weights loading and the twin inference helper.
+The model itself lives in entexbert2.model (backbone f_theta + task-selected Stage-2 head +
+LUPI-weighted loss). This module only handles config/weights loading and the inference helper.
+
+TWO inference paths, selected by the trained model's `task` (read from run_config):
+  * regression     : signed twin  mu = head(pool1) - head(pool2)   (or single-window score)
+  * classification : symmetric contrast  ell = a*||P(pool1) - P(pool2)|| + b = logit P(ASB)
+Both match entexbert2.model.forward exactly (eval mode -> dropout is identity).
 """
 
 import glob
@@ -105,11 +110,14 @@ def load_model_weights(model: torch.nn.Module, weights_path: str) -> torch.nn.Mo
     if unexpected:
         print("  first unexpected:", unexpected[:10])
 
-    # Heuristic guard: if the head didn't load, the analysis would be meaningless.
-    head_missing = [k for k in missing if k.startswith("main_head")]
+    # Heuristic guard: if the trained head didn't load, the analysis would be meaningless.
+    # The head params differ by task: regression -> main_head.*, classification -> proj.*/dist_*.
+    task = getattr(model, "task", "regression")
+    head_prefixes = ("main_head",) if task == "regression" else ("proj", "dist_a", "dist_b")
+    head_missing = [k for k in missing if k.startswith(head_prefixes)]
     if head_missing:
         raise RuntimeError(
-            f"main_head weights did not load ({head_missing[:5]}...). The checkpoint and the "
+            f"{task} head weights did not load ({head_missing[:5]}...). The checkpoint and the "
             f"run_config architecture likely disagree. Refusing to run on an untrained head."
         )
     return model
@@ -137,6 +145,8 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
         head_activation=run_config.get("head_activation", "gelu"),
         head_dropout=run_config.get("head_dropout", 0.1),
         neff_s=run_config.get("neff_s", 50.0),
+        task=run_config.get("task", "regression"),          # NEW
+        proj_dim=run_config.get("proj_dim", 128),           # NEW
     )
     return model.to(device)
 
@@ -173,34 +183,57 @@ def logits_and_embeddings(model, input_ids, attention_mask,
                           return_pools=False):
     """
     Score sequence(s) with the model's own backbone + pooling + head (eval mode -> dropout is
-    identity, so this matches the trained forward exactly).
+    identity, so this matches the trained forward exactly). Task-aware.
 
-    TWIN / score-and-subtract: with alt inputs given (hap_pair), the prediction is the SIGNED
-    contrast mu = head(window1) - head(window2), EXACTLY matching model.forward
-    (input_ids = window 1 = hap1, input_ids_alt = window 2 = hap2; mu = g(pool1) - g(pool2)
-    = logit P(hap1)). The returned embedding is the contrast pool1 - pool2.
+    regression (twin / score-and-subtract): with alt inputs given (hap_pair), the prediction is
+    the SIGNED contrast mu = head(pool1) - head(pool2), matching model.forward (mu = logit P(hap1)).
+    Single input -> mu = head(pool1) (Stage-1 binding score). Embedding = pool1 - pool2.
+
+    classification (symmetric contrast): REQUIRES paired inputs. The prediction is the P(ASB)
+    logit  ell = a*||P(pool1) - P(pool2)|| + b  (a = softplus(dist_a) > 0), matching model.forward.
+    Symmetric in the two windows. Embedding = the projected contrast P(pool1) - P(pool2).
 
     return_pools: also return the RAW per-window pools (pool1, pool2). These are what the
-    frozen-trunk pre-check dumps: an MLP head cannot be reconstructed from the contrast alone
-    (g(a) - g(b) != g(a - b)), so probe_frozen_trunk needs both pools, not just their difference.
+    frozen-trunk pre-check dumps; an MLP head / projection cannot be reconstructed from the
+    contrast alone, so probe_frozen_trunk needs both pools.
 
     Returns:
         return_pools=False:  (logits, pooled_contrast)
         return_pools=True:   (logits, pooled_contrast, pool1, pool2)   (pool2=None if single-seq)
     """
-    def _score(ids, mask):
-        backbone_outputs = model.backbone(input_ids=ids, attention_mask=mask, return_dict=True)
-        pooled = model._pool(backbone_outputs, attention_mask=mask)
-        return model.main_head(pooled), pooled
+    task = getattr(model, "task", "regression")
 
-    logits1, pool1 = _score(input_ids, attention_mask)
-    logits = logits1
-    pooled = pool1
+    def _pool(ids, mask):
+        backbone_outputs = model.backbone(input_ids=ids, attention_mask=mask, return_dict=True)
+        return model._pool(backbone_outputs, attention_mask=mask)
+
+    pool1 = _pool(input_ids, attention_mask)
     pool2 = None
 
+    if task == "classification":
+        if input_ids_alt is None:
+            raise ValueError(
+                "classification scoring requires paired inputs (hap1, hap2); got a single sequence."
+            )
+        pool2 = _pool(input_ids_alt, attention_mask_alt)
+        z1 = model.proj(pool1)
+        z2 = model.proj(pool2)
+        s = torch.linalg.vector_norm(z1 - z2, dim=-1, keepdim=True)      # (N,1), >= 0
+        a = torch.nn.functional.softplus(model.dist_a)
+        logits = a * s + model.dist_b                                    # (N,1) = ell = logit P(ASB)
+        pooled = z1 - z2                                                 # projected contrast
+        if return_pools:
+            return logits, pooled, pool1, pool2
+        return logits, pooled
+
+    # regression (twin / single-seq) -- unchanged behavior
+    logits1 = model.main_head(pool1)
+    logits = logits1
+    pooled = pool1
     if input_ids_alt is not None:
-        logits2, pool2 = _score(input_ids_alt, attention_mask_alt)
-        logits = logits1 - logits2       # mu = g(window1) - g(window2) = logit P(hap1)  (matches model.forward)
+        pool2 = _pool(input_ids_alt, attention_mask_alt)
+        logits2 = model.main_head(pool2)
+        logits = logits1 - logits2       # mu = g(window1) - g(window2) = logit P(hap1)
         pooled = pool1 - pool2           # contrast representation (hap1 - hap2)
 
     if return_pools:
@@ -217,20 +250,20 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
     """
     Load a checkpoint and score a list of inputs. Each input is either a single sequence
     or a [window1, window2] pair (hap_pair / ref_alt). Pair inputs are tokenized SEPARATELY
-    and score-and-subtracted (TWIN) exactly as trained -- never [SEP]-concatenated, which
-    would bury the single-base allelic difference.
+    and combined per the trained task (regression: score-and-subtract; classification:
+    projected-distance) -- never [SEP]-concatenated, which would bury the single-base allelic
+    difference.
 
     dump_pools=False (default):
         returns (logits, emb, run_config)
-          logits : (N, 1) signed contrast mu = head(window1) - head(window2)
-          emb    : (N, H) contrast pool = pool1 - pool2
+          logits : (N, 1)  regression: signed contrast mu ; classification: P(ASB) logit ell
+          emb    : (N, D)  regression: pool1 - pool2 (H) ; classification: proj contrast (proj_dim)
     dump_pools=True (pair inputs only):
         returns (logits, emb, pool_ref, pool_alt, run_config)
-          pool_ref = pool(window1), pool_alt = pool(window2)  -- the RAW per-window pools the
-          frozen-trunk pre-check needs (an MLP head can't be rebuilt from the contrast alone).
+          pool_ref = pool(window1), pool_alt = pool(window2)  -- RAW per-window pools for the
+          frozen-trunk pre-check (a head/projection can't be rebuilt from the contrast alone).
 
-    Convention: window1 is the ref / hap1 window, window2 is the alt / hap2 window, so
-    mu = logit P(hap1) and pool_ref/pool_alt line up with model.forward + the training label.
+    Convention: window1 is the ref / hap1 window, window2 is the alt / hap2 window.
     """
     model, tokenizer, run_config = load_model_and_tokenizer(
         checkpoint_dir, device=device, overrides=overrides)
@@ -238,6 +271,8 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
     is_pair = len(texts) > 0 and isinstance(texts[0], (list, tuple))
     if dump_pools and not is_pair:
         raise ValueError("dump_pools=True requires paired inputs ([window1, window2]).")
+    if getattr(model, "task", "regression") == "classification" and not is_pair:
+        raise ValueError("classification scoring requires paired inputs ([window1, window2]).")
     mml = run_config.get("model_max_length", 512)
 
     all_logits, all_emb, all_ref, all_alt = [], [], [], []
