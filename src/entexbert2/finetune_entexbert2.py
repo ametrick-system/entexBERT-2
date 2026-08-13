@@ -11,7 +11,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 #############################################################
 
-Last modified: 8/10/2026 by Amy Metrick
+Last modified: 8/13/2026 by Amy Metrick
 '''
 
 import os
@@ -57,6 +57,8 @@ class ModelArguments:
     head_dropout: float = field(default=0.1)
     # NEW: privileged precision weighting w =  n(1+s)/(n+s) #################################################
     neff_s: float = field(default=50.0, metadata={"help": "n_eff saturation cap s (0 = unweighted)"})
+    # NEW: classification (contrast head) projection dimension d for delta = ||P(h1) - P(h2)|| ##############
+    proj_dim: int = field(default=128, metadata={"help": "classification: shared projection dim d"})
     # NEW: 2-stage transfer learning ########################################################################
     init_backbone_from: Optional[str] = field(default=None,
         metadata={"help": "path to a Stage-1 checkpoint; loads backbone.* weights only"})
@@ -68,10 +70,10 @@ class ModelArguments:
 class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
     kmer: int = field(default=-1, metadata={"help": "k-mer for input sequence. -1 means not using k-mer."})
-    # NEW: regression task capabilities and streamline haplotype pair input format ########################
-    task: str = field(default="regression", metadata={"help": "'regression' (only mode supported)"})
+    # NEW: regression task capabilities and streamline haplotype pair input format #############################################
+    task: str = field(default="regression", metadata={"help": "'regression' (signed twin) or 'classification' (contrast head)"})
     input_mode: str = field(default="hap_pair", metadata={"help": "'hap_pair' (twin) or 'single'"})
-    #######################################################################################################
+    ############################################################################################################################
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -104,6 +106,9 @@ class TrainingArguments(transformers.TrainingArguments):
     metric_for_best_model: str = field(default="spearman")
     greater_is_better: bool = field(default=True)
     #############################################################################
+    # NEW: class-balanced batch sampling (via WeightedRandomSampler) for the rare-positive classification tasks
+    balanced_sampler: bool = field(default=False, metadata={"help": "class-balanced batches (classification)"})
+    ###########################################################################################################
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -311,6 +316,39 @@ def calculate_regression_metrics(predictions: np.ndarray, labels: np.ndarray):
     return out
 ##############################################################################################
 
+# NEW: classification metrics (contrast head) #################################################
+# The model emits ell = logit P(ASB) (higher = more allele-specific).
+#   PRIMARY (threshold-free, honest for rare-positive data): auroc, auprc -- rank on ell
+#     directly (NOT |ell|); the score is already correctly signed, unlike the regression contrast.
+#     auroc is the Han-benchmark metric and MUST stay metric_for_best_model.
+#   DIAGNOSTIC (threshold at ell=0, i.e. p=0.5): mcc/precision/recall/f1. These are NOT reliable
+#     for checkpoint selection: dev/test stay ~5-6% positive (only TRAIN batches are balanced), so
+#     a fixed 0.5 threshold understates a genuinely good ranker. Reported for context only; read
+#     them alongside pos_rate. Prefer auprc as the imbalance-aware summary.
+def calculate_classification_metrics(predictions: np.ndarray, labels: np.ndarray):
+    ell = np.asarray(predictions, dtype=float).reshape(-1)
+    y = np.asarray(labels, dtype=float).reshape(-1)
+    yb = (y > 0.5).astype(int)
+    n = len(yb); n_pos = int(yb.sum())
+    out = {
+        "bce": float(np.mean(np.logaddexp(0.0, ell) - yb * ell)),   # BCE-with-logits, unweighted
+        "n_pos": float(n_pos),
+        "pos_rate": float(n_pos / n) if n else float("nan"),
+    }
+    if 0 < n_pos < n:
+        out["auroc"] = float(sklearn.metrics.roc_auc_score(yb, ell))         # PRIMARY
+        out["auprc"] = float(sklearn.metrics.average_precision_score(yb, ell))  # PRIMARY
+        pred = (ell > 0.0).astype(int)                                       # threshold at p=0.5
+        out["mcc"] = float(sklearn.metrics.matthews_corrcoef(yb, pred))      # DIAGNOSTIC (see note)
+        out["precision"] = float(sklearn.metrics.precision_score(yb, pred, zero_division=0))
+        out["recall"] = float(sklearn.metrics.recall_score(yb, pred, zero_division=0))
+        out["f1"] = float(sklearn.metrics.f1_score(yb, pred, zero_division=0))
+    else:
+        for key in ("auroc", "auprc", "mcc", "precision", "recall", "f1"):
+            out[key] = float("nan")
+    return out
+##############################################################################################
+
 # from: https://discuss.huggingface.co/t/cuda-out-of-memory-when-using-trainer-with-compute-metrics/2941/13
 # def preprocess_logits_for_metrics(logits:Union[torch.Tensor, Tuple[torch.Tensor, Any]], _):
 #     if isinstance(logits, tuple):  # Unpack logits if it's a tuple
@@ -331,9 +369,54 @@ def preprocess_logits_for_metrics(logits: Union[torch.Tensor, Tuple[torch.Tensor
 """
 Compute metrics used for huggingface trainer.
 """ 
-def compute_metrics(eval_pred):
-    predictions, labels = eval_pred
-    return calculate_regression_metrics(predictions, labels) # MODIFIED: regression instead of classification
+# NEW: factory that bakes the task into the metric fn (no module-level state). classification
+# -> AUROC/AUPRC(+diagnostics) on ell; regression -> mse/pearson/spearman/auroc. The task is
+# explicit at the one call site in train(), so compute_metrics stays a pure, testable closure.
+def make_compute_metrics(task):
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        if task == "classification":
+            return calculate_classification_metrics(predictions, labels)
+        return calculate_regression_metrics(predictions, labels)
+    return compute_metrics
+
+# NEW: Trainer that can draw class-balanced training batches for the rare-positive AS task. ###
+# When training_args.balanced_sampler is set, each example is sampled with probability
+# inversely proportional to its class frequency (so batches are ~50/50 pos/neg on expectation),
+# which keeps the contrastive "push apart" signal from being swamped at ~5-6% positive.
+# depth-based n_eff precision weighting stays in the LOSS (model.forward); this only changes
+# WHICH examples land in a batch, keeping class-balance and label-reliability orthogonal.
+class BalancedTrainer(transformers.Trainer):
+    def _make_balanced_sampler(self):
+        labels = np.asarray(self.train_dataset.labels, dtype=float)
+        yb = (labels > 0.5).astype(int)
+        n_pos, n_neg = int(yb.sum()), int((1 - yb).sum())
+        if n_pos == 0 or n_neg == 0:
+            return None  # degenerate; fall back to default shuffling
+        # per-class weight = 1 / class_count -> equal expected mass on pos and neg
+        w = np.where(yb == 1, 1.0 / n_pos, 1.0 / n_neg).astype(np.float64)
+        return torch.utils.data.WeightedRandomSampler(
+            weights=torch.as_tensor(w, dtype=torch.double),
+            num_samples=len(w), replacement=True,
+        )
+
+    def get_train_dataloader(self):
+        if not getattr(self.args, "balanced_sampler", False):
+            return super().get_train_dataloader()
+        sampler = self._make_balanced_sampler()
+        if sampler is None:
+            return super().get_train_dataloader()
+        logging.warning("Using class-balanced WeightedRandomSampler for training batches.")
+        return torch.utils.data.DataLoader(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=sampler,
+            collate_fn=self.data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+################################################################################################
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
@@ -342,6 +425,11 @@ def train():
     # NEW: the twin/depth columns are non-standard Trainer inputs -- make sure we keep them!
     training_args.remove_unused_columns = False
     ########################################################################################
+
+    # NEW: classification needs both haplotype windows (the contrast head takes a pair) #####################
+    if data_args.task == "classification" and data_args.input_mode != "hap_pair":
+        raise ValueError("task=classification requires --input_mode hap_pair (needs both haplotype windows).")
+    #########################################################################################################
 
     # load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -380,6 +468,8 @@ def train():
         head_activation=model_args.head_activation,
         head_dropout=model_args.head_dropout,
         neff_s=model_args.neff_s,
+        task=data_args.task, # selects head topology (regression twin | classification contrast)
+        proj_dim=model_args.proj_dim, # classification projection dimension
     )
 
     # NEW: 2-stage transfer ################################################################################
@@ -419,20 +509,18 @@ def train():
             "head_dropout": model_args.head_dropout,
             "neff_s": model_args.neff_s,
             "task": data_args.task,
+            "proj_dim": model_args.proj_dim,
             "input_mode": data_args.input_mode,
             "use_lora": model_args.use_lora,
         }, f, indent=2)
     ##############################################################################################
 
-    # define trainer
-    trainer = transformers.Trainer(model=model,
+    # define trainer [MODIFIED: BalancedTrainer adds optional class-balanced sampling]
+    trainer = BalancedTrainer(model=model,
                                    tokenizer=tokenizer,
                                    args=training_args,
                                    preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-                                   compute_metrics=compute_metrics,
-                                   train_dataset=train_dataset,
-                                   eval_dataset=val_dataset,
-                                   data_collator=data_collator)
+                                   compute_metrics=make_compute_metrics(data_args.task),
     trainer.train()
 
     if training_args.save_model:
