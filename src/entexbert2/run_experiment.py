@@ -122,6 +122,7 @@ _DEFAULT_TRANSFORM = {
     "bigwig": "log1p",
     "column": "identity",
     "as_class": "identity",     # binary AS label: read as-is (0/1), no transform
+    "multitrack": "log1p",      # per-tissue fold-change, log1p like the mean binding target
 }
 
 
@@ -164,11 +165,35 @@ def _build_as_class(cfg, tf):
         transform_fn=tf,
     )
 
+def _build_multitrack(cfg, tf):
+    # Multi-track Stage-1 binding target: predict one (transformed) value per tissue track.
+    # The row source (multi_tissue_peak) emits y_track_0..y_track_{T-1} and m_track_0.. mask
+    # columns; this label does NOT compute a value itself. Its `name` is a sentinel column that
+    # build_dataset uses for split/dedup bookkeeping (we point it at binding_label_raw, the mean,
+    # which always exists) while the real per-track targets ride through count_cols untouched.
+    # `num_tracks` is validated downstream against the emitted y_track_* columns.
+    n = int(cfg["num_tracks"])
+    if n < 2:
+        raise ValueError(f"multitrack label needs num_tracks >= 2, got {n}.")
+    spec = make_column_label_spec(
+        column=cfg.get("anchor_column", "binding_label_raw"),
+        name=cfg.get("name", "binding_label_raw"),
+        task_type="regression",
+        transform_fn=tf,
+    )
+    # stash the track count + column names so run_from_config can wire count_cols + head width.
+    spec.multitrack_num_tracks = n
+    spec.multitrack_y_cols = [f"y_track_{i}" for i in range(n)]
+    spec.multitrack_m_cols = [f"m_track_{i}" for i in range(n)]
+    return spec
+
+
 LABEL_BUILDERS = {
     "logit_ratio": _build_logit_ratio,     # Stage 2 ASB target (regression, signed twin)
     "bigwig": _build_bigwig,               # Stage 1 binding signal
     "column": _build_column,               # precomputed source column (regression)
     "as_class": _build_as_class,           # Stage 2 ASB target (classification, contrast head)
+    "multitrack": _build_multitrack,       # Stage 1 multi-track binding (one target per tissue)
 }
 
 
@@ -288,10 +313,22 @@ def resolve_head(head, primary_label):
         raise ValueError(
             f"Supported tasks: 'regression' | 'classification'; got {task!r}."
         )
-    # Both heads emit a single scalar (regression: μ; classification: the P(ASB) logit).
-    if head.get("num_labels", 1) != 1:
-        print(f"  note: this model forces num_labels=1 (config had {head.get('num_labels')}).")
-    head["num_labels"] = 1
+    # Head width. Classification always emits ONE P(ASB) logit. Regression emits one scalar
+    # (signed twin / single-track binding) UNLESS the primary label is multi-track, in which
+    # case the head width is T = number of tissue tracks (validated by the label builder).
+    n_tracks = getattr(primary_label, "multitrack_num_tracks", None)
+    if task == "classification":
+        if head.get("num_labels", 1) != 1:
+            print(f"  note: classification forces num_labels=1 (config had {head.get('num_labels')}).")
+        head["num_labels"] = 1
+    elif n_tracks is not None:
+        # multi-track Stage-1 binding: T outputs, one per tissue.
+        head["num_labels"] = int(n_tracks)
+        head["multitrack"] = True
+    else:
+        if head.get("num_labels", 1) != 1:
+            print(f"  note: single-track regression forces num_labels=1 (config had {head.get('num_labels')}).")
+        head["num_labels"] = 1
 
     head.setdefault("head_num_layers", 1)
     head.setdefault("head_hidden_size", -1)
@@ -375,7 +412,19 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
     depth_col = cfg.get("depth_col")   # Stage 2: "n" -> privileged precision weight (w = n_eff)
-    count_cols = cfg.get("count_cols") # optional: extra count columns to carry into train.csv
+    count_cols = list(cfg.get("count_cols") or [])  # optional: extra columns carried into train.csv
+
+    # Multi-track Stage-1: carry the per-tissue target + mask columns into train.csv via the
+    # count_cols passthrough (they need no transform here; build_inputs emits them log1p-scaled).
+    # This is why build_dataset/split_and_write_csvs need no change: the track columns ride the
+    # existing count_cols channel untouched, exactly like Stage-2's raw count columns.
+    _mt_y = getattr(primary_label, "multitrack_y_cols", None)
+    if _mt_y:
+        _mt_m = getattr(primary_label, "multitrack_m_cols", [])
+        for c in list(_mt_y) + list(_mt_m):
+            if c not in count_cols:
+                count_cols.append(c)
+    count_cols = count_cols or None
 
     # Optional hybrid cross-individual partition (held-out test chrom(s) + hashed genomic bins).
     # None => fall back to the group-shuffle split. Everything dataset-specific is in the config.
@@ -407,6 +456,24 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     # Self-documenting manifest = the resolved config + derived head + resolved partition.
     # partition_resolved captures the FULL fold_assignment actually used, so a run is re-derivable
     # and a later K-fold sweep just re-runs with a different fold_id.
+    # Multi-track Stage-1: emit a sidecar naming each track's tissue (order == y_track_* index),
+    # so a run is self-describing and per-track predictions can be mapped back to tissues.
+    _mt_y = getattr(primary_label, "multitrack_y_cols", None)
+    if _mt_y:
+        _tissues = list(getattr(source, "tissues", []))
+        if len(_tissues) != len(_mt_y):
+            raise ValueError(
+                f"multitrack num_tracks={len(_mt_y)} disagrees with the source's tissue count "
+                f"{len(_tissues)} ({_tissues}). Set primary_label.num_tracks to the number of "
+                f"tissue tracks in row_source.tissue_tracks."
+            )
+        with open(os.path.join(output_dir, "tracks.json"), "w") as f:
+            json.dump({"num_tracks": len(_tissues),
+                       "tracks": [{"index": i, "tissue": t, "y_col": f"y_track_{i}",
+                                   "m_col": f"m_track_{i}"} for i, t in enumerate(_tissues)]},
+                      f, indent=2)
+        print(f"  multitrack:  {len(_tissues)} tissue tracks -> tracks.json")
+
     partition_resolved = dataclasses.asdict(partition_spec) if partition_spec is not None else None
     with open(os.path.join(output_dir, "experiment_config.json"), "w") as f:
         json.dump({"experiment": name, "resolved": cfg, "head_resolved": head,

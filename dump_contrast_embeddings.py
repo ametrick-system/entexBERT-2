@@ -86,6 +86,28 @@ def main():
     print(f"[dump] trunk_contrast {trunk_contrast.shape} | head_contrast {head_contrast.shape} "
           f"| task={rc.get('task')} proj_dim={rc.get('proj_dim')}")
 
+    # Stash the trained logistic-link scalars a>0, b so the plot can draw the decision radius
+    # delta* = -b/a (p=0.5 boundary) without re-loading the checkpoint. Read the raw parameters
+    # dist_a, dist_b straight from the state dict (tiny tensors) and apply a = softplus(a_raw).
+    extra = {}
+    try:
+        import torch, os, glob
+        sd_path = os.path.join(args.checkpoint_dir, "pytorch_model.bin")
+        if not os.path.exists(sd_path):
+            cands = glob.glob(os.path.join(args.checkpoint_dir, "*.bin"))
+            sd_path = cands[0] if cands else None
+        if sd_path:
+            sd = torch.load(sd_path, map_location="cpu")
+            if "dist_a" in sd and "dist_b" in sd:
+                a_raw = float(sd["dist_a"].reshape(-1)[0])
+                b = float(sd["dist_b"].reshape(-1)[0])
+                a = float(torch.nn.functional.softplus(torch.tensor(a_raw)))
+                extra = {"a_raw": np.float32(a_raw), "a": np.float32(a), "b": np.float32(b)}
+                print(f"[dump] head scalars: a_raw={a_raw:.4g} -> a={a:.4g} | b={b:.4g} "
+                      f"| decision radius -b/a={-b/a:.4g}")
+    except Exception as e:
+        print(f"[dump] could not read a/b from checkpoint ({e}); plot will need --a_raw/--b")
+
     np.savez_compressed(
         args.out,
         labels=labels.astype(np.int8),
@@ -96,6 +118,7 @@ def main():
         head_norm=np.linalg.norm(head_contrast, axis=1).astype(np.float32),
         checkpoint_dir=np.array(args.checkpoint_dir),
         data_csv=np.array(args.data_csv),
+        **extra,
     )
     print(f"[write] {args.out}")
 

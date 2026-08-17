@@ -11,7 +11,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 #############################################################
 
-Last modified: 8/13/2026 by Amy Metrick
+Last modified: 8/17/2026 by Amy Metrick
 '''
 
 import os
@@ -34,10 +34,10 @@ from peft import (
     get_peft_model_state_dict,
 )
 
-## NEW IMPORTS #################################################
+## NEW IMPORTS #############################################################
 from scipy.stats import pearsonr, spearmanr # regression metrics
-from entexbert2.model import entexBERT2ForSequencePrediction 
-################################################################
+from entexbert2.model import entexBERT2ForSequencePrediction, one_hot_encode
+############################################################################
 
 
 @dataclass
@@ -55,10 +55,15 @@ class ModelArguments:
     head_hidden_size: int = field(default=-1, metadata={"help": "MLP hidden size (-1 = auto)"})
     head_activation: str = field(default="gelu")
     head_dropout: float = field(default=0.1)
+    num_labels: int = field(default=1, metadata={"help": "regression head width T (multi-track Stage-1 = #tissue tracks; 1 = scalar)"})
     # NEW: privileged precision weighting w =  n(1+s)/(n+s) #################################################
     neff_s: float = field(default=50.0, metadata={"help": "n_eff saturation cap s (0 = unweighted)"})
     # NEW: classification (contrast head) projection dimension d for delta = ||P(h1) - P(h2)|| ##############
     proj_dim: int = field(default=128, metadata={"help": "classification: shared projection dim d"})
+    # NEW: base-resolution one-hot CNN stem (BPNet-style), fused with the BERT representation before the head
+    use_cnn_stem: bool = field(default=False, metadata={"help": "fuse a one-hot CNN stem (base resolution)"})
+    cnn_channels: int = field(default=64, metadata={"help": "hidden channels in the CNN stem"})
+    cnn_out_dim: int = field(default=64, metadata={"help": "CNN feature dim concatenated to the BERT rep"})
     # NEW: 2-stage transfer learning ########################################################################
     init_backbone_from: Optional[str] = field(default=None,
         metadata={"help": "path to a Stage-1 checkpoint; loads backbone.* weights only"})
@@ -182,12 +187,40 @@ class SupervisedDataset(Dataset):
             logging.warning("Perform single-sequence regression...")
             texts = [r[seqcol] for r in rows]
 
-        # NEW: float labels for regression tasks
-        labels = [float(r["label"]) for r in rows]
+        # NEW: multi-track Stage-1 binding. When the CSV carries y_track_0.. columns, the target
+        # is a PER-TISSUE vector (one binding value per tissue) rather than a single scalar, and
+        # m_track_0.. is a 0/1 observed-tissue mask. Detected by column presence so the same file
+        # format serves both the scalar and the multi-track trunk with no flag
+        y_track_cols = sorted([c for c in cols if c.startswith("y_track_")],
+                              key=lambda c: int(c.split("_")[-1]))
+        self.multitrack = len(y_track_cols) > 0
+        if self.multitrack:
+            m_track_cols = [f"m_track_{c.split('_')[-1]}" for c in y_track_cols]
+            missing_m = [c for c in m_track_cols if c not in cols]
+            if missing_m:
+                raise ValueError(f"multi-track CSV missing mask columns {missing_m}; "
+                                 f"have y_track cols {y_track_cols}.")
+            self.num_tracks = len(y_track_cols)
+            # labels: (N, T) per-tissue targets; label_mask: (N, T) observed flags.
+            labels = [[float(r[c]) for c in y_track_cols] for r in rows]
+            self.label_mask = [[float(r[c]) for c in m_track_cols] for r in rows]
+        else:
+            # NEW: float labels for regression tasks (scalar path, unchanged)
+            labels = [float(r["label"]) for r in rows]
+            self.label_mask = None
+
         # NEW: optional privileged depth column n (the precision weight)
         self.depth = [float(r["depth"]) for r in rows] if "depth" in cols else None
         ############################################################################################
 
+        # NEW: keep the RAW window DNA stringsfor the one-hot CNN stem
+        if input_mode == "hap_pair":
+            self.raw_seq  = [t[0] for t in texts]
+            self.raw_seq2 = [t[1] for t in texts]
+        else:
+            self.raw_seq  = list(texts)
+            self.raw_seq2 = None
+        ################################################################
         
         if kmer != -1:
             # only write file on the first process
@@ -228,7 +261,8 @@ class SupervisedDataset(Dataset):
             self.attention_mask_alt = None
 
         self.labels = labels
-        self.num_labels = 1 # NEW: regression -> single output
+        # NEW: multi-track -> T outputs; scalar path -> 1
+        self.num_labels = self.num_tracks if self.multitrack else 1
         ############################################################################################
 
     def __len__(self):
@@ -241,6 +275,13 @@ class SupervisedDataset(Dataset):
             item["input_ids_alt"] = self.input_ids_alt[i]
         if self.depth is not None:
             item["depth"] = self.depth[i]
+        # NEW: multi-track observed-tissue mask
+        if self.label_mask is not None:
+            item["label_mask"] = self.label_mask[i]
+        # NEW: raw DNA window string(s) for the CNN stem (one-hot'd in the collator)
+        item["raw_seq"] = self.raw_seq[i]
+        if self.raw_seq2 is not None:
+            item["raw_seq2"] = self.raw_seq2[i]
         return item
         ###########################################################################
 
@@ -249,6 +290,7 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    use_cnn_stem: bool = False  # NEW: build one-hot tensors for the CNN stem when True
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids = [instance["input_ids"] for instance in instances]
@@ -274,6 +316,25 @@ class DataCollatorForSupervisedDataset(object):
         if "depth" in instances[0]:
             batch["depth"] = torch.tensor([instance["depth"] for instance in instances],
                                           dtype=torch.float)
+        
+        # NEW: multi-track observed-tissue mask -> (B, T), forwarded to the masked MSE loss.
+        # (labels above already stacks to (B, T) for the multi-track path via torch.tensor on a
+        #  list-of-lists, and to (B,) for the scalar path -- no branch needed there.)
+        if "label_mask" in instances[0]:
+            batch["label_mask"] = torch.tensor(
+                [instance["label_mask"] for instance in instances], dtype=torch.float)
+        
+        # NEW: one-hot tensors for the CNN stem
+        # Each window is a (4, L) tensor;  pad/truncate the batch to its longest string so they stack
+        if self.use_cnn_stem and "raw_seq" in instances[0]:
+            seqs = [inst["raw_seq"] for inst in instances]
+            L = max(len(s) for s in seqs)
+            batch["onehot"] = torch.stack([one_hot_encode(s, length=L) for s in seqs])
+            if "raw_seq2" in instances[0]:
+                seqs2 = [inst["raw_seq2"] for inst in instances]
+                L2 = max(len(s) for s in seqs2)
+                batch["onehot_alt"] = torch.stack([one_hot_encode(s, length=L2) for s in seqs2])
+        
         return batch
 
 # """
@@ -311,6 +372,50 @@ def calculate_regression_metrics(predictions: np.ndarray, labels: np.ndarray):
     direction = (y > 0).astype(int) # hap1-favored vs hap2-favored
     if 0 < direction.sum() < len(direction):
         out["auroc"] = float(sklearn.metrics.roc_auc_score(direction, pred))
+    else:
+        out["auroc"] = float("nan")
+    return out
+##############################################################################################
+
+# NEW: multi-track regression metrics (Stage-1, one target per tissue) ########################
+# predictions/y/mask are (N, T). Only observed entries (mask=1) count. We report:
+#   mse       : masked-pooled MSE over all observed (locus, tissue) entries
+#   pearson   : masked-pooled Pearson over the same
+#   spearman  : MEAN per-track Spearman (each tissue's own rank correlation, averaged over
+#               tissues with >=2 observed rows). This is metric_for_best_model, so the trunk
+#               is selected for per-tissue rank quality, not just pooled fit.
+#   auroc     : masked-pooled peak-vs-low direction (y>median) AUROC, context only.
+def calculate_multitrack_metrics(predictions, y, mask):
+    pred = np.asarray(predictions, dtype=float)
+    y = np.asarray(y, dtype=float)
+    m = np.asarray(mask, dtype=float)
+    if pred.ndim == 1:  # defensive: single-track slipped through
+        pred = pred.reshape(-1, 1); y = y.reshape(-1, 1); m = m.reshape(-1, 1)
+    obs = m > 0.5
+    pv, yv = pred[obs], y[obs]
+    out = {
+        "mse": float(np.mean((pv - yv) ** 2)) if pv.size else float("nan"),
+        "n_obs": float(obs.sum()),
+        "n_tracks": float(pred.shape[1]),
+    }
+    out["pearson"] = float(pearsonr(pv, yv)[0]) if pv.size > 2 else float("nan")
+    # mean per-track Spearman over tissues with enough observed rows
+    rhos = []
+    for t in range(pred.shape[1]):
+        col = obs[:, t]
+        if int(col.sum()) > 2:
+            r = spearmanr(pred[col, t], y[col, t]).correlation
+            if np.isfinite(r):
+                rhos.append(r)
+    out["spearman"] = float(np.mean(rhos)) if rhos else float("nan")
+    # pooled direction AUROC vs the observed-target median (peak-vs-low proxy)
+    if yv.size > 2:
+        thr = np.median(yv)
+        direction = (yv > thr).astype(int)
+        if 0 < direction.sum() < len(direction):
+            out["auroc"] = float(sklearn.metrics.roc_auc_score(direction, pv))
+        else:
+            out["auroc"] = float("nan")
     else:
         out["auroc"] = float("nan")
     return out
@@ -364,7 +469,9 @@ def calculate_classification_metrics(predictions: np.ndarray, labels: np.ndarray
 def preprocess_logits_for_metrics(logits: Union[torch.Tensor, Tuple[torch.Tensor, Any]], _):
     if isinstance(logits, tuple):
         logits = logits[0]
-    return logits.reshape(-1) # flatten: (N, 1) -> (N,)
+    if logits.ndim == 2 and logits.shape[-1] > 1:
+        return logits # multi-track: (N, T)
+    return logits.reshape(-1) # scalar: (N, 1) -> (N,)
 
 """
 Compute metrics used for huggingface trainer.
@@ -375,6 +482,13 @@ Compute metrics used for huggingface trainer.
 def make_compute_metrics(task):
     def compute_metrics(eval_pred):
         predictions, labels = eval_pred
+        # NEW: multi-track Stage-1. label_names=["labels","label_mask"] makes `labels` a tuple
+        # (targets (N,T), mask (N,T)); predictions is (N,T). We report masked-pooled regression
+        # metrics (over observed entries only) plus a mean per-track Spearman so checkpoint
+        # selection (metric_for_best_model='spearman') tracks per-tissue rank quality.
+        if task == "regression" and isinstance(labels, (tuple, list)):
+            y, mask = labels[0], labels[1]
+            return calculate_multitrack_metrics(predictions, y, mask)
         if task == "classification":
             return calculate_classification_metrics(predictions, labels)
         return calculate_regression_metrics(predictions, labels)
@@ -426,6 +540,13 @@ def train():
     training_args.remove_unused_columns = False
     ########################################################################################
 
+    # NEW: multi-track Stage-1 needs the observed-tissue mask to reach compute_metrics. Trainer
+    # gathers any column listed in label_names into the eval `labels` tuple, so registering
+    # "labels","label_mask" makes compute_metrics receive (targets, mask). We only set it for the
+    # multi-track trunk (num_labels>1) so the scalar path stays byte-for-byte unchanged.
+    if model_args.num_labels > 1:
+        training_args.label_names = ["labels", "label_mask"]
+
     # NEW: classification needs both haplotype windows (the contrast head takes a pair) #####################
     if data_args.task == "classification" and data_args.input_mode != "hap_pair":
         raise ValueError("task=classification requires --input_mode hap_pair (needs both haplotype windows).")
@@ -444,7 +565,7 @@ def train():
     if "InstaDeepAI" in model_args.model_name_or_path:
         tokenizer.eos_token = tokenizer.pad_token
 
-    # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair functionality]]
+    # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair functionality, CNN stem compatibility]
     train_dataset = SupervisedDataset(tokenizer=tokenizer,
                                     data_path=os.path.join(data_args.data_path, "train.csv"),
                                     kmer=data_args.kmer, input_mode=data_args.input_mode)
@@ -454,7 +575,8 @@ def train():
     test_dataset = SupervisedDataset(tokenizer=tokenizer, 
                                     data_path=os.path.join(data_args.data_path, "test.csv"), 
                                     kmer=data_args.kmer, input_mode=data_args.input_mode)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer,
+                                    use_cnn_stem=model_args.use_cnn_stem)  # NEW
 
 
     # MODIFIED: load entexBERT-2 model
@@ -469,7 +591,11 @@ def train():
         head_dropout=model_args.head_dropout,
         neff_s=model_args.neff_s,
         task=data_args.task, # selects head topology (regression twin | classification contrast)
+        num_labels=model_args.num_labels, # NEW: regression head width T (multi-track Stage-1)
         proj_dim=model_args.proj_dim, # classification projection dimension
+        use_cnn_stem=model_args.use_cnn_stem, # NEW: fuse base-resolution one-hot CNN
+        cnn_channels=model_args.cnn_channels, # NEW
+        cnn_out_dim=model_args.cnn_out_dim, # NEW
     )
 
     # NEW: 2-stage transfer ################################################################################
@@ -509,7 +635,11 @@ def train():
             "head_dropout": model_args.head_dropout,
             "neff_s": model_args.neff_s,
             "task": data_args.task,
+            "num_labels": model_args.num_labels,   # NEW: regression head width T (multi-track Stage-1)
             "proj_dim": model_args.proj_dim,
+            "use_cnn_stem": model_args.use_cnn_stem,
+            "cnn_channels": model_args.cnn_channels,
+            "cnn_out_dim": model_args.cnn_out_dim,
             "input_mode": data_args.input_mode,
             "use_lora": model_args.use_lora,
         }, f, indent=2)

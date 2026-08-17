@@ -1360,6 +1360,16 @@ class MultiTissuePeakRowSource(RowSource):
             if self._has_pval:
                 pmat = self._read_signal_matrix(chrom, sub["anchor"].tolist(), path_key="pval_path")
                 assign["mean_pval"] = np.nanmean(pmat, axis=1)  # detection-confidence signal
+            # NEW (multi-track Stage-1): keep the PER-TISSUE fold-change vector instead of only
+            # its mean. y_track_t = log1p(fold-change) in tissue t; m_track_t = 1 where that tissue
+            # was actually assayed at this locus (finite), 0 where missing. mat is (n, N_tissues),
+            # column order == self.tissues. NaN (unassayed) -> masked out (m=0) and set to 0.0 so
+            # the value is never read when masked. Emitting here is free: mat already exists.
+            for t in range(mat.shape[1]):
+                col = mat[:, t]
+                m = np.isfinite(col).astype(np.int8)
+                assign[f"y_track_{t}"] = np.log1p(np.where(m == 1, col, 0.0))
+                assign[f"m_track_{t}"] = m
             sub = sub.assign(**assign)
             parts.append(sub)
         peaks = pd.concat(parts, ignore_index=True)
@@ -1381,6 +1391,14 @@ class MultiTissuePeakRowSource(RowSource):
             if self._has_pval:
                 pmat = self._read_signal_matrix(chrom, sub["anchor"].tolist(), path_key="pval_path")
                 assign["mean_pval"] = np.nanmean(pmat, axis=1)
+            # NEW (multi-track Stage-1): per-tissue LOW signal at the background anchor. We read
+            # every tissue's BigWig at each bg anchor, so background is fully observed (m=1). Any
+            # NaN (gap in coverage) is masked out like a peak, not imputed to a fake low value.
+            for t in range(mat.shape[1]):
+                col = mat[:, t]
+                m = np.isfinite(col).astype(np.int8)
+                assign[f"y_track_{t}"] = np.log1p(np.where(m == 1, col, 0.0))
+                assign[f"m_track_{t}"] = m
             sub = sub.assign(**assign)
             bgparts.append(sub)
         bg = pd.concat(bgparts, ignore_index=True) if bgparts else pd.DataFrame(columns=peaks.columns)
@@ -1408,6 +1426,16 @@ class MultiTissuePeakRowSource(RowSource):
                 "n_tissues_called", "cross_tissue_std", "mean_depth", "label_noise"]
         if self._has_pval:
             keep.append("mean_pval")
+        # NEW (multi-track Stage-1): carry the per-tissue target + mask columns. Order matches
+        # self.tissues; y_track_t/m_track_t are absent when the run doesn't request them (they
+        # were still computed above, so we key off their presence in df). Column order:
+        # y_track_0..y_track_{T-1} then m_track_0..m_track_{T-1}, matching run_experiment's
+        # count_cols wiring and the finetune dataset reader.
+        T = len(self.tissues)
+        y_cols = [f"y_track_{t}" for t in range(T)]
+        m_cols = [f"m_track_{t}" for t in range(T)]
+        if all(c in df.columns for c in y_cols + m_cols):
+            keep += y_cols + m_cols
         return df[keep].reset_index(drop=True)
 
     def describe(self) -> dict:

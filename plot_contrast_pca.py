@@ -35,7 +35,39 @@ def _auroc(y, score):
     return roc_auc_score(y, score) if 0 < y.sum() < len(y) else float("nan")
 
 
-def ecdf(ax, val, y, title, xlabel, logx="auto"):
+def _softplus(x):
+    # log(1+e^x), numerically stable; no scipy dependency
+    return np.maximum(x, 0.0) + np.log1p(np.exp(-np.abs(x)))
+
+
+def resolve_ab(d, a_cli=None, a_raw_cli=None, b_cli=None):
+    """
+    Resolve the trained logistic-link scalars a>0 and b for ell = a*s + b, so the decision
+    boundary p=0.5 (ell=0) maps to a distance radius  delta* = -b/a  on the head-norm axis.
+
+    Priority: explicit CLI (--a or --a_raw, and --b) > keys stashed in the npz by the dump script
+    (a/b, or a_raw/b, or dist_a/dist_b). Returns (a, b) or (None, None) if unavailable.
+    """
+    if b_cli is not None and (a_cli is not None or a_raw_cli is not None):
+        a = float(a_cli) if a_cli is not None else float(_softplus(np.array(a_raw_cli)))
+        return a, float(b_cli)
+    keys = set(d.files) if hasattr(d, "files") else set(d.keys())
+    def _get(k):
+        return float(np.asarray(d[k]).reshape(-1)[0]) if k in keys else None
+    b = _get("b") if _get("b") is not None else _get("dist_b")
+    if "a" in keys:
+        a = _get("a")
+    elif "a_raw" in keys or "dist_a" in keys:
+        raw = _get("a_raw") if "a_raw" in keys else _get("dist_a")
+        a = float(_softplus(np.array(raw)))
+    else:
+        a = None
+    if a is not None and b is not None and a > 0:
+        return a, b
+    return None, None
+
+
+def ecdf(ax, val, y, title, xlabel, logx="auto", vline=None, vlabel=None):
     """ECDF of `val` by class. Separation = vertical gap between the two curves.
     logx='auto' uses a log x-axis only when the values span >~1.5 decades (the head norm has a
     zero-pileup + long tail; the trunk norm sits in a narrow band where log-x just crowds ticks)."""
@@ -55,6 +87,9 @@ def ecdf(ax, val, y, title, xlabel, logx="auto"):
         lo, hi = np.percentile(val, [0.2, 99.5])
         ax.set_xlim(lo, hi)
     au = _auroc(y, val)
+    if vline is not None and vline > 0:
+        ax.axvline(vline, color="k", lw=1.4, ls="--", alpha=0.8,
+                   label=(vlabel or f"decision radius = {vline:.3g}"))
     ax.set_xlabel(xlabel); ax.set_ylabel("cumulative fraction")
     ax.set_title(f"{title}\nnorm AUROC = {au:.3f}  (median AS {np.median(val[y==1]):.3f} / non-AS {np.median(val[y==0]):.3f})")
     ax.legend(loc="upper left", frameon=False, fontsize=8)
@@ -66,9 +101,9 @@ def ell_hist(ax, ell, y):
     bins = np.linspace(lo, hi, 45)
     ax.hist(ell[y == 0], bins=bins, color=NONAS_COLOR, alpha=0.55, density=True, label="non-AS")
     ax.hist(ell[y == 1], bins=bins, color=AS_COLOR, alpha=0.55, density=True, label="AS")
-    ax.axvline(0.0, color="k", lw=1, ls="--", alpha=0.7)  # decision boundary p=0.5
+    ax.axvline(0.0, color="k", lw=1.4, ls="--", alpha=0.8, label="p=0.5 (ell=0)")  # SAME boundary as delta*=-b/a
     au = _auroc(y, ell)
-    ax.set_xlabel("ell = logit P(ASB)   (dashed = p=0.5)"); ax.set_ylabel("density")
+    ax.set_xlabel("ell = logit P(ASB)   (dashed p=0.5 == distance radius -b/a)"); ax.set_ylabel("density")
     ax.set_title(f"decision axis: model logit by class\nell AUROC = {au:.3f}")
     ax.legend(loc="best", frameon=False, fontsize=8)
 
@@ -91,6 +126,9 @@ def main():
     ap.add_argument("--out", default="pca_contrast.png")
     ap.add_argument("--dpi", type=int, default=150)
     ap.add_argument("--linx", action="store_true", help="linear x for the ECDFs (default log-x)")
+    ap.add_argument("--a", type=float, default=None, help="trained slope a (>0); else read from npz")
+    ap.add_argument("--a_raw", type=float, default=None, help="trained a_raw (a=softplus(a_raw)); else read from npz")
+    ap.add_argument("--b", type=float, default=None, help="trained bias b; else read from npz")
     args = ap.parse_args()
 
     d = np.load(args.npz, allow_pickle=True)
@@ -101,10 +139,30 @@ def main():
     ell = d["ell"] if "ell" in d else hnorm  # ell should always be present
     print(f"[load] {len(y)} loci | pos={int(y.sum())} neg={int((y==0).sum())}")
 
+    # decision radius delta* = -b/a : p>0.5 <=> ell>0 <=> distance s > delta*. Draw it on the
+    # head-norm axis (where s lives). Only meaningful when b<0 (rare-positive => negative bias).
+    a, b = resolve_ab(d, a_cli=args.a, a_raw_cli=args.a_raw, b_cli=args.b)
+    radius = None
+    if a is not None and b is not None:
+        radius = -b / a
+        beyond = hnorm > radius
+        f_as = float((beyond & (y == 1)).sum()) / max(int((y == 1).sum()), 1)
+        f_non = float((beyond & (y == 0)).sum()) / max(int((y == 0).sum()), 1)
+        print(f"[boundary] a={a:.4g} b={b:.4g} -> decision radius delta* = -b/a = {radius:.4g}")
+        print(f"[boundary] fraction beyond radius (called AS): AS {f_as:.3f} | non-AS {f_non:.3f}"
+              f"  (=> precision-limiting non-AS spillover {f_non:.3f})")
+        if radius <= 0:
+            print("[boundary] radius <= 0 (b>=0): every locus is called AS at p=0.5; line omitted.")
+            radius = None
+    else:
+        print("[boundary] a/b not provided and not found in npz -> skipping decision-radius line "
+              "(pass --a/--a_raw and --b, or have the dump script stash them).")
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
     lx = False if args.linx else "auto"
     ecdf(axes[0, 0], tnorm, y, "TRUNK contrast norm  ||h1-h2||", "contrast norm  ||.||", logx=lx)
-    ecdf(axes[0, 1], hnorm, y, "HEAD contrast norm  = distance s", "distance  s = ||P(h1)-P(h2)||", logx=lx)
+    ecdf(axes[0, 1], hnorm, y, "HEAD contrast norm  = distance s", "distance  s = ||P(h1)-P(h2)||", logx=lx,
+         vline=radius, vlabel=(f"decision radius -b/a = {radius:.3g}" if radius else None))
     ell_hist(axes[1, 0], ell, y)
     pca_scatter(axes[1, 1], head, y)
     fig.suptitle("Does the contrast head pull AS apart more than the trunk?  (radial separation, tail-legible)", fontsize=13)

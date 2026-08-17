@@ -87,6 +87,78 @@ def build_prediction_head(
 
 
 # ---------------------------------------------------------------------------
+# NEW: base-resolution one-hot CNN stem (BPNet-style) — optional, off by default
+# ---------------------------------------------------------------------------
+
+_BASE_TO_IDX = {"A": 0, "C": 1, "G": 2, "T": 3}
+
+
+def one_hot_encode(seq: str, length: Optional[int] = None) -> torch.Tensor:
+    """
+    DNA string -> (4, L) float one-hot tensor (row order A,C,G,T). Upper-cased; any
+    non-ACGT base (N, -, ...) becomes an all-zero column. If `length` is given the
+    sequence is truncated / zero-right-padded to it (windows are fixed length in
+    practice, so this is a guard, not a normal path).
+
+    SINGLE SOURCE OF TRUTH: both the training Dataset and model_io scoring must build
+    the one-hot identically, or the CNN stem would see different inputs at train vs.
+    inference (the drift-bug class we already closed for the heads). Import this.
+    """
+    seq = seq.upper()
+    L = len(seq) if length is None else int(length)
+    oh = torch.zeros(4, L, dtype=torch.float32)
+    for i, b in enumerate(seq[:L]):
+        j = _BASE_TO_IDX.get(b, -1)
+        if j >= 0:
+            oh[j, i] = 1.0
+    return oh
+
+
+class OneHotCNNStem(torch.nn.Module):
+    """
+    Small BPNet-style conv stack over one-hot DNA, giving the model single-base
+    sensitivity the BPE trunk lacks (one SNV can re-segment BPE tokens far from the
+    variant, injecting noise into the haplotype contrast).
+
+    GLOBAL max-pool over positions -> translation-INVARIANT: a +-k bp positional jitter
+    of the SNV leaves the pooled feature essentially unchanged (the peak conv response
+    is found wherever it lands). This is deliberate: the branch whose whole purpose is
+    sharp local sensitivity must NOT re-impose an absolute-position (center-crop)
+    assumption, or it would be MORE jitter-brittle than the trunk, not less. The
+    differential c1 - c2 self-localizes to the variant, so no center prior is needed.
+
+    input : (B, 4, L) one-hot float   ->   output: (B, out_dim)
+
+    Default kernels (7,7,7) x dilations (1,2,4) -> receptive field
+    1 + sum((k-1)*d) = 1 + 6 + 12 + 24 = 43 bp, enough to span a CTCF-length motif.
+    """
+
+    def __init__(self, in_channels: int = 4, channels: int = 64, out_dim: int = 64,
+                 kernel_sizes=(7, 7, 7), dilations=(1, 2, 4),
+                 activation: str = "relu", dropout: float = 0.1):
+        super().__init__()
+        if len(kernel_sizes) != len(dilations):
+            raise ValueError("kernel_sizes and dilations must have the same length.")
+        layers = []
+        c_in = in_channels
+        n = len(kernel_sizes)
+        for i, (k, d) in enumerate(zip(kernel_sizes, dilations)):
+            c_out = out_dim if i == n - 1 else channels
+            pad = ((k - 1) * d) // 2          # 'same' padding -> length preserved
+            layers += [torch.nn.Conv1d(c_in, c_out, kernel_size=k, dilation=d, padding=pad),
+                       get_activation_module(activation),
+                       torch.nn.Dropout(dropout)]
+            c_in = c_out
+        self.conv = torch.nn.Sequential(*layers)
+        self.out_dim = int(out_dim)
+
+    def forward(self, onehot: torch.Tensor) -> torch.Tensor:
+        h = self.conv(onehot)                # (B, out_dim, L)
+        h, _ = h.max(dim=-1)                 # GLOBAL max-pool over positions -> (B, out_dim)
+        return h
+
+
+# ---------------------------------------------------------------------------
 # The model: f_theta (shared trunk) + task-selected Stage-2 head + LUPI loss
 # ---------------------------------------------------------------------------
 
@@ -128,7 +200,11 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         neff_s: float = 50.0,
         freeze_backbone: bool = False,
         task: str = "regression",                 # NEW: 'regression' | 'classification'
+        num_labels: int = 1,                       # NEW: regression head width T (multi-track Stage-1 = #tissues; 1 = scalar)
         proj_dim: int = 128,                       # NEW: classification projection dim d
+        use_cnn_stem: bool = False,                # NEW: fuse a base-resolution one-hot CNN
+        cnn_channels: int = 64,                    # NEW: hidden channels in the CNN stem
+        cnn_out_dim: int = 64,                     # NEW: CNN feature dim concatenated to h
     ):
         super().__init__()
         if pooling_mode not in ("cls", "center_mean"):
@@ -139,11 +215,23 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             raise ValueError(f"neff_s (beta-binomial concentration) must be > 0, got {neff_s}.")
         if task not in ("regression", "classification"):
             raise ValueError(f"task must be 'regression' or 'classification', got {task!r}.")
+        # NEW: num_labels is the regression head width T (multi-track Stage-1 predicts one
+        # fold-change per tissue). T=1 is the original scalar path. Only regression uses it;
+        # the classification contrast head always emits a single P(ASB) logit.
+        num_labels = int(num_labels)
+        if num_labels < 1:
+            raise ValueError(f"num_labels must be >= 1, got {num_labels}.")
+        if task == "classification" and num_labels != 1:
+            raise ValueError(
+                f"classification contrast head emits one P(ASB) logit; num_labels must be 1, "
+                f"got {num_labels}."
+            )
 
         self.pooling_mode = pooling_mode
         self.center_pool_width = int(center_pool_width)
         self.neff_s = float(neff_s)
         self.task = task                                    # NEW
+        self.num_labels = num_labels                        # NEW: regression head width T
 
         # Shared pretrained trunk f_theta.
         self.backbone = transformers.AutoModel.from_pretrained(
@@ -153,10 +241,25 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         dropout_prob = getattr(self.backbone.config, "hidden_dropout_prob", 0.1)
         self.dropout = torch.nn.Dropout(dropout_prob)
 
+        # NEW: optional base-resolution CNN stem. Built BEFORE the heads so the head input
+        # size can be widened by the CNN feature dim. The stem is NOT part of backbone.*, so
+        # init_backbone_from leaves it at its fresh init and it trains in BOTH 2a and 2b.
+        self.use_cnn_stem = bool(use_cnn_stem)
+        if self.use_cnn_stem:
+            self.cnn_stem = OneHotCNNStem(channels=cnn_channels, out_dim=cnn_out_dim,
+                                          dropout=head_dropout)
+            head_input = hidden_size + self.cnn_stem.out_dim   # fuse: [h ; c]
+        else:
+            self.cnn_stem = None
+            head_input = hidden_size
+
         if task == "regression":
-            # Twin head g_phi: scalar per-window binding logit; subtracted across haplotypes.
+            # Twin head g_phi: per-window binding logit(s). output_size = num_labels:
+            #   T=1  -> scalar (original signed-twin ASB + single-track Stage-1 binding)
+            #   T>1  -> one binding logit per tissue track (multi-track Stage-1 supervision).
+            # Subtracted across haplotypes elementwise in the Stage-2 twin path.
             self.main_head = build_prediction_head(
-                input_size=hidden_size, output_size=1, num_layers=head_num_layers,
+                input_size=head_input, output_size=self.num_labels, num_layers=head_num_layers,
                 hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
             )
             self.proj = None
@@ -164,11 +267,11 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             self.dist_b = None
         else:
             # NEW: classification contrast head.
-            # Shared projection P: hidden -> proj_dim (num_layers>=2 => nonlinear projection).
+            # Shared projection P: (hidden [+ cnn]) -> proj_dim (num_layers>=2 => nonlinear).
             if proj_dim <= 0:
                 raise ValueError(f"proj_dim must be > 0 for classification, got {proj_dim}.")
             self.proj = build_prediction_head(
-                input_size=hidden_size, output_size=proj_dim, num_layers=head_num_layers,
+                input_size=head_input, output_size=proj_dim, num_layers=head_num_layers,
                 hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
             )
             # logit = a * ||P(h1) - P(h2)|| + b ; a>0 enforced via softplus at forward time.
@@ -239,16 +342,37 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             pooled.append(seq[b, start:end, :].mean(dim=0))
         return torch.stack(pooled, dim=0)
 
-    def _pool_one(self, input_ids, attention_mask, **kwargs):
-        """One window -> pooled (dropout-applied) representation h in R^hidden."""
+    def _pool_one(self, input_ids, attention_mask, onehot=None, **kwargs):
+        """
+        One window -> pooled representation. Without the stem this is h in R^hidden.
+        With the stem it is the FUSED vector [h ; c] in R^(hidden + cnn_out_dim), where
+        c = OneHotCNNStem(onehot) is the base-resolution feature. `onehot` is (B, 4, L).
+        """
         out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
                             return_dict=True, **kwargs)
-        return self.dropout(self._pool(out, attention_mask=attention_mask))
+        h = self.dropout(self._pool(out, attention_mask=attention_mask))
+        if self.cnn_stem is not None:
+            if onehot is None:
+                raise RuntimeError(
+                    "use_cnn_stem=True but no one-hot tensor reached _pool_one. The collator "
+                    "must emit onehot/onehot_alt (see one_hot_encode) for every batch."
+                )
+            c = self.cnn_stem(onehot)                       # (B, cnn_out_dim)
+            h = torch.cat([h, c], dim=-1)                   # fuse: [h ; c]
+        return h
 
-    def _score_one(self, input_ids, attention_mask, **kwargs):
-        """One window -> scalar binding logit + pooled representation (regression head)."""
-        pooled = self._pool_one(input_ids, attention_mask, **kwargs)
-        return self.main_head(pooled).squeeze(-1), pooled
+    def _score_one(self, input_ids, attention_mask, onehot=None, **kwargs):
+        """One window -> binding logit(s) + fused representation (regression head).
+
+        Returns (B,) when num_labels==1 (scalar path) and (B, T) when num_labels>1
+        (multi-track Stage-1). We squeeze the last dim ONLY for the scalar head so the
+        downstream signed-twin contrast and scalar loss are unchanged.
+        """
+        pooled = self._pool_one(input_ids, attention_mask, onehot=onehot, **kwargs)
+        out = self.main_head(pooled)                      # (B, T)
+        if self.num_labels == 1:
+            out = out.squeeze(-1)                          # (B,)  scalar path (unchanged)
+        return out, pooled
 
     # ---- LUPI precision weight --------------------------------------------
     def _neff_weight(self, depth, like):
@@ -267,8 +391,11 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         attention_mask=None,
         input_ids_alt=None,        # hap2 window  (sequence2)
         attention_mask_alt=None,
-        labels=None,               # regression: Jeffreys logit-ratio ; classification: 0/1 AS
+        labels=None,               # regression: Jeffreys logit-ratio (or (B,T) per-track binding) ; classification: 0/1 AS
         depth=None,                # n = total read depth (privileged; weight only)
+        label_mask=None,           # NEW: (B,T) 0/1 observed-tissue mask for multi-track Stage-1 (None => all observed)
+        onehot=None,               # NEW: (B,4,L) one-hot of hap1 window (CNN stem; None if unused)
+        onehot_alt=None,           # NEW: (B,4,L) one-hot of hap2 window
         **kwargs,
     ):
         # ================= classification: symmetric contrast (distance) =================
@@ -278,8 +405,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                     "classification (contrast) head requires a paired (hap1, hap2) batch, but "
                     "input_ids_alt did not reach forward. Use --input_mode hap_pair and the twin collator."
                 )
-            h1 = self._pool_one(input_ids, attention_mask, **kwargs)
-            h2 = self._pool_one(input_ids_alt, attention_mask_alt, **kwargs)
+            h1 = self._pool_one(input_ids, attention_mask, onehot=onehot, **kwargs)
+            h2 = self._pool_one(input_ids_alt, attention_mask_alt, onehot=onehot_alt, **kwargs)
             z1 = self.proj(h1)
             z2 = self.proj(h2)
             s = torch.linalg.vector_norm(z1 - z2, dim=-1)          # >= 0, symmetric in (h1,h2)
@@ -297,13 +424,33 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         # ================= regression: signed twin (+ single-seq Stage-1) =================
         # single-sequence branch = Stage-1 binding regression (one window -> one score).
         # Stage-2 ASB still passes hap2 (input_ids_alt) and gets the signed twin contrast.
-        logit_hap1, _ = self._score_one(input_ids, attention_mask, **kwargs)
+        logit_hap1, _ = self._score_one(input_ids, attention_mask, onehot=onehot, **kwargs)
         if input_ids_alt is None:
-            mu = logit_hap1                                # single-window binding score
+            mu = logit_hap1                                # single-window binding score (B,) or (B,T)
         else:
-            logit_hap2, _ = self._score_one(input_ids_alt, attention_mask_alt, **kwargs)
+            logit_hap2, _ = self._score_one(input_ids_alt, attention_mask_alt,
+                                            onehot=onehot_alt, **kwargs)
             mu = logit_hap1 - logit_hap2                   # signed contrast = logit P(hap1)
 
+        # ---- Multi-track Stage-1 (num_labels > 1): masked multi-output MSE ----------------
+        # mu is (B, T). labels is (B, T) per-tissue log1p fold-change; label_mask is (B, T) in
+        # {0,1} marking tissues actually assayed at each locus. Only observed (mask=1) entries
+        # contribute; the loss is the mean over observed entries so it is invariant to how many
+        # tissues a locus has. depth-based n_eff weighting is not used for the binding trunk.
+        if self.num_labels > 1:
+            loss = None
+            if labels is not None:
+                y = labels.float().view_as(mu)
+                if label_mask is not None:
+                    m = label_mask.float().view_as(mu)
+                else:
+                    m = torch.ones_like(mu)
+                sq = m * (mu - y) ** 2
+                denom = m.sum().clamp(min=1.0)
+                loss = sq.sum() / denom
+            return SequenceClassifierOutput(loss=loss, logits=mu)   # (B, T), no unsqueeze
+
+        # ---- Scalar path (num_labels == 1): unchanged signed-twin / single-track ----------
         loss = None
         if labels is not None:
             y = labels.float().view_as(mu)
