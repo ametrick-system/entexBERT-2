@@ -11,7 +11,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 #############################################################
 
-Last modified: 8/17/2026 by Amy Metrick
+Last modified: 8/18/2026 by Amy Metrick
 '''
 
 import os
@@ -60,6 +60,7 @@ class ModelArguments:
     neff_s: float = field(default=50.0, metadata={"help": "n_eff saturation cap s (0 = unweighted)"})
     # NEW: classification (contrast head) projection dimension d for delta = ||P(h1) - P(h2)|| ##############
     proj_dim: int = field(default=128, metadata={"help": "classification: shared projection dim d"})
+    learned_metric: bool = field(default=False, metadata={"help": "classification: use Mahalanobis metric s=||L(z1-z2)|| (L init identity) instead of Euclidean ||z1-z2||"})
     # NEW: base-resolution one-hot CNN stem (BPNet-style), fused with the BERT representation before the head
     use_cnn_stem: bool = field(default=False, metadata={"help": "fuse a one-hot CNN stem (base resolution)"})
     cnn_channels: int = field(default=64, metadata={"help": "hidden channels in the CNN stem"})
@@ -546,6 +547,12 @@ def train():
     # multi-track trunk (num_labels>1) so the scalar path stays byte-for-byte unchanged.
     if model_args.num_labels > 1:
         training_args.label_names = ["labels", "label_mask"]
+    else:
+        # CRITICAL: model.forward() now has a `label_mask` param, so HF find_labels() auto-derives
+        # label_names=["labels","label_mask"] when we leave it None. Scalar/twin/classification
+        # batches carry no label_mask -> has_labels=False -> eval skips loss AND compute_metrics ->
+        # KeyError 'eval_auroc' at save. Pin ["labels"] to restore the pre-multitrack eval path.
+        training_args.label_names = ["labels"]
 
     # NEW: classification needs both haplotype windows (the contrast head takes a pair) #####################
     if data_args.task == "classification" and data_args.input_mode != "hap_pair":
@@ -593,6 +600,7 @@ def train():
         task=data_args.task, # selects head topology (regression twin | classification contrast)
         num_labels=model_args.num_labels, # NEW: regression head width T (multi-track Stage-1)
         proj_dim=model_args.proj_dim, # classification projection dimension
+        learned_metric=model_args.learned_metric, # NEW: Mahalanobis metric on the contrast distance
         use_cnn_stem=model_args.use_cnn_stem, # NEW: fuse base-resolution one-hot CNN
         cnn_channels=model_args.cnn_channels, # NEW
         cnn_out_dim=model_args.cnn_out_dim, # NEW
@@ -635,8 +643,9 @@ def train():
             "head_dropout": model_args.head_dropout,
             "neff_s": model_args.neff_s,
             "task": data_args.task,
-            "num_labels": model_args.num_labels,   # NEW: regression head width T (multi-track Stage-1)
+            "num_labels": model_args.num_labels, #regression head width T (multi-track Stage-1)
             "proj_dim": model_args.proj_dim,
+            "learned_metric": model_args.learned_metric,
             "use_cnn_stem": model_args.use_cnn_stem,
             "cnn_channels": model_args.cnn_channels,
             "cnn_out_dim": model_args.cnn_out_dim,

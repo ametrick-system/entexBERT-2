@@ -202,6 +202,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         task: str = "regression",                 # NEW: 'regression' | 'classification'
         num_labels: int = 1,                       # NEW: regression head width T (multi-track Stage-1 = #tissues; 1 = scalar)
         proj_dim: int = 128,                       # NEW: classification projection dim d
+        learned_metric: bool = False,              # NEW: classification -- s = ||L(z1-z2)|| (Mahalanobis) instead of ||z1-z2||
         use_cnn_stem: bool = False,                # NEW: fuse a base-resolution one-hot CNN
         cnn_channels: int = 64,                    # NEW: hidden channels in the CNN stem
         cnn_out_dim: int = 64,                     # NEW: CNN feature dim concatenated to h
@@ -265,6 +266,8 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             self.proj = None
             self.dist_a = None
             self.dist_b = None
+            self.learned_metric = False
+            self.metric_map = None
         else:
             # NEW: classification contrast head.
             # Shared projection P: (hidden [+ cnn]) -> proj_dim (num_layers>=2 => nonlinear).
@@ -274,10 +277,23 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 input_size=head_input, output_size=proj_dim, num_layers=head_num_layers,
                 hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
             )
-            # logit = a * ||P(h1) - P(h2)|| + b ; a>0 enforced via softplus at forward time.
+            # logit = a * s + b ; a>0 enforced via softplus at forward time.
             # a_raw init so softplus(a_raw) ~ 1.0; b init 0 -> p starts ~ 0.5 at small distances.
             self.dist_a = torch.nn.Parameter(torch.tensor(0.5413))   # softplus(0.5413) ~ 1.0
             self.dist_b = torch.nn.Parameter(torch.tensor(0.0))
+            # NEW (#1 learned-metric head): s = ||L (z1 - z2)|| with a learned square map L (d x d),
+            # i.e. a Mahalanobis distance d^T M d, M = L^T L >= 0. Weights the ASB-relevant directions
+            # instead of the isotropic Euclidean norm. Initialized to IDENTITY so at step 0 it is
+            # byte-identical to the plain-distance head (s = ||z1-z2||) -- the change is a pure superset
+            # and only departs from Euclidean as L trains. When learned_metric=False, metric_map stays
+            # None and the forward path is exactly the original.
+            self.learned_metric = bool(learned_metric)
+            if self.learned_metric:
+                self.metric_map = torch.nn.Linear(proj_dim, proj_dim, bias=False)
+                with torch.no_grad():
+                    self.metric_map.weight.copy_(torch.eye(proj_dim))   # identity at init
+            else:
+                self.metric_map = None
             self.main_head = None
 
         if freeze_backbone:
@@ -409,7 +425,10 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             h2 = self._pool_one(input_ids_alt, attention_mask_alt, onehot=onehot_alt, **kwargs)
             z1 = self.proj(h1)
             z2 = self.proj(h2)
-            s = torch.linalg.vector_norm(z1 - z2, dim=-1)          # >= 0, symmetric in (h1,h2)
+            d = z1 - z2                                            # symmetric under swap up to sign
+            if self.metric_map is not None:
+                d = self.metric_map(d)                             # learned metric: L(z1 - z2)
+            s = torch.linalg.vector_norm(d, dim=-1)                # >= 0, symmetric in (h1,h2)
             a = torch.nn.functional.softplus(self.dist_a)          # a > 0: distance monotone in P(ASB)
             ell = a * s + self.dist_b                              # logit of P(ASB)
 

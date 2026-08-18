@@ -147,6 +147,7 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
         neff_s=run_config.get("neff_s", 50.0),
         task=run_config.get("task", "regression"),          # NEW
         proj_dim=run_config.get("proj_dim", 128),           # NEW
+        learned_metric=run_config.get("learned_metric", False),  # NEW: Mahalanobis metric on the contrast
         use_cnn_stem=run_config.get("use_cnn_stem", False),  # NEW
         cnn_channels=run_config.get("cnn_channels", 64),     # NEW
         cnn_out_dim=run_config.get("cnn_out_dim", 64),       # NEW
