@@ -34,10 +34,10 @@ from peft import (
     get_peft_model_state_dict,
 )
 
-## NEW IMPORTS #############################################################
+## NEW IMPORTS ##################################################
 from scipy.stats import pearsonr, spearmanr # regression metrics
-from entexbert2.model import entexBERT2ForSequencePrediction, one_hot_encode
-############################################################################
+from entexbert2.model import entexBERT2ForSequencePrediction
+#################################################################
 
 
 @dataclass
@@ -60,12 +60,6 @@ class ModelArguments:
     neff_s: float = field(default=50.0, metadata={"help": "n_eff saturation cap s (0 = unweighted)"})
     # NEW: classification (contrast head) projection dimension d for delta = ||P(h1) - P(h2)|| ##############
     proj_dim: int = field(default=128, metadata={"help": "classification: shared projection dim d"})
-    learned_metric: bool = field(default=False, metadata={"help": "classification: use Mahalanobis metric s=||L(z1-z2)|| (L init identity) instead of Euclidean ||z1-z2||"})
-    pair_head: bool = field(default=False, metadata={"help": "classification (#2): swap-symmetric MLP on [z1+z2;|z1-z2|;z1*z2] -> logit instead of distance->logistic (mutually exclusive with learned_metric)"})
-    # NEW: base-resolution one-hot CNN stem (BPNet-style), fused with the BERT representation before the head
-    use_cnn_stem: bool = field(default=False, metadata={"help": "fuse a one-hot CNN stem (base resolution)"})
-    cnn_channels: int = field(default=64, metadata={"help": "hidden channels in the CNN stem"})
-    cnn_out_dim: int = field(default=64, metadata={"help": "CNN feature dim concatenated to the BERT rep"})
     # NEW: 2-stage transfer learning ########################################################################
     init_backbone_from: Optional[str] = field(default=None,
         metadata={"help": "path to a Stage-1 checkpoint; loads backbone.* weights only"})
@@ -215,15 +209,6 @@ class SupervisedDataset(Dataset):
         self.depth = [float(r["depth"]) for r in rows] if "depth" in cols else None
         ############################################################################################
 
-        # NEW: keep the RAW window DNA stringsfor the one-hot CNN stem
-        if input_mode == "hap_pair":
-            self.raw_seq  = [t[0] for t in texts]
-            self.raw_seq2 = [t[1] for t in texts]
-        else:
-            self.raw_seq  = list(texts)
-            self.raw_seq2 = None
-        ################################################################
-        
         if kmer != -1:
             # only write file on the first process
             if torch.distributed.get_rank() not in [0, -1]:
@@ -280,10 +265,6 @@ class SupervisedDataset(Dataset):
         # NEW: multi-track observed-tissue mask
         if self.label_mask is not None:
             item["label_mask"] = self.label_mask[i]
-        # NEW: raw DNA window string(s) for the CNN stem (one-hot'd in the collator)
-        item["raw_seq"] = self.raw_seq[i]
-        if self.raw_seq2 is not None:
-            item["raw_seq2"] = self.raw_seq2[i]
         return item
         ###########################################################################
 
@@ -292,7 +273,6 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
-    use_cnn_stem: bool = False  # NEW: build one-hot tensors for the CNN stem when True
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids = [instance["input_ids"] for instance in instances]
@@ -325,17 +305,6 @@ class DataCollatorForSupervisedDataset(object):
         if "label_mask" in instances[0]:
             batch["label_mask"] = torch.tensor(
                 [instance["label_mask"] for instance in instances], dtype=torch.float)
-        
-        # NEW: one-hot tensors for the CNN stem
-        # Each window is a (4, L) tensor;  pad/truncate the batch to its longest string so they stack
-        if self.use_cnn_stem and "raw_seq" in instances[0]:
-            seqs = [inst["raw_seq"] for inst in instances]
-            L = max(len(s) for s in seqs)
-            batch["onehot"] = torch.stack([one_hot_encode(s, length=L) for s in seqs])
-            if "raw_seq2" in instances[0]:
-                seqs2 = [inst["raw_seq2"] for inst in instances]
-                L2 = max(len(s) for s in seqs2)
-                batch["onehot_alt"] = torch.stack([one_hot_encode(s, length=L2) for s in seqs2])
         
         return batch
 
@@ -573,7 +542,7 @@ def train():
     if "InstaDeepAI" in model_args.model_name_or_path:
         tokenizer.eos_token = tokenizer.pad_token
 
-    # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair functionality, CNN stem compatibility]
+    # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair functionality]
     train_dataset = SupervisedDataset(tokenizer=tokenizer,
                                     data_path=os.path.join(data_args.data_path, "train.csv"),
                                     kmer=data_args.kmer, input_mode=data_args.input_mode)
@@ -583,8 +552,7 @@ def train():
     test_dataset = SupervisedDataset(tokenizer=tokenizer, 
                                     data_path=os.path.join(data_args.data_path, "test.csv"), 
                                     kmer=data_args.kmer, input_mode=data_args.input_mode)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer,
-                                    use_cnn_stem=model_args.use_cnn_stem)  # NEW
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
 
     # MODIFIED: load entexBERT-2 model
@@ -599,13 +567,8 @@ def train():
         head_dropout=model_args.head_dropout,
         neff_s=model_args.neff_s,
         task=data_args.task, # selects head topology (regression twin | classification contrast)
-        num_labels=model_args.num_labels, # NEW: regression head width T (multi-track Stage-1)
+        num_labels=model_args.num_labels, # regression head width T (multi-track Stage-1)
         proj_dim=model_args.proj_dim, # classification projection dimension
-        learned_metric=model_args.learned_metric, # NEW: Mahalanobis metric on the contrast distance
-        pair_head=model_args.pair_head, # NEW: swap-symmetric pair MLP head
-        use_cnn_stem=model_args.use_cnn_stem, # NEW: fuse base-resolution one-hot CNN
-        cnn_channels=model_args.cnn_channels, # NEW
-        cnn_out_dim=model_args.cnn_out_dim, # NEW
     )
 
     # NEW: 2-stage transfer ################################################################################
@@ -647,11 +610,6 @@ def train():
             "task": data_args.task,
             "num_labels": model_args.num_labels, #regression head width T (multi-track Stage-1)
             "proj_dim": model_args.proj_dim,
-            "learned_metric": model_args.learned_metric,
-            "pair_head": model_args.pair_head,
-            "use_cnn_stem": model_args.use_cnn_stem,
-            "cnn_channels": model_args.cnn_channels,
-            "cnn_out_dim": model_args.cnn_out_dim,
             "input_mode": data_args.input_mode,
             "use_lora": model_args.use_lora,
         }, f, indent=2)

@@ -14,7 +14,7 @@ The model itself lives in entexbert2.model (backbone f_theta + task-selected Sta
 LUPI-weighted loss). This module only handles config/weights loading and the inference helper.
 
 TWO inference paths, selected by the trained model's `task` (read from run_config):
-  * regression     : signed twin  mu = head(pool1) - head(pool2)   (or single-window score)
+  * regression     : single-window binding score  mu = head(pool)   (Stage-1 trunk)
   * classification : symmetric contrast  ell = a*||P(pool1) - P(pool2)|| + b = logit P(ASB)
 Both match entexbert2.model.forward exactly (eval mode -> dropout is identity).
 """
@@ -145,9 +145,8 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
         head_activation=run_config.get("head_activation", "gelu"),
         head_dropout=run_config.get("head_dropout", 0.1),
         neff_s=run_config.get("neff_s", 50.0),
-        task=run_config.get("task", "regression"),          # NEW
-        proj_dim=run_config.get("proj_dim", 128),           # NEW
-        learned_metric=run_config.get("learned_metric", False),  # NEW: Mahalanobis metric on the contrast
+        task=run_config.get("task", "regression"),
+        proj_dim=run_config.get("proj_dim", 128),
     )
     return model.to(device)
 
@@ -186,17 +185,16 @@ def logits_and_embeddings(model, input_ids, attention_mask,
     Score sequence(s) with the model's own backbone + pooling + head (eval mode -> dropout is
     identity, so this matches the trained forward exactly). Task-aware.
 
-    regression (twin / score-and-subtract): with alt inputs given (hap_pair), the prediction is
-    the SIGNED contrast mu = head(pool1) - head(pool2), matching model.forward (mu = logit P(hap1)).
-    Single input -> mu = head(pool1) (Stage-1 binding score). Embedding = pool1 - pool2.
+    regression (Stage-1 binding trunk): single-window score mu = head(pool1). Embedding = pool1.
+    (Alt inputs are ignored for regression; the signed-twin path has been removed.)
 
-    classification (symmetric contrast): REQUIRES paired inputs. The prediction is the P(ASB)
-    logit  ell = a*||P(pool1) - P(pool2)|| + b  (a = softplus(dist_a) > 0), matching model.forward.
-    Symmetric in the two windows. Embedding = the projected contrast P(pool1) - P(pool2).
+    classification (symmetric contrast): REQUIRES paired inputs. The P(ASB) logit
+    ell = a*||z1 - z2|| + b (a = softplus(dist_a) > 0), z = P(pool), matches model.forward.
+    Symmetric in the two windows. Embedding = projected contrast z1 - z2.
 
     return_pools: also return the RAW per-window pools (pool1, pool2). These are what the
-    frozen-trunk pre-check dumps; an MLP head / projection cannot be reconstructed from the
-    contrast alone, so probe_frozen_trunk needs both pools.
+    frozen-trunk pre-check dumps; a projection cannot be reconstructed from the contrast alone,
+    so probe_frozen_trunk needs both pools.
 
     Returns:
         return_pools=False:  (logits, pooled_contrast)
@@ -204,8 +202,8 @@ def logits_and_embeddings(model, input_ids, attention_mask,
     """
     task = getattr(model, "task", "regression")
 
-    # Route through model._pool_one so pooling is applied IDENTICALLY to training (eval mode ->
-    # dropout is identity, so this matches model.forward exactly).
+    # Route through model._pool_one so pooling matches training exactly. eval mode -> dropout is
+    # identity, so this matches model.forward exactly.
     def _pool(ids, mask):
         return model._pool_one(ids, mask)
 
@@ -220,23 +218,18 @@ def logits_and_embeddings(model, input_ids, attention_mask,
         pool2 = _pool(input_ids_alt, attention_mask_alt)
         z1 = model.proj(pool1)
         z2 = model.proj(pool2)
+        pooled = z1 - z2                                                 # projected contrast (for probes)
+        # Mirror model.forward's classification head EXACTLY: ell = a*||z1 - z2|| + b.
         s = torch.linalg.vector_norm(z1 - z2, dim=-1, keepdim=True)      # (N,1), >= 0
         a = torch.nn.functional.softplus(model.dist_a)
         logits = a * s + model.dist_b                                    # (N,1) = ell = logit P(ASB)
-        pooled = z1 - z2                                                 # projected contrast
         if return_pools:
             return logits, pooled, pool1, pool2
         return logits, pooled
 
-    # regression (twin / single-seq) -- unchanged behavior
-    logits1 = model.main_head(pool1)
-    logits = logits1
+    # regression (Stage-1 binding trunk): single-window score mu = head(pool1)
+    logits = model.main_head(pool1)
     pooled = pool1
-    if input_ids_alt is not None:
-        pool2 = _pool(input_ids_alt, attention_mask_alt)
-        logits2 = model.main_head(pool2)
-        logits = logits1 - logits2       # mu = g(window1) - g(window2) = logit P(hap1)
-        pooled = pool1 - pool2           # contrast representation (hap1 - hap2)
 
     if return_pools:
         return logits, pooled, pool1, pool2
@@ -250,16 +243,16 @@ def logits_and_embeddings(model, input_ids, attention_mask,
 def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
                   overrides=None, dump_pools=False):
     """
-    Load a checkpoint and score a list of inputs. Each input is either a single sequence
-    or a [window1, window2] pair (hap_pair / ref_alt). Pair inputs are tokenized SEPARATELY
-    and combined per the trained task (regression: score-and-subtract; classification:
-    projected-distance) -- never [SEP]-concatenated, which would bury the single-base allelic
-    difference.
+    Load a checkpoint and score a list of inputs. For regression (Stage-1 binding) each input
+    is a single sequence -> single-window score. For classification each input is a
+    [window1, window2] pair (hap_pair / ref_alt) tokenized SEPARATELY and combined by the
+    projected-distance head -- never [SEP]-concatenated, which would bury the single-base
+    allelic difference.
 
     dump_pools=False (default):
         returns (logits, emb, run_config)
-          logits : (N, 1)  regression: signed contrast mu ; classification: P(ASB) logit ell
-          emb    : (N, D)  regression: pool1 - pool2 (H) ; classification: proj contrast (proj_dim)
+          logits : (N, 1)  regression: binding score mu ; classification: P(ASB) logit ell
+          emb    : (N, D)  regression: pool1 (H) ; classification: proj contrast (proj_dim)
     dump_pools=True (pair inputs only):
         returns (logits, emb, pool_ref, pool_alt, run_config)
           pool_ref = pool(window1), pool_alt = pool(window2)  -- RAW per-window pools for the

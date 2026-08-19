@@ -1,28 +1,27 @@
 """
 entexbert2.model — the streamlined 2-stage ASB model.
 
-ONE trunk (f_theta = DNABERT-2), TWO Stage-2 heads selectable by `task`:
+ONE trunk (f_theta = DNABERT-2), TWO roles selectable by `task`:
 
-  * task="regression"  (signed twin):  mu = g(f(seq_hap1)) - g(f(seq_hap2))
-        predicts the signed allelic log-odds; precision-weighted MSE on the
-        Jeffreys logit-ratio label. Direction-aware, deployable. (Also the
-        single-sequence Stage-1 binding trunk: input_ids_alt=None -> mu = g(f(seq)).)
+  * task="regression"  (Stage-1 binding trunk):  mu = g(f(seq))
+        one window -> one binding score; precision-weighted MSE on the
+        (log1p fold-change) binding label. Single-track (scalar) or multi-track
+        (one score per tissue) via num_labels. This is the SFT/DAPT stage whose
+        backbone is transferred into Stage 2.
 
-  * task="classification"  (symmetric contrast):  s = ||P(h1) - P(h2)||,
-        p = sigmoid(a*s + b); predicts P(ASB) from the DISTANCE between the two
-        haplotype representations in a learned projection. Symmetric by
-        construction (swapping alleles leaves s, hence p, unchanged) -- correct
-        for the symmetric AS label. Precision-weighted BCE.
+  * task="classification"  (Stage-2 ASB head, symmetric contrast):
+        s = ||P(h1) - P(h2)||, p = sigmoid(a*s + b); predicts P(ASB) from the
+        DISTANCE between the two haplotype representations in a learned
+        projection. Symmetric by construction (swapping alleles leaves s, hence
+        p, unchanged) -- correct for the symmetric AS label. Precision-weighted BCE.
 
-Both Stage-2 heads are trained with the LUPI read-count precision weight
-w = n_eff(n) = n(1+s)/(n+s): privileged at train, absent at test (mu / s are
+The Stage-2 classification head is trained with the LUPI read-count precision
+weight w = n_eff(n) = n(1+s)/(n+s): privileged at train, absent at test (s is
 sequence-only -> fully deployable). Stage 2a freezes the trunk; 2b unfreezes it.
 
-The regression head is the antisymmetric head-then-subtract comparator (encodes
-DIRECTION). The classification head is a distance in a shared projection (encodes
-MAGNITUDE only) -- the two topologies are different because the ASB label is
-symmetric (imbalanced regardless of which allele wins) but the logit-ratio label
-is signed. `task` therefore selects the head TOPOLOGY, not just the loss.
+NOTE: the earlier signed-twin regression ASB head (mu = g(hap1) - g(hap2),
+precision-weighted MSE on the Jeffreys logit-ratio) has been removed. `task`
+now selects the STAGE: regression = Stage-1 binding, classification = Stage-2 ASB.
 """
 
 from typing import Optional
@@ -30,7 +29,6 @@ from typing import Optional
 import torch
 import transformers
 from transformers.modeling_outputs import SequenceClassifierOutput
-
 
 # ---------------------------------------------------------------------------
 # Prediction head (g_phi): linear (num_layers=1) or MLP (num_layers>=2)
@@ -48,7 +46,6 @@ def get_activation_module(name: str) -> torch.nn.Module:
         return torch.nn.SiLU()
     raise ValueError(f"Unsupported head activation {name!r} (gelu|relu|tanh|silu).")
 
-
 def build_prediction_head(
     input_size: int,
     output_size: int = 1,
@@ -59,8 +56,8 @@ def build_prediction_head(
 ) -> torch.nn.Module:
     """
     num_layers counts total Linear layers:
-      1  -> Linear(input_size -> output_size)                 (linear head)
-      2  -> Linear(input->hidden) + act + drop + Linear(hidden->output)
+      1  -> Linear(input_size -> output_size)
+      2  -> Linear(input->hidden) + activation + dropout + Linear(hidden->output)
       3+ -> deeper MLP
     """
     if num_layers < 1:
@@ -94,12 +91,12 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
     """
     Stage-1 trunk (fine-tuned on binding affinity) + Stage-2 head (task-selected).
 
-    task="regression":
-        forward scores both windows through the SAME trunk and head and returns the
-        signed contrast mu = head(pool(seq1)) - head(pool(seq2)); with seq1=hap1,
-        seq2=hap2, mu is the predicted logit P(hap1). Single-window (input_ids_alt=None)
-        -> mu = head(pool(seq)) is the Stage-1 binding score.
-        Loss: precision-weighted MSE, L = sum_i w_i (mu_i - y_i)^2 / sum_i w_i.
+    task="regression"  (Stage-1 binding trunk):
+        forward scores ONE window through the trunk and head, returning the binding
+        score mu = head(pool(seq)). num_labels==1 -> scalar (single-track); num_labels>1
+        -> one score per tissue (multi-track, masked over observed tissues).
+        Loss: precision-weighted MSE, L = sum_i w_i (mu_i - y_i)^2 / sum_i w_i
+        (scalar path); masked mean MSE (multi-track path).
 
     task="classification":
         forward projects each window's pooled representation with a SHARED projection
@@ -129,8 +126,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         freeze_backbone: bool = False,
         task: str = "regression",                 # NEW: 'regression' | 'classification'
         num_labels: int = 1,                       # NEW: regression head width T (multi-track Stage-1 = #tissues; 1 = scalar)
-        proj_dim: int = 128,                       # NEW: classification projection dim d
-        learned_metric: bool = False,              # NEW: classification -- s = ||L(z1-z2)|| (Mahalanobis) instead of ||z1-z2||
+        proj_dim: int = 128,                       # classification projection dim d
     ):
         super().__init__()
         if pooling_mode not in ("cls", "center_mean"):
@@ -170,10 +166,9 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         head_input = hidden_size
 
         if task == "regression":
-            # Twin head g_phi: per-window binding logit(s). output_size = num_labels:
-            #   T=1  -> scalar (original signed-twin ASB + single-track Stage-1 binding)
+            # Stage-1 binding head g_phi: per-window binding logit(s). output_size = num_labels:
+            #   T=1  -> scalar (single-track Stage-1 binding)
             #   T>1  -> one binding logit per tissue track (multi-track Stage-1 supervision).
-            # Subtracted across haplotypes elementwise in the Stage-2 twin path.
             self.main_head = build_prediction_head(
                 input_size=head_input, output_size=self.num_labels, num_layers=head_num_layers,
                 hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
@@ -181,34 +176,19 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             self.proj = None
             self.dist_a = None
             self.dist_b = None
-            self.learned_metric = False
-            self.metric_map = None
         else:
-            # NEW: classification contrast head.
-            # Shared projection P: hidden -> proj_dim (num_layers>=2 => nonlinear).
+            # Classification contrast head: distance -> logistic.
+            # Shared projection P: hidden -> proj_dim (num_layers>=2 => nonlinear); then
+            # ell = a*||z1 - z2|| + b, p = sigmoid(ell) = P(ASB). Symmetric in (z1,z2).
             if proj_dim <= 0:
                 raise ValueError(f"proj_dim must be > 0 for classification, got {proj_dim}.")
             self.proj = build_prediction_head(
                 input_size=head_input, output_size=proj_dim, num_layers=head_num_layers,
                 hidden_size=head_hidden_size, activation=head_activation, dropout=head_dropout,
             )
-            # logit = a * s + b ; a>0 enforced via softplus at forward time.
-            # a_raw init so softplus(a_raw) ~ 1.0; b init 0 -> p starts ~ 0.5 at small distances.
+            # logit = a * s + b ; a>0 via softplus at forward. a_raw init so softplus~1.0; b=0.
             self.dist_a = torch.nn.Parameter(torch.tensor(0.5413))   # softplus(0.5413) ~ 1.0
             self.dist_b = torch.nn.Parameter(torch.tensor(0.0))
-            # NEW (#1 learned-metric head): s = ||L (z1 - z2)|| with a learned square map L (d x d),
-            # i.e. a Mahalanobis distance d^T M d, M = L^T L >= 0. Weights the ASB-relevant directions
-            # instead of the isotropic Euclidean norm. Initialized to IDENTITY so at step 0 it is
-            # byte-identical to the plain-distance head (s = ||z1-z2||) -- the change is a pure superset
-            # and only departs from Euclidean as L trains. When learned_metric=False, metric_map stays
-            # None and the forward path is exactly the original.
-            self.learned_metric = bool(learned_metric)
-            if self.learned_metric:
-                self.metric_map = torch.nn.Linear(proj_dim, proj_dim, bias=False)
-                with torch.no_grad():
-                    self.metric_map.weight.copy_(torch.eye(proj_dim))   # identity at init
-            else:
-                self.metric_map = None
             self.main_head = None
 
         if freeze_backbone:
@@ -280,11 +260,11 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         return self.dropout(self._pool(out, attention_mask=attention_mask))
 
     def _score_one(self, input_ids, attention_mask, **kwargs):
-        """One window -> binding logit(s) + pooled representation (regression head).
+        """One window -> binding logit(s) + fused representation (regression head).
 
         Returns (B,) when num_labels==1 (scalar path) and (B, T) when num_labels>1
         (multi-track Stage-1). We squeeze the last dim ONLY for the scalar head so the
-        downstream signed-twin contrast and scalar loss are unchanged.
+        downstream scalar binding loss sees a (B,) score.
         """
         pooled = self._pool_one(input_ids, attention_mask, **kwargs)
         out = self.main_head(pooled)                      # (B, T)
@@ -309,7 +289,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         attention_mask=None,
         input_ids_alt=None,        # hap2 window  (sequence2)
         attention_mask_alt=None,
-        labels=None,               # regression: Jeffreys logit-ratio (or (B,T) per-track binding) ; classification: 0/1 AS
+        labels=None,               # regression: binding label, (B,) scalar or (B,T) per-track ; classification: 0/1 AS
         depth=None,                # n = total read depth (privileged; weight only)
         label_mask=None,           # NEW: (B,T) 0/1 observed-tissue mask for multi-track Stage-1 (None => all observed)
         **kwargs,
@@ -325,12 +305,9 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             h2 = self._pool_one(input_ids_alt, attention_mask_alt, **kwargs)
             z1 = self.proj(h1)
             z2 = self.proj(h2)
-            d = z1 - z2                                            # symmetric under swap up to sign
-            if self.metric_map is not None:
-                d = self.metric_map(d)                             # learned metric: L(z1 - z2)
-            s = torch.linalg.vector_norm(d, dim=-1)                # >= 0, symmetric in (h1,h2)
-            a = torch.nn.functional.softplus(self.dist_a)          # a > 0: distance monotone in P(ASB)
-            ell = a * s + self.dist_b                              # logit of P(ASB)
+            s = torch.linalg.vector_norm(z1 - z2, dim=-1)      # >= 0, symmetric in (h1,h2)
+            a = torch.nn.functional.softplus(self.dist_a)      # a > 0: distance monotone in P(ASB)
+            ell = a * s + self.dist_b                          # logit of P(ASB)
 
             loss = None
             if labels is not None:
@@ -340,15 +317,12 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 loss = (w * bce).mean()
             return SequenceClassifierOutput(loss=loss, logits=ell.unsqueeze(-1))
 
-        # ================= regression: signed twin (+ single-seq Stage-1) =================
-        # single-sequence branch = Stage-1 binding regression (one window -> one score).
-        # Stage-2 ASB still passes hap2 (input_ids_alt) and gets the signed twin contrast.
-        logit_hap1, _ = self._score_one(input_ids, attention_mask, **kwargs)
-        if input_ids_alt is None:
-            mu = logit_hap1                                # single-window binding score (B,) or (B,T)
-        else:
-            logit_hap2, _ = self._score_one(input_ids_alt, attention_mask_alt, **kwargs)
-            mu = logit_hap1 - logit_hap2                   # signed contrast = logit P(hap1)
+        # ================= regression: Stage-1 binding trunk (single window) =================
+        # ONE window -> one binding score per (locus, track). Stage-2 ASB is the
+        # classification (contrast) head above; the signed-twin regression path
+        # (mu = head(hap1) - head(hap2)) has been removed.
+        mu, _ = self._score_one(input_ids, attention_mask, **kwargs)
+        # (B,) or (B,T) binding score
 
         # ---- Multi-track Stage-1 (num_labels > 1): masked multi-output MSE ----------------
         # mu is (B, T). labels is (B, T) per-tissue log1p fold-change; label_mask is (B, T) in
@@ -368,7 +342,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 loss = sq.sum() / denom
             return SequenceClassifierOutput(loss=loss, logits=mu)   # (B, T), no unsqueeze
 
-        # ---- Scalar path (num_labels == 1): unchanged signed-twin / single-track ----------
+        # ---- Scalar path (num_labels == 1): single-track Stage-1 binding score ----------
         loss = None
         if labels is not None:
             y = labels.float().view_as(mu)
