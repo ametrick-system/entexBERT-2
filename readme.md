@@ -18,6 +18,7 @@ python3 -m pip install -r requirements.txt
 # Step 3: [in home directory] install entexBERT-2 as a package with its dependencies
 git clone https://github.com/ametrick-system/entexBERT-2.git
 pip install .
+pip install h5py logomaker modisco-lite # TODO: FOLD INTO DEPENDENCIES
 ```
 
 ## `finetune_entexbert2.py` — CLI options

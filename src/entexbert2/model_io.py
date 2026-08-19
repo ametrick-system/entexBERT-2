@@ -28,7 +28,7 @@ import torch
 import transformers
 
 # The trained model class (importing entexbert2.model is side-effect-free).
-from entexbert2.model import entexBERT2ForSequencePrediction, one_hot_encode
+from entexbert2.model import entexBERT2ForSequencePrediction
 
 # ---------------------------------------------------------------------------
 # Config
@@ -148,9 +148,6 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
         task=run_config.get("task", "regression"),          # NEW
         proj_dim=run_config.get("proj_dim", 128),           # NEW
         learned_metric=run_config.get("learned_metric", False),  # NEW: Mahalanobis metric on the contrast
-        use_cnn_stem=run_config.get("use_cnn_stem", False),  # NEW
-        cnn_channels=run_config.get("cnn_channels", 64),     # NEW
-        cnn_out_dim=run_config.get("cnn_out_dim", 64),       # NEW
     )
     return model.to(device)
 
@@ -184,7 +181,6 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
 @torch.no_grad()
 def logits_and_embeddings(model, input_ids, attention_mask,
                           input_ids_alt=None, attention_mask_alt=None,
-                          onehot=None, onehot_alt=None,
                           return_pools=False):
     """
     Score sequence(s) with the model's own backbone + pooling + head (eval mode -> dropout is
@@ -208,14 +204,12 @@ def logits_and_embeddings(model, input_ids, attention_mask,
     """
     task = getattr(model, "task", "regression")
 
-    # Route through model._pool_one so the CNN stem (if any) is applied IDENTICALLY to training:
-    # pool = [h ; c] when use_cnn_stem, else h. Re-deriving pooling here would silently drop the
-    # stem (train/inference drift) AND feed proj/main_head a wrong-width vector. eval mode ->
-    # dropout is identity, so this matches model.forward exactly.
-    def _pool(ids, mask, oh):
-        return model._pool_one(ids, mask, onehot=oh)
+    # Route through model._pool_one so pooling is applied IDENTICALLY to training (eval mode ->
+    # dropout is identity, so this matches model.forward exactly).
+    def _pool(ids, mask):
+        return model._pool_one(ids, mask)
 
-    pool1 = _pool(input_ids, attention_mask, onehot)
+    pool1 = _pool(input_ids, attention_mask)
     pool2 = None
 
     if task == "classification":
@@ -223,7 +217,7 @@ def logits_and_embeddings(model, input_ids, attention_mask,
             raise ValueError(
                 "classification scoring requires paired inputs (hap1, hap2); got a single sequence."
             )
-        pool2 = _pool(input_ids_alt, attention_mask_alt, onehot_alt)
+        pool2 = _pool(input_ids_alt, attention_mask_alt)
         z1 = model.proj(pool1)
         z2 = model.proj(pool2)
         s = torch.linalg.vector_norm(z1 - z2, dim=-1, keepdim=True)      # (N,1), >= 0
@@ -239,7 +233,7 @@ def logits_and_embeddings(model, input_ids, attention_mask,
     logits = logits1
     pooled = pool1
     if input_ids_alt is not None:
-        pool2 = _pool(input_ids_alt, attention_mask_alt, onehot_alt)
+        pool2 = _pool(input_ids_alt, attention_mask_alt)
         logits2 = model.main_head(pool2)
         logits = logits1 - logits2       # mu = g(window1) - g(window2) = logit P(hap1)
         pooled = pool1 - pool2           # contrast representation (hap1 - hap2)
@@ -283,16 +277,6 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
         raise ValueError("classification scoring requires paired inputs ([window1, window2]).")
     mml = run_config.get("model_max_length", 512)
 
-    # NEW: if the trained model has a CNN stem, build one-hot tensors from the SAME window
-    # strings we tokenize (one_hot_encode from model.py = the single source of truth, so the
-    # stem sees identical inputs at train and score time). Windows are fixed length, so we
-    # pad/truncate each batch to its longest string.
-    use_stem = getattr(model, "cnn_stem", None) is not None
-
-    def _batch_onehot(seqs):
-        L = max(len(s) for s in seqs)
-        return torch.stack([one_hot_encode(s, length=L) for s in seqs]).to(device)
-
     all_logits, all_emb, all_ref, all_alt = [], [], [], []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
@@ -303,13 +287,10 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
                               max_length=mml, truncation=True)
             enc_a = tokenizer(alt, return_tensors="pt", padding="longest",
                               max_length=mml, truncation=True)
-            oh_r = _batch_onehot(ref) if use_stem else None
-            oh_a = _batch_onehot(alt) if use_stem else None
             out = logits_and_embeddings(
                 model, enc_r["input_ids"].to(device), enc_r["attention_mask"].to(device),
                 input_ids_alt=enc_a["input_ids"].to(device),
                 attention_mask_alt=enc_a["attention_mask"].to(device),
-                onehot=oh_r, onehot_alt=oh_a,
                 return_pools=dump_pools)
             if dump_pools:
                 logits, pooled, pool1, pool2 = out
@@ -320,10 +301,8 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
         else:
             enc = tokenizer(batch, return_tensors="pt", padding="longest",
                             max_length=mml, truncation=True)
-            oh = _batch_onehot(batch) if use_stem else None
             logits, pooled = logits_and_embeddings(
-                model, enc["input_ids"].to(device), enc["attention_mask"].to(device),
-                onehot=oh)
+                model, enc["input_ids"].to(device), enc["attention_mask"].to(device))
         all_logits.append(logits.detach().cpu().numpy())
         all_emb.append(pooled.detach().cpu().numpy())
 

@@ -11,7 +11,7 @@ New formats are added by (1) implementing a RowSource / make_*_label_spec in bui
 Two live pipelines:
 
   Stage 1 (binding trunk):  row_source multi_tissue_peak + label bigwig (or column)
-  Stage 2 (ASB twin head):  row_source betabinom_counts + label logit_ratio, with
+  Stage 2 (ASB twin head):  row_source betabinom_counts + label as_class, with
                             depth_col: n  (n carried through as the privileged weight)
 
 Usage:
@@ -24,20 +24,21 @@ Example Stage-2 config:
     ref_fasta: /data/hg38.fa
     output_dir: runs/stage2_ctcf_asb
     row_source: {type: betabinom_counts, path: ctcf_betabinom_counts.csv, donor: null}
-    primary_label: {type: logit_ratio}          # y = logit((k+0.5)/(n+1))
+    primary_label: {type: as_class}             # binary AS label (imbalance_significance, 0/1)
     sequence: {input_mode: hap_pair}
     window: {left_bp: 128, right_bp: 128, snv_offset_mode: fixed, jitter_max_bp: 0}
     balance: {strategy: none}
     split: {mode: train_dev_test, ratio: [0.8, 0.1, 0.1], seed: 42, group: locus}
-    head: {task: regression, num_labels: 1, head_num_layers: 1, head_hidden_size: -1}
+    head: {task: classification, proj_dim: 128, head_num_layers: 1, head_hidden_size: -1}
     depth_col: n                                 # n -> `depth` weight column (w = n_eff)
     partition: {enabled: true, bin_size: 100000, salt: entexbert2_v1, fold_id: 0,
                 fold_assignment: {chr5: 0, chr12: 0}}
 
 Label types:
-    logit_ratio : {type, name?}                  Stage-2 ASB target logit((k+0.5)/(n+1))  (regression)
+    as_class    : {type, column?, name?}         Stage-2 ASB target: binary 0/1 label     (classification)
     bigwig      : {type, path, name?, signal_mode?, region?, radius_bp?, transform?}       (regression)
     column      : {type, column, name?, transform?}   precomputed source column            (regression)
+    multitrack  : {type, num_tracks, anchor_column?, name?}   per-tissue binding targets    (regression)
 """
 
 import argparse
@@ -55,7 +56,6 @@ from entexbert2.build_inputs import (
     MultiTissuePeakRowSource,
     BetabinomCountRowSource,
     build_dataset,
-    make_logit_ratio_label_spec,
     make_bigwig_label_spec,
     make_column_label_spec,
     log1p_transform,
@@ -118,7 +118,6 @@ ROW_SOURCE_BUILDERS = {
 
 # Default post-fn transform per label type.
 _DEFAULT_TRANSFORM = {
-    "logit_ratio": "identity",
     "bigwig": "log1p",
     "column": "identity",
     "as_class": "identity",     # binary AS label: read as-is (0/1), no transform
@@ -128,10 +127,6 @@ _DEFAULT_TRANSFORM = {
 
 def _label_name(cfg, fallback):
     return cfg.get("name") or cfg.get("target_name") or fallback
-
-
-def _build_logit_ratio(cfg, _tf):
-    return make_logit_ratio_label_spec(name=cfg.get("name", "logit_ratio"))
 
 
 def _build_bigwig(cfg, tf):
@@ -189,7 +184,6 @@ def _build_multitrack(cfg, tf):
 
 
 LABEL_BUILDERS = {
-    "logit_ratio": _build_logit_ratio,     # Stage 2 ASB target (regression, signed twin)
     "bigwig": _build_bigwig,               # Stage 1 binding signal
     "column": _build_column,               # precomputed source column (regression)
     "as_class": _build_as_class,           # Stage 2 ASB target (classification, contrast head)

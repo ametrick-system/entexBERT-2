@@ -61,6 +61,7 @@ class ModelArguments:
     # NEW: classification (contrast head) projection dimension d for delta = ||P(h1) - P(h2)|| ##############
     proj_dim: int = field(default=128, metadata={"help": "classification: shared projection dim d"})
     learned_metric: bool = field(default=False, metadata={"help": "classification: use Mahalanobis metric s=||L(z1-z2)|| (L init identity) instead of Euclidean ||z1-z2||"})
+    pair_head: bool = field(default=False, metadata={"help": "classification (#2): swap-symmetric MLP on [z1+z2;|z1-z2|;z1*z2] -> logit instead of distance->logistic (mutually exclusive with learned_metric)"})
     # NEW: base-resolution one-hot CNN stem (BPNet-style), fused with the BERT representation before the head
     use_cnn_stem: bool = field(default=False, metadata={"help": "fuse a one-hot CNN stem (base resolution)"})
     cnn_channels: int = field(default=64, metadata={"help": "hidden channels in the CNN stem"})
@@ -601,6 +602,7 @@ def train():
         num_labels=model_args.num_labels, # NEW: regression head width T (multi-track Stage-1)
         proj_dim=model_args.proj_dim, # classification projection dimension
         learned_metric=model_args.learned_metric, # NEW: Mahalanobis metric on the contrast distance
+        pair_head=model_args.pair_head, # NEW: swap-symmetric pair MLP head
         use_cnn_stem=model_args.use_cnn_stem, # NEW: fuse base-resolution one-hot CNN
         cnn_channels=model_args.cnn_channels, # NEW
         cnn_out_dim=model_args.cnn_out_dim, # NEW
@@ -646,6 +648,7 @@ def train():
             "num_labels": model_args.num_labels, #regression head width T (multi-track Stage-1)
             "proj_dim": model_args.proj_dim,
             "learned_metric": model_args.learned_metric,
+            "pair_head": model_args.pair_head,
             "use_cnn_stem": model_args.use_cnn_stem,
             "cnn_channels": model_args.cnn_channels,
             "cnn_out_dim": model_args.cnn_out_dim,
