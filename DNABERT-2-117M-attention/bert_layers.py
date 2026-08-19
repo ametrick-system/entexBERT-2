@@ -168,9 +168,9 @@ class BertUnpadSelfAttention(nn.Module):
             q = qkv[:, :, 0, :, :].permute(0, 2, 1, 3)  # b h s d
             k = qkv[:, :, 1, :, :].permute(0, 2, 3, 1)  # b h d s
             v = qkv[:, :, 2, :, :].permute(0, 2, 1, 3)  # b h s d
-            attention_scores = torch.matmul(q, k) / math.sqrt(
-                self.attention_head_size)
-            attention_scores = attention_scores + bias
+            content_scores = torch.matmul(q, k) / math.sqrt(
+                self.attention_head_size)                       # NEW: clean q.k^T/sqrt(d), pre-bias
+            attention_scores = content_scores + bias
             attention_probs = nn.functional.softmax(attention_scores, dim=-1)
             attention_probs = self.dropout(attention_probs)
             attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
