@@ -11,7 +11,7 @@ New formats are added by (1) implementing a RowSource / make_*_label_spec in bui
 Two live pipelines:
 
   Stage 1 (binding trunk):  row_source multi_tissue_peak + label bigwig (or column)
-  Stage 2 (ASB twin head):  row_source betabinom_counts + label as_class, with
+  Stage 2 (ASB contrast head):  row_source betabinom_counts + label as_class, with
                             depth_col: n  (n carried through as the privileged weight)
 
 Usage:
@@ -26,7 +26,7 @@ Example Stage-2 config:
     row_source: {type: betabinom_counts, path: ctcf_betabinom_counts.csv, donor: null}
     primary_label: {type: as_class}             # binary AS label (imbalance_significance, 0/1)
     sequence: {input_mode: hap_pair}
-    window: {left_bp: 128, right_bp: 128, snv_offset_mode: fixed, jitter_max_bp: 0}
+    window: {left_bp: 128, right_bp: 128, offset_mode: fixed, jitter_max_bp: 0}
     balance: {strategy: none}
     split: {mode: train_dev_test, ratio: [0.8, 0.1, 0.1], seed: 42, group: locus}
     head: {task: classification, proj_dim: 128, head_num_layers: 1, head_hidden_size: -1}
@@ -52,7 +52,7 @@ from pyfaidx import Fasta
 from entexbert2.build_inputs import (
     BalanceSpec,
     PartitionSpec,
-    SNVWindowSpec,
+    WindowSpec,
     MultiTissuePeakRowSource,
     BetabinomCountRowSource,
     build_dataset,
@@ -63,7 +63,6 @@ from entexbert2.build_inputs import (
 )
 
 NONE_TISSUE_TOKENS = {None, "null", "NONE", "None", "none", "", "all", "ALL"}
-
 
 # ---------------------------------------------------------------------------
 # Transforms
@@ -76,7 +75,6 @@ def get_transform_fn(name):
     if name == "identity":
         return identity_transform
     raise ValueError(f"Unsupported transform: {name!r}")
-
 
 # ---------------------------------------------------------------------------
 # Row source registry  (extension point #1)
@@ -108,7 +106,7 @@ def _build_betabinom_source(cfg):
 
 ROW_SOURCE_BUILDERS = {
     "multi_tissue_peak": _build_multi_tissue_peak_source,   # Stage 1 (binding trunk)
-    "betabinom_counts": _build_betabinom_source,            # Stage 2 (ASB twin head)
+    "betabinom_counts": _build_betabinom_source,            # Stage 2 (ASB contrast head)
 }
 
 
@@ -289,8 +287,9 @@ def resolve_head(head, primary_label):
     Derive/validate the finetune head config from the primary label's task_type so the two
     can't disagree. The config's `head` block only needs architecture (head_num_layers,
     head_hidden_size, and for classification proj_dim). The 2-stage ASB model supports:
-      - task="regression"     : signed twin head, num_labels=1 (Stage-1 binding + Stage-2 ASB Δ)
-      - task="classification"  : symmetric contrast head, s=||P(h1)-P(h2)||, p=σ(a·s+b)
+      - task="regression"     : Stage-1 binding trunk, single-window score (num_labels=1
+                                scalar, or T tissue tracks for multi-track supervision)
+      - task="classification"  : Stage-2 ASB contrast head, s=||P(h1)-P(h2)||, p=sigma(a·s+b)
     task is authoritative from the label's task_type and also selects the model head TOPOLOGY.
     """
     head = dict(head or {})
@@ -308,7 +307,7 @@ def resolve_head(head, primary_label):
             f"Supported tasks: 'regression' | 'classification'; got {task!r}."
         )
     # Head width. Classification always emits ONE P(ASB) logit. Regression emits one scalar
-    # (signed twin / single-track binding) UNLESS the primary label is multi-track, in which
+    # (single-track Stage-1 binding) UNLESS the primary label is multi-track, in which
     # case the head width is T = number of tissue tracks (validated by the label builder).
     n_tracks = getattr(primary_label, "multitrack_num_tracks", None)
     if task == "classification":
@@ -374,14 +373,13 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
 
     source = build_source(cfg["row_source"])
     primary_label = build_label(cfg["primary_label"])
-    aux_labels = [build_label(c) for c in cfg.get("aux_labels", [])]
 
     wcfg = cfg.get("window", {})
-    window_spec = SNVWindowSpec(
+    window_spec = WindowSpec(
         left_bp=wcfg["left_bp"],
         right_bp=wcfg["right_bp"],
         chrom_sizes_path=wcfg.get("chrom_sizes"),
-        snv_offset_mode=wcfg.get("snv_offset_mode", "fixed"),
+        offset_mode=wcfg.get("offset_mode", "fixed"),
         jitter_max_bp=wcfg.get("jitter_max_bp", 0),
     )
 
@@ -430,10 +428,9 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     print(f"Experiment: {name}")
     print(f"  source:     {source.source_type} (has_variants={source.has_variants})")
     print(f"  primary:    {primary_label.name} [{primary_label.task_type}]")
-    print(f"  aux:        {[a.name for a in aux_labels] or 'none'}")
     print(f"  input_mode: {input_mode}")
     print(f"  window:     L{window_spec.left_bp}/R{window_spec.right_bp} "
-          f"offset={window_spec.snv_offset_mode} jitter={window_spec.jitter_max_bp}")
+          f"offset={window_spec.offset_mode} jitter={window_spec.jitter_max_bp}")
     print(f"  split:      {split_mode} group={'locus' if group_cols else 'none'} "
           f"exclude={len(exclude_loci) if exclude_loci else 0} loci")
     if depth_col:
@@ -486,7 +483,6 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         input_mode=input_mode,
         balance_spec=balance_spec,
         balance_split=balance_split,
-        aux_labels=aux_labels,
         split_ratio=split_ratio,
         seed=seed,
         skip_ambiguous=skip_ambiguous,
