@@ -20,7 +20,6 @@ Acknowledgements: this file was written by Amy Metrick in collaboration with Ant
 """
 
 import os
-import math
 import hashlib
 import pandas as pd
 import numpy as np
@@ -126,7 +125,7 @@ def assign_split_column(df: pd.DataFrame, spec: "PartitionSpec") -> np.ndarray:
     
     Returns an object ndarray of length len(df)
     """
-    pos_col = "SNV" if "SNV" in df.columns else "ref_start"
+    pos_col = "anchor" if "anchor" in df.columns else "ref_start"
     chroms = df["chr"].astype(str).to_numpy()
     positions = df[pos_col].astype("int64").to_numpy()
 
