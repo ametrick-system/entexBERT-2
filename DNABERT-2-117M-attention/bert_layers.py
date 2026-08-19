@@ -132,6 +132,7 @@ class BertUnpadSelfAttention(nn.Module):
     def forward(self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor,
                 max_seqlen_in_batch: int, indices: torch.Tensor,
                 attn_mask: torch.Tensor, bias: torch.Tensor,
+                padding_bias: Optional[torch.Tensor] = None,  # NEW: padding-only bias (no ALiBi) for reported attn
                 output_attentions: Optional[bool] = False) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         """Perform self-attention.
 
@@ -174,6 +175,14 @@ class BertUnpadSelfAttention(nn.Module):
             attention_probs = self.dropout(attention_probs)
             attention = torch.matmul(attention_probs, v).permute(0, 2, 1,
                                                                  3)  # b s h d
+            # NEW: for reporting, recompute attention WITHOUT the ALiBi positional bias, at full precision
+            # Note that the model's own output above is UNCHANGED (still uses content+ALiBi+padding)
+            if output_attentions:
+                if padding_bias is not None:
+                    reported_scores = content_scores + padding_bias
+                else:
+                    reported_scores = content_scores
+                reported_probs = nn.functional.softmax(reported_scores, dim=-1)
         else:
             # Triton implementation only supports 0 attention dropout
             convert_dtype = qkv.dtype not in [torch.float16, torch.bfloat16]
@@ -194,7 +203,9 @@ class BertUnpadSelfAttention(nn.Module):
         attention_output = rearrange(attention, 'nnz h d -> nnz (h d)')
 
         if output_attentions:
-            return attention_output, attention_probs # NEW: return attention_probs in addition to attention output
+            # NEW: report the ALiBi-free content attention (softmax over content+padding only),
+            # NOT the bias-mixed attention_probs the model used internally. Standard (B,H,S,S) shape.
+            return attention_output, reported_probs # NEW: return reported_probs in addition to attention output
 
         return attention_output
 
@@ -234,6 +245,7 @@ class BertUnpadAttention(nn.Module):
         indices: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        padding_bias: Optional[torch.Tensor] = None,  # NEW: padding-only bias (no ALiBi) for reported attn
         output_attentions: Optional[bool] = False, # NEW
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]: # NEW (Union)
         """Forward pass for scaled self-attention without padding.
@@ -249,7 +261,7 @@ class BertUnpadAttention(nn.Module):
             bias: None or (batch, heads, max_seqlen_in_batch, max_seqlen_in_batch)
         """
         self_outputs = self.self(input_tensor, cu_seqlens, max_s, indices,
-                                attn_mask, bias,
+                                attn_mask, bias, padding_bias=padding_bias,
                                 output_attentions=output_attentions) # NEW
         
         # NEW ##########################################
@@ -339,6 +351,7 @@ class BertLayer(nn.Module):
         indices: Optional[torch.Tensor] = None,
         attn_mask: Optional[torch.Tensor] = None,
         bias: Optional[torch.Tensor] = None,
+        padding_bias: Optional[torch.Tensor] = None,  # NEW: padding-only bias (no ALiBi) for reported attn
         output_attentions: Optional[bool] = False, # NEW
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]: # NEW (Union for attention probs)
         """Forward pass for a BERT layer, including both attention and MLP.
@@ -355,6 +368,7 @@ class BertLayer(nn.Module):
         """
         attention_outputs = self.attention(hidden_states, cu_seqlens, seqlen,
                                           subset_idx, indices, attn_mask, bias,
+                                          padding_bias=padding_bias,
                                           output_attentions=output_attentions) # NEW
 
         # NEW ###################################################
@@ -506,6 +520,8 @@ class BertEncoder(nn.Module):
         alibi_bias = self.alibi[:, :, :seqlen, :seqlen]
         attn_bias = extended_attention_mask[:, :, :seqlen, :seqlen]
         alibi_attn_mask = attn_bias + alibi_bias
+        # NEW: padding-only bias (no ALiBi distance term)
+        padding_bias = attn_bias
 
         if subset_mask is None:
             for layer_module in self.layer:
@@ -516,6 +532,7 @@ class BertEncoder(nn.Module):
                                              indices,
                                              attn_mask=attention_mask,
                                              bias=alibi_attn_mask,
+                                             padding_bias=padding_bias,  # NEW
                                              output_attentions=output_attentions,) # NEW
                 
                 # NEW #############################################################
