@@ -72,7 +72,7 @@ class DataArguments:
     data_path: str = field(default=None, metadata={"help": "Path to the training data."})
     kmer: int = field(default=-1, metadata={"help": "k-mer for input sequence. -1 means not using k-mer."})
     # NEW: regression task capabilities and streamline haplotype pair input format ######################################################################################
-        task: str = field(default="regression", metadata={"help": "'regression' (Stage-1 binding trunk, single window) or 'classification' (Stage-2 ASB contrast head)"})
+    task: str = field(default="regression", metadata={"help": "'regression' (Stage-1 binding trunk, single window) or 'classification' (Stage-2 ASB contrast head)"})
     input_mode: str = field(default="hap_pair", metadata={"help": "'hap_pair' (twin) or 'single'"})
     #####################################################################################################################################################################
 
