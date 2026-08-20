@@ -36,6 +36,8 @@ def main():
     ap.add_argument("--max_rows", type=int, default=0,
                     help="0 = all rows; else cap (keeps ALL positives + a random negative subset).")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--label_col", default="label",
+                    help="label column; numeric (>0.5=pos) OR categorical AS/nonAS (as_label)")
     args = ap.parse_args()
 
     # entexbert2 must be importable (repo on PYTHONPATH)
@@ -46,11 +48,16 @@ def main():
     if not rows:
         sys.exit(f"empty CSV: {args.data_csv}")
     cols = rows[0].keys()
-    for need in ("sequence1", "sequence2", "label"):
+    for need in ("sequence1", "sequence2", args.label_col):
         if need not in cols:
             sys.exit(f"{args.data_csv} missing column '{need}'; has {list(cols)}")
 
-    labels = np.array([int(float(r["label"]) > 0.5) for r in rows], dtype=int)
+    def _lab(v):
+        s = str(v).strip()
+        if s.lower() in ("as", "1", "true"):  return 1
+        if s.lower() in ("nonas", "non-as", "0", "false"):  return 0
+        return int(float(s) > 0.5)   # numeric fallback
+    labels = np.array([_lab(r[args.label_col]) for r in rows], dtype=int)
     idx = np.arange(len(rows))
 
     # optional subsample: keep every positive, randomly downsample negatives, to bound compute.

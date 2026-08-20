@@ -82,6 +82,20 @@ def main():
     import modiscolite as ml
     from memelite import tomtom
 
+    # --- guard: one-sided attribution (e.g. head-ISM AS loci, where disrupting a driver base
+    # moves the ASB logit in a single direction) leaves ONE polarity with zero sliding-window
+    # sums. MoDISco's _isotonic_thresholds is called unconditionally for both polarities and
+    # divides by len(values) -> ZeroDivisionError / "sample weights all zero" when a side is
+    # empty. Wrap it so an empty side simply rejects everything (threshold=+/-inf) instead of
+    # crashing; the non-empty side clusters normally.
+    from modiscolite import extract_seqlets as _es
+    _orig_isotonic = _es._isotonic_thresholds
+    def _safe_isotonic(values, null_values, increasing, target_fdr, min_frac_neg=0.95):
+        if len(values) == 0:
+            return np.inf if increasing else -np.inf
+        return _orig_isotonic(values, null_values, increasing, target_fdr, min_frac_neg)
+    _es._isotonic_thresholds = _safe_isotonic
+
     d = np.load(a.ism, allow_pickle=True)
     onehot = d["onehot"].astype(np.float32)
     hyp = d["hyp_scores"].astype(np.float32)

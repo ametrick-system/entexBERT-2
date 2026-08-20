@@ -133,11 +133,16 @@ def main():
         profs[lab] = prof
     norm_by = max((p.max() or 1.0) for p in profs.values()) if a.normalize else 1.0
 
+    # Fixed high-contrast colors for the common AS / non-AS pair so the saliency tracks POP
+    # against the (many, noisy) cofactor-density curves; fall back to viridis for other labels.
+    FIXED = {"AS": "#d1495b", "nonAS": "#3d6cb3", "non-AS": "#3d6cb3",
+             "peak": "#d1495b", "background": "#3d6cb3"}
     for i, (lab, imp, _oh) in enumerate(tracks):
         prof = profs[lab] / norm_by
-        col = tcmap(0.12 + 0.72 * i / max(1, len(tracks) - 1)) if len(tracks) > 1 else "#4b0082"
-        lw = 2.6 if i == 0 else 2.0
-        ax.plot(x, prof, color=col, lw=lw, label=f"{lab} saliency", zorder=6 - i)
+        col = FIXED.get(lab, tcmap(0.12 + 0.72 * i / max(1, len(tracks) - 1)) if len(tracks) > 1 else "#4b0082")
+        lw = 3.4 if i == 0 else 3.0                    # thick: saliency is the message, density is context
+        ax.plot(x, prof, color=col, lw=lw, label=f"{lab} saliency", zorder=10 - i,
+                solid_capstyle="round")
         if single and a.band != "none":
             if a.band == "iqr":
                 lo, hi = np.percentile(imp, [25, 75], axis=0)
@@ -156,14 +161,14 @@ def main():
         if a.shared_windows:
             dens = motif_density(tracks[0][2], motifs, fimo, a.fimo_threshold, a.smooth)
             for j, nm in enumerate(dens):
-                ax2.plot(x, dens[nm], color=cmap(j), lw=1.3, ls="-", alpha=0.85,
+                ax2.plot(x, dens[nm], color=cmap(j), lw=1.0, ls="-", alpha=0.55, zorder=3,
                          label=f"{nm} density")
         else:
             for i, (lab, _imp, oh) in enumerate(tracks):
                 dens = motif_density(oh, motifs, fimo, a.fimo_threshold, a.smooth)
                 for j, nm in enumerate(dens):
                     ax2.plot(x, dens[nm], color=cmap(j),
-                             lw=1.2, ls="--" if i else "-", alpha=0.8,
+                             lw=0.9, ls="--" if i else "-", alpha=0.5, zorder=3,
                              label=f"{nm} density ({lab})")
         ax2.set_ylabel("motif-hit density (fraction of windows)")
         ax2.set_ylim(bottom=0)
