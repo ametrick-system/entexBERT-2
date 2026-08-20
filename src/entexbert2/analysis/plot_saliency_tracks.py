@@ -1,0 +1,192 @@
+#!/usr/bin/env python
+"""
+Multi-track aggregate saliency/attention figure with JASPAR cofactor-density overlay.
+
+Generalizes plot_ism_aggregate_density.py (single track) to overlay several .npz tracks on one
+axis, so it covers every Wave-2 figure:
+
+  Fig C (trunk)      : one track   -> ism_trunk.npz
+  Fig G-head (AS/nonAS): two tracks -> ism_head_<arm>_<set>_AS_<base>.npz + ..._nonAS_...  (per-group
+                        motif density: AS and non-AS are different loci, so each track's density is
+                        computed from its own windows)
+  Fig D (attention)  : three tracks -> att_sft.npz / att_nosft.npz / att_raw.npz  (shared windows:
+                        one motif-density curve, computed once)
+
+Each track npz carries importance (N,L) and onehot (N,L,4) under the same names ISM and
+attention_profile write. --shared_windows plots ONE density curve (tracks share loci, e.g.
+attention); otherwise each track gets its own density (e.g. AS vs non-AS).
+
+FIMO (memelite) runs LOCALLY; local numba compiles it fine (the cluster's older numba is the one
+that needs the sed patch). Set NUMBA_CACHE_DIR before import.
+"""
+import os
+os.environ.setdefault("NUMBA_CACHE_DIR", "/tmp/numba_cache")
+os.makedirs(os.environ["NUMBA_CACHE_DIR"], exist_ok=True)
+import argparse, json, numpy as np
+import matplotlib.pyplot as plt
+
+BASES = "ACGT"
+
+
+def load_motifs(path, tfs):
+    """{CANONICAL_UPPER_NAME: {matrix_id: (4,W)}} -- keep EVERY JASPAR matrix for each requested TF
+    (JUN/Jun, both FOS, both HNF4A ...) grouped under one canonical name, so density unions all of
+    a TF's matrices into a single curve instead of silently dropping all but one (dict collision)
+    or double-listing case variants (JUN vs 'Jun')."""
+    db = json.load(open(path)); want = {t.upper() for t in tfs}; out = {}
+    for k, v in db.items():
+        nm = v.get("name", k)
+        up = nm.upper()
+        if up in want:
+            out.setdefault(up, {})[k] = np.array([v["pfm"][b] for b in BASES], dtype=np.float64)
+    return out
+
+
+def smooth(x, w):
+    if w <= 1:
+        return x
+    return np.convolve(x, np.ones(w) / w, mode="same")
+
+
+def motif_density(onehot, motifs, fimo, threshold, smooth_w):
+    """Per-position fraction of windows with a motif hit, per TF. motifs = {TF: {matrix_id:(4,W)}};
+    all of a TF's matrices are unioned into one curve. A position counts once per window even if
+    several matrices of the same TF hit it (avoids double-counting overlapping JASPAR variants)."""
+    N, L, _ = onehot.shape
+    seqs = np.transpose(onehot, (0, 2, 1)).astype(np.float32)     # (N,4,L)
+    flat = {}                          # matrix_id -> pfm, plus map matrix_id -> TF
+    mid2tf = {}
+    for tf, mats in motifs.items():
+        for mid, pfm in mats.items():
+            flat[mid] = pfm; mid2tf[mid] = tf
+    res = fimo(flat, seqs, threshold=threshold)
+    # per TF, per window: boolean covered[pos]; then sum across windows so each window counts once
+    cover = {tf: np.zeros(L) for tf in motifs}
+    per_win = {tf: np.zeros((N, L), dtype=bool) for tf in motifs}
+    for r in res:
+        if len(r) == 0:
+            continue
+        mid = str(r["motif_name"].iloc[0])
+        tf = mid2tf.get(mid)
+        if tf is None:
+            continue
+        for _, row in r.iterrows():
+            w = int(row["sequence_name"]) if "sequence_name" in row else int(row.get("seq_idx", 0))
+            s, e = int(row["start"]), int(min(row["end"], L))
+            per_win[tf][w, s:e] = True
+    for tf in motifs:
+        cover[tf] = per_win[tf].sum(0).astype(float)
+    return {tf: smooth(cover[tf] / N, smooth_w) for tf in motifs}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tracks", nargs="+", required=True,
+                    help="LABEL=path.npz entries (1+). First track is drawn boldest.")
+    ap.add_argument("--jaspar", default=None, help="omit to skip motif overlay entirely")
+    ap.add_argument("--tfs", default="", help="comma-separated TF names (need JASPAR motifs)")
+    ap.add_argument("--shared_windows", action="store_true",
+                    help="tracks share the same loci -> compute ONE density curve (attention). "
+                         "Default: per-track density (AS vs non-AS).")
+    ap.add_argument("--fimo_threshold", type=float, default=1e-4)
+    ap.add_argument("--smooth", type=int, default=11)
+    ap.add_argument("--band", choices=["iqr", "std", "none"], default="iqr",
+                    help="variability band; drawn only when a SINGLE track is plotted")
+    ap.add_argument("--normalize", action="store_true")
+    ap.add_argument("--mode", choices=["ism", "attention"], default="ism",
+                    help="y-axis label only")
+    ap.add_argument("--title", default=None)
+    ap.add_argument("--out", required=True)
+    a = ap.parse_args()
+
+    pairs = []
+    for t in a.tracks:
+        if "=" not in t:
+            raise SystemExit(f"--tracks entry must be LABEL=path.npz, got {t!r}")
+        lab, path = t.split("=", 1)
+        pairs.append((lab, path))
+
+    tracks = []
+    L = None
+    for lab, path in pairs:
+        d = np.load(path, allow_pickle=True)
+        imp, onehot = d["importance"], d["onehot"]
+        if L is None:
+            L = imp.shape[1]
+        elif imp.shape[1] != L:
+            raise SystemExit(f"track {lab}: L={imp.shape[1]} != {L}")
+        tracks.append((lab, imp, onehot))
+
+    motifs = {}
+    if a.jaspar and a.tfs.strip():
+        from memelite import fimo
+        motifs = load_motifs(a.jaspar, [t.strip() for t in a.tfs.split(",")])
+
+    x = np.arange(L) - L // 2
+    fig, ax = plt.subplots(figsize=(13, 4.4))
+    tcmap = plt.get_cmap("viridis")
+    single = len(tracks) == 1
+
+    profs = {}
+    for i, (lab, imp, _oh) in enumerate(tracks):
+        prof = smooth(imp.mean(0), a.smooth)
+        profs[lab] = prof
+    norm_by = max((p.max() or 1.0) for p in profs.values()) if a.normalize else 1.0
+
+    for i, (lab, imp, _oh) in enumerate(tracks):
+        prof = profs[lab] / norm_by
+        col = tcmap(0.12 + 0.72 * i / max(1, len(tracks) - 1)) if len(tracks) > 1 else "#4b0082"
+        lw = 2.6 if i == 0 else 2.0
+        ax.plot(x, prof, color=col, lw=lw, label=f"{lab} saliency", zorder=6 - i)
+        if single and a.band != "none":
+            if a.band == "iqr":
+                lo, hi = np.percentile(imp, [25, 75], axis=0)
+            else:
+                s = imp.std(0); lo, hi = imp.mean(0) - s, imp.mean(0) + s
+            ax.fill_between(x, smooth(lo, a.smooth) / norm_by, smooth(hi, a.smooth) / norm_by,
+                            color="#7030a0", alpha=0.16, lw=0)
+
+    # ---- motif density overlay (SECONDARY y-axis: density is a fraction in [0,1], a different
+    #      quantity from saliency units, so it gets its own axis instead of sharing the left one) ----
+    ax2 = None
+    if motifs:
+        from memelite import fimo
+        cmap = plt.get_cmap("tab10")
+        ax2 = ax.twinx()
+        if a.shared_windows:
+            dens = motif_density(tracks[0][2], motifs, fimo, a.fimo_threshold, a.smooth)
+            for j, nm in enumerate(dens):
+                ax2.plot(x, dens[nm], color=cmap(j), lw=1.3, ls="-", alpha=0.85,
+                         label=f"{nm} density")
+        else:
+            for i, (lab, _imp, oh) in enumerate(tracks):
+                dens = motif_density(oh, motifs, fimo, a.fimo_threshold, a.smooth)
+                for j, nm in enumerate(dens):
+                    ax2.plot(x, dens[nm], color=cmap(j),
+                             lw=1.2, ls="--" if i else "-", alpha=0.8,
+                             label=f"{nm} density ({lab})")
+        ax2.set_ylabel("motif-hit density (fraction of windows)")
+        ax2.set_ylim(bottom=0)
+        ax2.margins(x=0)
+
+    ax.axvline(0, color="red", ls="--", lw=1, zorder=1)
+    ax.set_xlabel("position relative to center (bp)")
+    ax.set_ylabel(("normalized " if a.normalize else "") +
+                  ("attention (received, ALiBi-free)" if a.mode == "attention"
+                   else "ISM saliency (Δ score / substitution)"))
+    ax.set_title(a.title or "aggregate saliency vs cofactor motif density", fontsize=11)
+    # merge legends from both axes
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = (ax2.get_legend_handles_labels() if ax2 is not None else ([], []))
+    ax.legend(h1 + h2, l1 + l2, fontsize=7.5, ncol=1, loc="upper right", framealpha=0.9)
+    ax.margins(x=0)
+    fig.tight_layout()
+    fig.savefig(a.out, dpi=150, bbox_inches="tight")
+    for lab in profs:
+        p = profs[lab]
+        print(f"[track] {lab}: peak {p.max():.4f} at {int(np.argmax(p))-L//2:+d} bp")
+    print(f"[out] {a.out}")
+
+
+if __name__ == "__main__":
+    main()
