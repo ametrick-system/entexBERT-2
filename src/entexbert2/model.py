@@ -29,6 +29,8 @@ from typing import Optional
 import torch
 import transformers
 from transformers.modeling_outputs import SequenceClassifierOutput
+from entexbert2.cross_allele_head import CrossAlleleInteraction, pool as xpool
+
 
 # ---------------------------------------------------------------------------
 # Prediction head (g_phi): linear (num_layers=1) or MLP (num_layers>=2)
@@ -46,6 +48,7 @@ def get_activation_module(name: str) -> torch.nn.Module:
         return torch.nn.SiLU()
     raise ValueError(f"Unsupported head activation {name!r} (gelu|relu|tanh|silu).")
 
+
 def build_prediction_head(
     input_size: int,
     output_size: int = 1,
@@ -56,8 +59,8 @@ def build_prediction_head(
 ) -> torch.nn.Module:
     """
     num_layers counts total Linear layers:
-      1  -> Linear(input_size -> output_size)
-      2  -> Linear(input->hidden) + activation + dropout + Linear(hidden->output)
+      1  -> Linear(input_size -> output_size)                 (linear head)
+      2  -> Linear(input->hidden) + act + drop + Linear(hidden->output)
       3+ -> deeper MLP
     """
     if num_layers < 1:
@@ -127,10 +130,16 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         task: str = "regression",                 # NEW: 'regression' | 'classification'
         num_labels: int = 1,                       # NEW: regression head width T (multi-track Stage-1 = #tissues; 1 = scalar)
         proj_dim: int = 128,                       # classification projection dim d
+        interaction: str = "none",                 # NEW: "none" (bi-encoder) | "cross_attn" (cross-encoder)
+        x_dim: int = 256,                          # NEW: cross-attn projection dim
+        x_heads: int = 4,                          # NEW: cross-attn heads
+        x_dropout: float = 0.1,                    # NEW: cross-attn dropout
+        x_readout: str = "mean",                   # NEW: "mean" | "variant_focus" (jitter-robust)
+        x_width: int = 2,                          # NEW: +/- tokens for variant_focus
     ):
         super().__init__()
-        if pooling_mode not in ("cls", "center_mean"):
-            raise ValueError(f"pooling_mode must be 'cls' or 'center_mean', got {pooling_mode!r}.")
+        if pooling_mode not in ("cls", "center_mean", "mean"):
+            raise ValueError(f"pooling_mode must be 'cls', 'center_mean', or 'mean', got {pooling_mode!r}.")
         if pooling_mode == "center_mean" and center_pool_width % 2 == 0:
             raise ValueError("center_pool_width must be odd for symmetric center pooling.")
         if neff_s <= 0:
@@ -148,12 +157,23 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                 f"classification contrast head emits one P(ASB) logit; num_labels must be 1, "
                 f"got {num_labels}."
             )
+        # NEW: cross-allele interaction (bi-encoder -> cross-encoder). Only defined for classification.
+        if interaction not in ("none", "cross_attn"):
+            raise ValueError(f"interaction must be 'none' or 'cross_attn', got {interaction!r}.")
+        if interaction == "cross_attn" and task != "classification":
+            raise ValueError("interaction='cross_attn' is only defined for task='classification'.")
+        if x_readout not in ("mean", "variant_focus"):
+            raise ValueError(f"x_readout must be 'mean' or 'variant_focus', got {x_readout!r}.")
 
         self.pooling_mode = pooling_mode
         self.center_pool_width = int(center_pool_width)
         self.neff_s = float(neff_s)
         self.task = task                                    # NEW
         self.num_labels = num_labels                        # NEW: regression head width T
+        self.interaction = interaction                      # NEW
+        self.x_readout = x_readout                          # NEW
+        self.x_width = int(x_width)                         # NEW
+        self.xattn = None                                   # NEW: set below for cross_attn
 
         # Shared pretrained trunk f_theta.
         self.backbone = transformers.AutoModel.from_pretrained(
@@ -190,6 +210,9 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
             self.dist_a = torch.nn.Parameter(torch.tensor(0.5413))   # softplus(0.5413) ~ 1.0
             self.dist_b = torch.nn.Parameter(torch.tensor(0.0))
             self.main_head = None
+            # NEW: cross-encoder interaction block (shared-weight symmetric, ALiBi-free)
+            if interaction == "cross_attn":
+                self.xattn = CrossAlleleInteraction(hidden_size, d_x=x_dim, n_heads=x_heads, dropout=x_dropout)
 
         if freeze_backbone:
             self.freeze_backbone()
@@ -240,6 +263,17 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         if self.pooling_mode == "cls":
             return seq[:, 0, :]
 
+        if self.pooling_mode == "mean":
+            # masked all-token mean over the valid (non-pad) tokens of each window.
+            # Reads distal context directly (not only via attention into central tokens),
+            # unlike center_mean. Used for the wide-context enhancer-state test.
+            if attention_mask is None:
+                return seq.mean(dim=1)
+            m = attention_mask.unsqueeze(-1).to(seq.dtype)          # (B, L, 1)
+            summed = (seq * m).sum(dim=1)                           # (B, H)
+            denom = m.sum(dim=1).clamp(min=1.0)                     # (B, 1), avoid div-by-0
+            return summed / denom
+
         # center_mean: mean-pool center_pool_width tokens around the middle of each valid window
         bsz, max_len, _ = seq.shape
         half = self.center_pool_width // 2
@@ -258,6 +292,16 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
                             return_dict=True, **kwargs)
         return self.dropout(self._pool(out, attention_mask=attention_mask))
+
+    def _encode_one(self, input_ids, attention_mask, **kwargs):
+        """One window -> per-position hidden states (B,S,H) for cross-allele attention."""
+        out = self.backbone(input_ids=input_ids, attention_mask=attention_mask,
+                            return_dict=True, **kwargs)
+        if hasattr(out, "last_hidden_state") and out.last_hidden_state is not None:
+            return out.last_hidden_state
+        if isinstance(out, dict) and "last_hidden_state" in out:
+            return out["last_hidden_state"]
+        return out[0]
 
     def _score_one(self, input_ids, attention_mask, **kwargs):
         """One window -> binding logit(s) + fused representation (regression head).
@@ -292,6 +336,7 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
         labels=None,               # regression: binding label, (B,) scalar or (B,T) per-track ; classification: 0/1 AS
         depth=None,                # n = total read depth (privileged; weight only)
         label_mask=None,           # NEW: (B,T) 0/1 observed-tissue mask for multi-track Stage-1 (None => all observed)
+        var_tok_idx=None,          # NEW: variant token index per example (cross_attn variant_focus readout)
         **kwargs,
     ):
         # ================= classification: symmetric contrast (distance) =================
@@ -301,8 +346,17 @@ class entexBERT2ForSequencePrediction(torch.nn.Module):
                     "classification (contrast) head requires a paired (hap1, hap2) batch, but "
                     "input_ids_alt did not reach forward. Use --input_mode hap_pair and the twin collator."
                 )
-            h1 = self._pool_one(input_ids, attention_mask, **kwargs)
-            h2 = self._pool_one(input_ids_alt, attention_mask_alt, **kwargs)
+            if self.interaction == "cross_attn":
+                # cross-encoder: encode each allele, let them attend to each other (symmetric,
+                # ALiBi-free), then pool the interaction-aware reps. Backbone stays in-distribution.
+                H1 = self._encode_one(input_ids, attention_mask, **kwargs)
+                H2 = self._encode_one(input_ids_alt, attention_mask_alt, **kwargs)
+                H1x, H2x = self.xattn(H1, H2, attention_mask, attention_mask_alt)
+                h1 = self.dropout(xpool(H1x, attention_mask, self.x_readout, var_tok_idx, self.x_width))
+                h2 = self.dropout(xpool(H2x, attention_mask_alt, self.x_readout, var_tok_idx, self.x_width))
+            else:
+                h1 = self._pool_one(input_ids, attention_mask, **kwargs)
+                h2 = self._pool_one(input_ids_alt, attention_mask_alt, **kwargs)
             z1 = self.proj(h1)
             z2 = self.proj(h2)
             s = torch.linalg.vector_norm(z1 - z2, dim=-1)      # >= 0, symmetric in (h1,h2)

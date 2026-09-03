@@ -147,6 +147,12 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
         neff_s=run_config.get("neff_s", 50.0),
         task=run_config.get("task", "regression"),
         proj_dim=run_config.get("proj_dim", 128),
+        interaction=run_config.get("interaction", "none"),          # NEW
+        x_dim=run_config.get("x_dim", 256),                          # NEW
+        x_heads=run_config.get("x_heads", 4),                        # NEW
+        x_dropout=run_config.get("x_dropout", 0.1),                  # NEW
+        x_readout=run_config.get("x_readout", "mean"),               # NEW
+        x_width=run_config.get("x_width", 2),                        # NEW
     )
     return model.to(device)
 
@@ -180,7 +186,7 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
 @torch.no_grad()
 def logits_and_embeddings(model, input_ids, attention_mask,
                           input_ids_alt=None, attention_mask_alt=None,
-                          return_pools=False):
+                          return_pools=False, var_tok_idx=None):    # NEW: var_tok_idx (cross_attn)
     """
     Score sequence(s) with the model's own backbone + pooling + head (eval mode -> dropout is
     identity, so this matches the trained forward exactly). Task-aware.
@@ -207,7 +213,10 @@ def logits_and_embeddings(model, input_ids, attention_mask,
     def _pool(ids, mask):
         return model._pool_one(ids, mask)
 
-    pool1 = _pool(input_ids, attention_mask)
+    interaction = getattr(model, "interaction", "none")             # NEW
+    # NEW: cross_attn computes its pools inside the classification branch (needs the alt window);
+    # the single-window pool1 is only used by the bi-encoder / regression paths.
+    pool1 = None if (task == "classification" and interaction == "cross_attn") else _pool(input_ids, attention_mask)
     pool2 = None
 
     if task == "classification":
@@ -215,9 +224,17 @@ def logits_and_embeddings(model, input_ids, attention_mask,
             raise ValueError(
                 "classification scoring requires paired inputs (hap1, hap2); got a single sequence."
             )
-        pool2 = _pool(input_ids_alt, attention_mask_alt)
-        z1 = model.proj(pool1)
-        z2 = model.proj(pool2)
+        if interaction == "cross_attn":                              # NEW cross-encoder path
+            from entexbert2.cross_allele_head import pool as _xpool
+            H1 = model._encode_one(input_ids, attention_mask)
+            H2 = model._encode_one(input_ids_alt, attention_mask_alt)
+            H1x, H2x = model.xattn(H1, H2, attention_mask, attention_mask_alt)
+            z1 = model.proj(_xpool(H1x, attention_mask, model.x_readout, var_tok_idx, model.x_width))
+            z2 = model.proj(_xpool(H2x, attention_mask_alt, model.x_readout, var_tok_idx, model.x_width))
+        else:                                                        # bi-encoder path (unchanged)
+            pool2 = _pool(input_ids_alt, attention_mask_alt)
+            z1 = model.proj(pool1)
+            z2 = model.proj(pool2)
         pooled = z1 - z2                                                 # projected contrast (for probes)
         # Mirror model.forward's classification head EXACTLY: ell = a*||z1 - z2|| + b.
         s = torch.linalg.vector_norm(z1 - z2, dim=-1, keepdim=True)      # (N,1), >= 0
@@ -269,6 +286,7 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
     if getattr(model, "task", "regression") == "classification" and not is_pair:
         raise ValueError("classification scoring requires paired inputs ([window1, window2]).")
     mml = run_config.get("model_max_length", 512)
+    interaction = run_config.get("interaction", "none")              # NEW
 
     all_logits, all_emb, all_ref, all_alt = [], [], [], []
     for i in range(0, len(texts), batch_size):
@@ -276,15 +294,33 @@ def run_inference(checkpoint_dir, texts, batch_size=64, device="cpu",
         if is_pair:
             ref = [b[0] for b in batch]
             alt = [b[1] for b in batch]
-            enc_r = tokenizer(ref, return_tensors="pt", padding="longest",
-                              max_length=mml, truncation=True)
-            enc_a = tokenizer(alt, return_tensors="pt", padding="longest",
-                              max_length=mml, truncation=True)
-            out = logits_and_embeddings(
-                model, enc_r["input_ids"].to(device), enc_r["attention_mask"].to(device),
-                input_ids_alt=enc_a["input_ids"].to(device),
-                attention_mask_alt=enc_a["attention_mask"].to(device),
-                return_pools=dump_pools)
+            if interaction == "cross_attn":                          # NEW: anchored aligned grid
+                from entexbert2.anchor_tokenize import anchor_tokenize
+                idr, ida, vtx = [], [], []
+                for rseq, aseq in zip(ref, alt):
+                    dif = [k for k in range(min(len(rseq), len(aseq))) if rseq[k] != aseq[k]]
+                    vp = dif[0] if len(dif) == 1 else len(rseq) // 2   # single-base diff (jitter-safe); else center
+                    a = anchor_tokenize(tokenizer, rseq, aseq, vp)     # variable length; batch-padded below
+                    idr.append(torch.tensor(a["input_ids_ref"]))
+                    ida.append(torch.tensor(a["input_ids_alt"]))
+                    vtx.append(a["var_tok_idx"])
+                ii_r = torch.nn.utils.rnn.pad_sequence(idr, batch_first=True, padding_value=tokenizer.pad_token_id)
+                ii_a = torch.nn.utils.rnn.pad_sequence(ida, batch_first=True, padding_value=tokenizer.pad_token_id)
+                out = logits_and_embeddings(
+                    model, ii_r.to(device), ii_r.ne(tokenizer.pad_token_id).to(device),
+                    input_ids_alt=ii_a.to(device),
+                    attention_mask_alt=ii_a.ne(tokenizer.pad_token_id).to(device),
+                    return_pools=dump_pools, var_tok_idx=torch.tensor(vtx).to(device))
+            else:
+                enc_r = tokenizer(ref, return_tensors="pt", padding="longest",
+                                  max_length=mml, truncation=True)
+                enc_a = tokenizer(alt, return_tensors="pt", padding="longest",
+                                  max_length=mml, truncation=True)
+                out = logits_and_embeddings(
+                    model, enc_r["input_ids"].to(device), enc_r["attention_mask"].to(device),
+                    input_ids_alt=enc_a["input_ids"].to(device),
+                    attention_mask_alt=enc_a["attention_mask"].to(device),
+                    return_pools=dump_pools)
             if dump_pools:
                 logits, pooled, pool1, pool2 = out
                 all_ref.append(pool1.detach().cpu().numpy())

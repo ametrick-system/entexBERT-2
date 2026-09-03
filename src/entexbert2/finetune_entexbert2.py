@@ -11,7 +11,7 @@ All modifications to the original script are wrapped in comments in the followin
 ...
 #############################################################
 
-Last modified: 8/18/2026 by Amy Metrick
+Last modified: 9/2/2026 by Amy Metrick
 '''
 
 import os
@@ -60,6 +60,13 @@ class ModelArguments:
     neff_s: float = field(default=50.0, metadata={"help": "n_eff saturation cap s (0 = unweighted)"})
     # NEW: classification (contrast head) projection dimension d for delta = ||P(h1) - P(h2)|| ##############
     proj_dim: int = field(default=128, metadata={"help": "classification: shared projection dim d"})
+    # NEW: cross-allele attention (cross-encoder ASB head) ##################################################
+    head_interaction: str = field(default="none", metadata={"help": "'none' (bi-encoder) | 'cross_attn'"})
+    x_dim: int = field(default=256, metadata={"help": "cross-attn projection dim"})
+    x_heads: int = field(default=4, metadata={"help": "cross-attn heads"})
+    x_dropout: float = field(default=0.1, metadata={"help": "cross-attn dropout"})
+    x_readout: str = field(default="mean", metadata={"help": "'mean' | 'variant_focus' (jitter-robust)"})
+    x_width: int = field(default=2, metadata={"help": "+/- tokens for variant_focus readout"})
     # NEW: 2-stage transfer learning ########################################################################
     init_backbone_from: Optional[str] = field(default=None,
         metadata={"help": "path to a Stage-1 checkpoint; loads backbone.* weights only"})
@@ -160,7 +167,8 @@ class SupervisedDataset(Dataset):
                  data_path: str, 
                  tokenizer: transformers.PreTrainedTokenizer, 
                  kmer: int = -1,
-                 input_mode: str = "hap_pair"): # NEW: hap_pair reads two windows per example
+                 input_mode: str = "hap_pair", # NEW: hap_pair reads two windows per example
+                 interaction: str = "none"):   # NEW: "cross_attn" -> anchored aligned tokenization
 
         super(SupervisedDataset, self).__init__()
 
@@ -230,7 +238,26 @@ class SupervisedDataset(Dataset):
 
         # MODIFIED: for hap_pair, tokenize the two windows SEPARATELY rather than [SEP]-concatenating
         self.input_mode = input_mode
-        if input_mode == "hap_pair":
+        self.interaction = interaction            # NEW
+        self.var_tok_idx = None                   # NEW: set only for cross_attn
+        if input_mode == "hap_pair" and interaction == "cross_attn":
+            # NEW: anchored aligned grid (ref/alt equal length, differ at exactly one token).
+            from entexbert2.anchor_tokenize import anchor_tokenize
+            ids1, ids2, vtx = [], [], []
+            for t in texts:
+                rseq, aseq = t[0], t[1]
+                dif = [k for k in range(min(len(rseq), len(aseq))) if rseq[k] != aseq[k]]
+                vp = dif[0] if len(dif) == 1 else len(rseq) // 2   # single-base diff (jitter-safe) else center
+                a = anchor_tokenize(tokenizer, rseq, aseq, vp)     # variable length; collator pads
+                ids1.append(torch.tensor(a["input_ids_ref"]))
+                ids2.append(torch.tensor(a["input_ids_alt"]))
+                vtx.append(a["var_tok_idx"])
+            self.input_ids = ids1                 # list of 1-D tensors; masks derived in the collator
+            self.attention_mask = None
+            self.input_ids_alt = ids2
+            self.attention_mask_alt = None
+            self.var_tok_idx = torch.tensor(vtx)
+        elif input_mode == "hap_pair":
             enc1 = tokenizer([t[0] for t in texts], return_tensors="pt", padding="longest",
                              max_length=tokenizer.model_max_length, truncation=True)
             enc2 = tokenizer([t[1] for t in texts], return_tensors="pt", padding="longest",
@@ -260,6 +287,8 @@ class SupervisedDataset(Dataset):
         item = dict(input_ids=self.input_ids[i], labels=self.labels[i])
         if self.input_ids_alt is not None:
             item["input_ids_alt"] = self.input_ids_alt[i]
+        if self.var_tok_idx is not None: # NEW (cross attention)
+            item["var_tok_idx"] = self.var_tok_idx[i]
         if self.depth is not None:
             item["depth"] = self.depth[i]
         # NEW: multi-track observed-tissue mask
@@ -294,6 +323,9 @@ class DataCollatorForSupervisedDataset(object):
             )
             batch["input_ids_alt"] = alt
             batch["attention_mask_alt"] = alt.ne(self.tokenizer.pad_token_id)
+        # NEW: carry the variant token index (cross_attn variant_focus readout)
+        if "var_tok_idx" in instances[0]:
+            batch["var_tok_idx"] = torch.stack([instance["var_tok_idx"] for instance in instances])
         # NEW: carry the privileged depth weight through to the loss (crucially NOT the model input)
         if "depth" in instances[0]:
             batch["depth"] = torch.tensor([instance["depth"] for instance in instances],
@@ -542,16 +574,20 @@ def train():
     if "InstaDeepAI" in model_args.model_name_or_path:
         tokenizer.eos_token = tokenizer.pad_token
 
-    # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair functionality]
+    # define datasets and data collator [MODIFIED: added input_mode=data_args.input_mode for hap_pair functionality 
+                                        # and interaction==model_args.head_interaction for cross attention]
     train_dataset = SupervisedDataset(tokenizer=tokenizer,
                                     data_path=os.path.join(data_args.data_path, "train.csv"),
-                                    kmer=data_args.kmer, input_mode=data_args.input_mode)
+                                    kmer=data_args.kmer, input_mode=data_args.input_mode,
+                                    interaction=model_args.head_interaction)
     val_dataset = SupervisedDataset(tokenizer=tokenizer, 
                                     data_path=os.path.join(data_args.data_path, "dev.csv"), 
-                                    kmer=data_args.kmer, input_mode=data_args.input_mode)
+                                    kmer=data_args.kmer, input_mode=data_args.input_mode,
+                                    interaction=model_args.head_interaction)
     test_dataset = SupervisedDataset(tokenizer=tokenizer, 
                                     data_path=os.path.join(data_args.data_path, "test.csv"), 
-                                    kmer=data_args.kmer, input_mode=data_args.input_mode)
+                                    kmer=data_args.kmer, input_mode=data_args.input_mode,
+                                    interaction=model_args.head_interaction)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
 
 
@@ -569,6 +605,10 @@ def train():
         task=data_args.task, # selects head topology (regression twin | classification contrast)
         num_labels=model_args.num_labels, # regression head width T (multi-track Stage-1)
         proj_dim=model_args.proj_dim, # classification projection dimension
+        interaction=model_args.head_interaction,  # bi-encoder or cross_attn
+        x_dim=model_args.x_dim, x_heads=model_args.x_heads, x_dropout=model_args.x_dropout,
+        x_readout=model_args.x_readout, x_width=model_args.x_width,
+     )
     )
 
     # NEW: 2-stage transfer ################################################################################
@@ -608,9 +648,12 @@ def train():
             "head_dropout": model_args.head_dropout,
             "neff_s": model_args.neff_s,
             "task": data_args.task,
-            "num_labels": model_args.num_labels, #regression head width T (multi-track Stage-1)
+            "num_labels": model_args.num_labels, # regression head width T (multi-track Stage-1)
             "proj_dim": model_args.proj_dim,
-            "input_mode": data_args.input_mode,
+            "interaction": model_args.head_interaction,
+            "x_dim": model_args.x_dim, "x_heads": model_args.x_heads,
+            "x_dropout": model_args.x_dropout, "x_readout": model_args.x_readout, "x_width": model_args.x_width,
+             "input_mode": data_args.input_mode,
             "use_lora": model_args.use_lora,
         }, f, indent=2)
     ##############################################################################################

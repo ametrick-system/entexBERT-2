@@ -89,7 +89,11 @@ def build_windows(df, ref_fasta, left_bp, right_bp,
 # Shared: balanced AUROC (subsample the larger class to the smaller, seed=1),
 # with a bootstrap CI over the balanced set.
 # ----------------------------------------------------------------------
-def balanced_auroc(score, label, seed=1, n_boot=1000):
+def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
+    # cover=None -> random balance (original behavior). cover given -> COVERAGE-MATCHED balance:
+    # subsample the larger class so its coverage (depth) distribution matches the smaller class,
+    # removing the depth/coverage confound (coverage-alone AUROC -> ~0.5). Any AUROC left is real
+    # allelic skill, not a depth shortcut.
     score = np.asarray(score, dtype=float)
     label = np.asarray(label, dtype=int)
     pos_idx = np.where(label == 1)[0]
@@ -98,10 +102,30 @@ def balanced_auroc(score, label, seed=1, n_boot=1000):
     if m < 10:
         return np.nan, np.nan, (np.nan, np.nan), m
     rng = np.random.default_rng(seed)
-    if len(neg_idx) >= len(pos_idx):
-        sel_neg = rng.choice(neg_idx, size=m, replace=False); sel_pos = pos_idx
+    if cover is None:
+        if len(neg_idx) >= len(pos_idx):
+            sel_neg = rng.choice(neg_idx, size=m, replace=False); sel_pos = pos_idx
+        else:
+            sel_pos = rng.choice(pos_idx, size=m, replace=False); sel_neg = neg_idx
     else:
-        sel_pos = rng.choice(pos_idx, size=m, replace=False); sel_neg = neg_idx
+        # match the LARGER class's log-coverage distribution to the SMALLER class (quantile bins)
+        lc = np.log1p(np.clip(np.asarray(cover, dtype=float), 0, None))
+        small = pos_idx if len(pos_idx) <= len(neg_idx) else neg_idx
+        large = neg_idx if len(pos_idx) <= len(neg_idx) else pos_idx
+        edges = np.quantile(lc[small], np.linspace(0, 1, n_qbins + 1))
+        edges[0] -= 1e-6; edges[-1] += 1e-6
+        sb = np.digitize(lc[small], edges); lb = np.digitize(lc[large], edges)
+        picks = []
+        for b in np.unique(sb):
+            pool = large[lb == b]; want = int((sb == b).sum())
+            if len(pool):
+                picks.append(rng.choice(pool, size=want, replace=len(pool) < want))
+        sel_large = np.concatenate(picks) if picks else large[:0]
+        if len(pos_idx) <= len(neg_idx):
+            sel_pos, sel_neg = small, sel_large
+        else:
+            sel_pos, sel_neg = sel_large, small
+    m = min(len(sel_pos), len(sel_neg))
     idx = np.concatenate([sel_pos, sel_neg])
     y = label[idx]; s = score[idx]
     point = roc_auc_score(y, s)
@@ -250,16 +274,24 @@ def eval_adastra(args):
         print("[leakage] no --train_coords; full-set number only. "
               "For leak-free, pass fold0/train.meta.csv fold0/dev.meta.csv.")
 
-    def report(tag, sub):
-        pt, aupr, (lo, hi), m = balanced_auroc(sub[score_col].to_numpy(), sub["label"].to_numpy())
-        print(f"[AUROC:{tag}] balanced {m} pos + {m} neg  AUROC={pt:.4f} "
+    def report(tag, sub, cover_matched=False):
+        cov = (sub["total_cover"].to_numpy()
+               if (cover_matched and "total_cover" in sub.columns) else None)
+        pt, aupr, (lo, hi), m = balanced_auroc(sub[score_col].to_numpy(), sub["label"].to_numpy(),
+                                               cover=cov, n_qbins=args.cover_qbins)
+        lbl = tag + ("+covmatch" if cover_matched else "")
+        print(f"[AUROC:{lbl}] balanced {m} pos + {m} neg  AUROC={pt:.4f} "
               f"95%CI[{lo:.4f},{hi:.4f}]  AUPRC={aupr:.4f}")
-        return {"regime": tag, "auroc": pt, "auroc_lo": lo, "auroc_hi": hi,
-                "auprc": aupr, "n_pos": int(m)}
+        return {"regime": tag, "cover_matched": cover_matched, "auroc": pt, "auroc_lo": lo,
+                "auroc_hi": hi, "auprc": aupr, "n_pos": int(m)}
 
     results = [report("full", ev)]
+    if args.match_coverage:
+        results.append(report("full", ev, cover_matched=True))
     if leaky.any():
         results.append(report("leak_free", ev.loc[~leaky]))
+        if args.match_coverage:
+            results.append(report("leak_free", ev.loc[~leaky], cover_matched=True))
 
     if args.reference_csv and os.path.exists(args.reference_csv):
         ref = pd.read_csv(args.reference_csv)
@@ -331,9 +363,12 @@ def eval_hetsnv(args):
             print(f"[leakage] {leaky.sum()}/{len(d)} {donor} ({kind}) variants in a seen bin "
                   f"({int(leaky[d.label.to_numpy()==1].sum())} positive).")
 
-        def rep(tag, sub):
+        def rep(tag, sub, cover_matched=False):
             _sc = "delta" if _task["t"] == "classification" else "abs_delta"
-            pt, aupr, (lo, hi), m = balanced_auroc(sub[_sc].to_numpy(), sub["label"].to_numpy())
+            cov = (sub["total_reads"].to_numpy()
+                   if (cover_matched and "total_reads" in sub.columns) else None)
+            pt, aupr, (lo, hi), m = balanced_auroc(sub[_sc].to_numpy(), sub["label"].to_numpy(),
+                                                   cover=cov, n_qbins=args.cover_qbins)
             # signed/mag calibration only meaningful for the regression contrast; NaN for classification.
             if _task["t"] == "classification":
                 mag = sgn = np.nan
@@ -342,14 +377,19 @@ def eval_hetsnv(args):
                        if len(sub) > 10 else np.nan)
                 sgn = (spearmanr(sub["delta"], sub["signed_log_count_ratio"]).correlation
                        if len(sub) > 10 else np.nan)
-            print(f"  [{donor}:{tag}] AUROC={pt:.4f} CI[{lo:.4f},{hi:.4f}] AUPRC={aupr:.4f} "
+            lbl = tag + ("+covmatch" if cover_matched else "")
+            print(f"  [{donor}:{lbl}] AUROC={pt:.4f} CI[{lo:.4f},{hi:.4f}] AUPRC={aupr:.4f} "
                   f"n_pos={m} | mag_Spearman={mag:.4f} signed_Spearman={sgn:.4f}")
             summary.append(dict(donor=donor, donor_kind=d["donor_kind"].iloc[0], regime=tag,
-                                tissue="ALL", auroc=pt, auroc_lo=lo, auroc_hi=hi, auprc=aupr,
-                                n_pos=m, mag_spearman=mag, signed_spearman=sgn))
+                                cover_matched=cover_matched, tissue="ALL", auroc=pt, auroc_lo=lo,
+                                auroc_hi=hi, auprc=aupr, n_pos=m, mag_spearman=mag, signed_spearman=sgn))
         rep("full", d)
+        if args.match_coverage:
+            rep("full", d, cover_matched=True)
         if leaky.any():
             rep("leak_free", d.loc[~leaky])
+            if args.match_coverage:
+                rep("leak_free", d.loc[~leaky], cover_matched=True)
 
         d_tis = d.loc[~leaky] if leaky.any() else d
         tis_regime = "leak_free" if leaky.any() else "full"
@@ -414,6 +454,12 @@ def parse_args():
                     help="fold0/train.meta.csv fold0/dev.meta.csv (leak filter; NOT test.meta.csv)")
     ap.add_argument("--bin_size", type=int, default=100000)
     ap.add_argument("--drop_leaky", action="store_true")
+    ap.add_argument("--match_coverage", action="store_true",
+                    help="Also report a COVERAGE-MATCHED balanced AUROC per regime (negatives "
+                         "matched to positives on log-coverage), controlling the depth confound. "
+                         "ADASTRA uses total_cover; hetSNV uses total_reads.")
+    ap.add_argument("--cover_qbins", type=int, default=20,
+                    help="quantile bins for coverage matching (--match_coverage)")
     ap.add_argument("--left_bp", type=int, default=128)
     ap.add_argument("--right_bp", type=int, default=128)
     ap.add_argument("--batch_size", type=int, default=64)
