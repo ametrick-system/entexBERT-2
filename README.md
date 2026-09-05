@@ -19,6 +19,12 @@ python3 -m pip install -r requirements.txt
 git clone https://github.com/ametrick-system/entexBERT-2.git
 pip install .
 pip install h5py logomaker modisco-lite
+
+# Step 4: benchmarking
+conda create -n enformer python=3.11
+conda activate enformer
+pip install torch --index-url https://download.pytorch.org/whl/cu118
+pip install enformer-pytorch pyfaidx pandas scikit-learn openpyxl numpy
 ```
 ## Quickstart
 

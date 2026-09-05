@@ -608,7 +608,6 @@ def train():
         interaction=model_args.head_interaction,  # bi-encoder or cross_attn
         x_dim=model_args.x_dim, x_heads=model_args.x_heads, x_dropout=model_args.x_dropout,
         x_readout=model_args.x_readout, x_width=model_args.x_width,
-     )
     )
 
     # NEW: 2-stage transfer ################################################################################
