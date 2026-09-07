@@ -1297,7 +1297,14 @@ class MultiTissuePeakRowSource(RowSource):
         self.background_gap_bp = int(background_gap_bp)
         self.exclude_chroms = set(exclude_chroms or [])
         self.seed = int(seed)
-        self.tissues = [d["tissue"] for d in datasets]
+        _groups = [d.get("group") for d in datasets]
+        if all(g is not None for g in _groups): # multi-TF joint trunk
+            self.track_names = list(dict.fromkeys(_groups)) # TF names
+            self._group_cols = [[i for i, g in enumerate(_groups) if g == nm] for nm in self.track_names]
+        else:
+            self.track_names = [d["tissue"] for d in datasets]
+            self._group_cols = [[i] for i in range(len(datasets))]
+        self.tissues = self.track_names
         # p-value confidence tracks are optional; enabled when every tissue provides pval_path
         self._has_pval = all(d.get("pval_path") for d in datasets)
 
@@ -1441,11 +1448,12 @@ class MultiTissuePeakRowSource(RowSource):
             # y_track_t = log1p(fold-change) in tissue t; m_track_t = 1 where that tissue was actually assayed at this locus (finite), 0 where missing; mat is (n, N_tissues),
             # column order == self.tissues. NaN (unassayed) -> masked out (m=0) and set to 0.0 so
             # the value is never read when masked
-            for t in range(mat.shape[1]):
-                col = mat[:, t]
+            for gi, cols in enumerate(self._group_cols):
+                with np.errstate(invalid="ignore"):
+                    col = np.nanmean(mat[:, cols], axis=1) # merge tissues within the track/group
                 m = np.isfinite(col).astype(np.int8)
-                assign[f"y_track_{t}"] = np.log1p(np.where(m == 1, col, 0.0))
-                assign[f"m_track_{t}"] = m
+                assign[f"y_track_{gi}"] = np.log1p(np.where(m == 1, col, 0.0))
+                assign[f"m_track_{gi}"] = m
             sub = sub.assign(**assign)
             parts.append(sub)
         peaks = pd.concat(parts, ignore_index=True)
@@ -1468,11 +1476,12 @@ class MultiTissuePeakRowSource(RowSource):
                 pmat = self._read_signal_matrix(chrom, sub["anchor"].tolist(), path_key="pval_path")
                 assign["mean_pval"] = np.nanmean(pmat, axis=1)
             # For multi-track Stage-1: per-tissue LOW signal at the background anchor
-            for t in range(mat.shape[1]):
-                col = mat[:, t]
+            for gi, cols in enumerate(self._group_cols):
+                with np.errstate(invalid="ignore"):
+                    col = np.nanmean(mat[:, cols], axis=1) # merge tissues within the track/group
                 m = np.isfinite(col).astype(np.int8)
-                assign[f"y_track_{t}"] = np.log1p(np.where(m == 1, col, 0.0))
-                assign[f"m_track_{t}"] = m
+                assign[f"y_track_{gi}"] = np.log1p(np.where(m == 1, col, 0.0))
+                assign[f"m_track_{gi}"] = m
             sub = sub.assign(**assign)
             bgparts.append(sub)
         bg = pd.concat(bgparts, ignore_index=True) if bgparts else pd.DataFrame(columns=peaks.columns)
