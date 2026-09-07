@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-build_betabinom_counts.py — aggregate EN-TEx hetSNV read counts per (donor, locus)
-into a beta-binomial training table.
+build_hap_counts.py — aggregate EN-TEx hetSNV read counts per (donor, locus)
+into a per-locus haplotype-count table for the Stage-2 ASB head.
 
-The hetSNV TSV has one row per (donor, tissue, locus). For the beta-binomial count
-model we want ONE observation per unique (donor, haplotype-sequence) locus, with reads
-SUMMED across tissues (tissue-agnostic, matching ADASTRA pooling and the Track-1
-consensus model). This script produces that table; the finetune row-source reads it
-like any other SNV table.
+The hetSNV TSV has one row per (donor, tissue, locus). For the ASB count table we
+want ONE observation per unique (donor, haplotype-sequence) locus, with reads SUMMED
+across tissues (tissue-agnostic, matching ADASTRA pooling and the Stage-1 consensus
+model). This script produces that table; the hap_counts row source reads it like any
+other SNV table.
 
 Emitted columns (one row per donor-locus):
   chr, ref_start, ref_allele, hap1_allele, hap2_allele, donor,
   k (= summed hap1 reads), n (= summed total reads), imbalance_significance (any-sig),
   assay
-The finetune betabinomial task reads k and n as its label pair; chr/ref_start drive the
-100kb-bin leakage split and the held-out-chromosome test.
+The Stage-2 ASB head reads this table via the hap_counts row source: n supplies the per-locus
+depth (privileged precision weight n_eff) and imbalance_significance the binary AS label;
+chr/ref_start drive the 100kb-bin leakage split and the held-out-chromosome test.
 
-  python build_betabinom_counts.py \
+  python build_hap_counts.py \
       --hetsnv_tsv /home/asm242/palmer_scratch/entex_data/hetSNVs.tsv \
-      --assay CTCF --out ctcf_betabinom_counts.csv
+      --assay CTCF --out ctcf_hap_counts.csv
 """
 import argparse
 import numpy as np, pandas as pd
@@ -31,7 +32,7 @@ def main():
     ap.add_argument("--assay", default="CTCF", help="assay substring filter; 'ALL' keeps all")
     ap.add_argument("--min_total_reads", type=int, default=1,
                     help="drop aggregated loci with n < this (n=0 has no likelihood)")
-    ap.add_argument("--out", default="betabinom_counts.csv")
+    ap.add_argument("--out", default="hap_counts.csv")
     a = ap.parse_args()
 
     usecols = ["chr", "ref_start", "ref_allele", "hap1_allele", "hap2_allele",

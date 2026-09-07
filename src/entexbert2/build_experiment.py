@@ -11,19 +11,19 @@ New formats are added by (1) implementing a RowSource / make_*_label_spec in bui
 Two live pipelines:
 
   Stage 1 (binding trunk):  row_source multi_tissue_peak + label bigwig (or column)
-  Stage 2 (ASB contrast head):  row_source betabinom_counts + label as_class, with
+  Stage 2 (ASB contrast head):  row_source hap_counts + label as_class, with
                             depth_col: n  (n carried through as the privileged weight)
 
 Usage:
-    python run_experiment.py configs/stage2_ctcf_asb.yaml
-    python run_experiment.py exp.yaml --ref_fasta /data/hg38.fa --output_dir runs/foo
+    python build_experiment.py configs/stage2_ctcf_asb.yaml
+    python build_experiment.py exp.yaml --ref_fasta /data/hg38.fa --output_dir runs/foo
 
 Example Stage-2 config:
 
     experiment: stage2_ctcf_asb
     ref_fasta: /data/hg38.fa
     output_dir: runs/stage2_ctcf_asb
-    row_source: {type: betabinom_counts, path: ctcf_betabinom_counts.csv, donor: null}
+    row_source: {type: hap_counts, path: ctcf_hap_counts.csv, donor: null}
     primary_label: {type: as_class}             # binary AS label (imbalance_significance, 0/1)
     sequence: {input_mode: hap_pair}
     window: {left_bp: 128, right_bp: 128, offset_mode: fixed, jitter_max_bp: 0}
@@ -54,13 +54,14 @@ from entexbert2.build_inputs import (
     PartitionSpec,
     WindowSpec,
     MultiTissuePeakRowSource,
-    BetabinomCountRowSource,
+    HaplotypeCountRowSource,
     build_dataset,
     make_bigwig_label_spec,
     make_column_label_spec,
     log1p_transform,
     identity_transform,
 )
+from entexbert2.personal_seq import parse_chain_file, PersonalGenome
 
 NONE_TISSUE_TOKENS = {None, "null", "NONE", "None", "none", "", "all", "ALL"}
 
@@ -97,8 +98,8 @@ def _build_multi_tissue_peak_source(cfg):
         seed=cfg.get("seed", 42),
     )
 
-def _build_betabinom_source(cfg):
-    return BetabinomCountRowSource(
+def _build_hap_counts_source(cfg):
+    return HaplotypeCountRowSource(
         counts_csv=cfg["path"],
         assay=cfg.get("assay"),
         donor=cfg.get("donor"),
@@ -106,7 +107,7 @@ def _build_betabinom_source(cfg):
 
 ROW_SOURCE_BUILDERS = {
     "multi_tissue_peak": _build_multi_tissue_peak_source,   # Stage 1 (binding trunk)
-    "betabinom_counts": _build_betabinom_source,            # Stage 2 (ASB contrast head)
+    "hap_counts": _build_hap_counts_source,            # Stage 2 (ASB contrast head)
 }
 
 
@@ -150,7 +151,7 @@ def _build_column(cfg, tf):
 def _build_as_class(cfg, tf):
     # Binary allele-specific-binding label (e.g. imbalance_significance, 0/1) read directly
     # from a precomputed source column. task_type="classification" drives the contrast head.
-    # Default column matches the betabinom_counts source's significance column.
+    # Default column matches the hap_counts source's significance column.
     return make_column_label_spec(
         column=cfg.get("column", "imbalance_significance"),
         name=cfg.get("name", "as_class"),
@@ -359,6 +360,36 @@ def parse_args():
     return p.parse_args()
 
 
+def build_personal_genomes(seqcfg):
+    """Construct {donor: PersonalGenome} from a personal `sequence:` config section.
+
+    Per donor:
+        hap_fastas: {ENC-00X: [hap1.fa, hap2.fa]}          # hap1 = maternal, hap2 = paternal (README)
+        chains:     {ENC-00X: [maternal.chain, paternal.chain]}
+    hap1 FASTA pairs with the maternal chain, hap2 with the paternal chain; PersonalGenome then
+    re-derives the hap1<->hap2 assignment PER LOCUS by allele-match, so the sex-chromosome
+    exceptions in the personal-genome README need no special handling here.
+    """
+    hap_fastas = seqcfg.get("hap_fastas") or {}
+    chains = seqcfg.get("chains") or {}
+    donors = sorted(set(hap_fastas) & set(chains))
+    if not donors:
+        raise ValueError("sequence.mode='personal' needs matching donors in "
+                         "sequence.hap_fastas and sequence.chains.")
+    genomes = {}
+    for d in donors:
+        h1_fa, h2_fa = hap_fastas[d]
+        mat_chain, pat_chain = chains[d]
+        genomes[d] = PersonalGenome(
+            parse_chain_file(mat_chain), Fasta(h1_fa),
+            parse_chain_file(pat_chain), Fasta(h2_fa),
+            donor=d,
+        )
+        print(f"  personal[{d}]: hap1<-{os.path.basename(h1_fa)}/{os.path.basename(mat_chain)}  "
+              f"hap2<-{os.path.basename(h2_fa)}/{os.path.basename(pat_chain)}")
+    return genomes
+
+
 def run_from_config(cfg, ref_fasta=None, output_dir=None):
     """
     Build a dataset from a config dict. Importable for notebooks/tests.
@@ -403,6 +434,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         raise ValueError(f"balance.apply_to must be 'all' or 'train', got {balance_split!r}.")
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
+    sequence_mode = cfg.get("sequence", {}).get("mode", "reference")   # "reference" (hg38+swap) | "personal"
     depth_col = cfg.get("depth_col")   # Stage 2: "n" -> privileged precision weight (w = n_eff)
     count_cols = list(cfg.get("count_cols") or [])  # optional: extra columns carried into train.csv
 
@@ -474,6 +506,11 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     print("Loading reference FASTA...")
     ref = Fasta(ref_fasta_path)
 
+    personal_genomes = None
+    if sequence_mode == "personal":
+        print("Building personal genomes (chain lift + haplotype FASTAs)...")
+        personal_genomes = build_personal_genomes(cfg.get("sequence", {}))
+
     df = build_dataset(
         row_source=source,
         output_dir=output_dir,
@@ -481,6 +518,8 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         primary_label=primary_label,
         window_spec=window_spec,
         input_mode=input_mode,
+        sequence_mode=sequence_mode,
+        personal_genomes=personal_genomes,
         balance_spec=balance_spec,
         balance_split=balance_split,
         split_ratio=split_ratio,

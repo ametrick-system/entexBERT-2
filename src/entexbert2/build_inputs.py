@@ -1266,7 +1266,7 @@ class HaplotypeCountRowSource(RowSource):
         if missing:
             raise ValueError(
                 f"hap_counts source: {self.counts_csv} missing columns {missing}. "
-                f"Expected the output of build_betabinom_counts.py. Have: {sorted(df.columns)}")
+                f"Expected the output of build_hap_counts.py. Have: {sorted(df.columns)}")
         # optional donor/assay filters
         if self.donor is not None and "donor" in df.columns:
             df = df[df["donor"] == self.donor]
