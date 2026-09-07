@@ -655,6 +655,8 @@ def add_sequence_inputs(
     df: pd.DataFrame,
     ref_fasta,
     input_mode: str = "ref_single",
+    sequence_mode: str = "reference",
+    personal_genomes: Optional[dict] = None,
 ) -> pd.DataFrame:
     """
     Add sequence columns according to input_mode, plus per-sequence anchor/extent metadata
@@ -680,6 +682,15 @@ def add_sequence_inputs(
 
     needs_hap1 = input_mode in {"hap1_single", "hap_pair", "ref_hap1_pair"}
     needs_hap2 = input_mode in {"hap2_single", "hap_pair", "ref_hap2_pair"}
+
+    if sequence_mode not in {"reference", "personal"}:
+        raise ValueError(f"sequence_mode must be 'reference' or 'personal', got {sequence_mode!r}.")
+    if sequence_mode == "personal":
+        if not personal_genomes:
+            raise ValueError("sequence_mode='personal' requires personal_genomes={donor: PersonalGenome}.")
+        if not (needs_hap1 or needs_hap2):
+            raise ValueError(f"sequence_mode='personal' needs a haplotype input_mode "
+                             f"(got {input_mode!r}, which extracts no haplotype).")
 
     has_alleles = ("hap1_allele" in df.columns) and ("hap2_allele" in df.columns)
     if (needs_hap1 or needs_hap2) and not has_alleles:
@@ -710,7 +721,10 @@ def add_sequence_inputs(
     anchor1s, fstart1s, fend1s = [], [], []
     anchor2s, fstart2s, fend2s = [], [], []
 
-    for _, row in df.iterrows():
+    keep_pos = []
+    n_dropped_personal = 0 # dropped rows in reference -> personal liftover
+
+    for pos, (_, row) in enumerate(df.iterrows()):
         chrom = row["chr"]
         start = int(row["bed_start"])
         end = int(row["bed_end"])
@@ -746,8 +760,23 @@ def add_sequence_inputs(
 
         hap1_allele = str(row["hap1_allele"]).upper() if has_alleles else None
         hap2_allele = str(row["hap2_allele"]).upper() if has_alleles else None
-        hap1_seq = make_haplotype_sequence(ref_seq, snv_offset, hap1_allele) if needs_hap1 else None
-        hap2_seq = make_haplotype_sequence(ref_seq, snv_offset, hap2_allele) if needs_hap2 else None
+
+        if sequence_mode == "personal": # windows will contain all personal variants
+            donor = str(row["donor"]) if "donor" in df.columns else next(iter(personal_genomes))
+            pg = personal_genomes.get(donor)
+            if pg is None:
+                n_dropped_personal += 1
+                continue
+            res, _err = pg.pair_windows(chrom, snv, hap1_allele, hap2_allele,
+                                        left=snv_offset, right=(end - snv - 1))
+            if res is None:
+                n_dropped_personal += 1 # unliftable (variant in a gap) or allele-mismatched loci dropped
+                continue
+            hap1_seq = res["seq1"] if needs_hap1 else None
+            hap2_seq = res["seq2"] if needs_hap2 else None
+        else:
+            hap1_seq = make_haplotype_sequence(ref_seq, snv_offset, hap1_allele) if needs_hap1 else None
+            hap2_seq = make_haplotype_sequence(ref_seq, snv_offset, hap2_allele) if needs_hap2 else None
 
         # Per-sequence offset/extent:
         # Substitution-only for now, so the anchor offset is snv_offset in every sequence;
@@ -805,6 +834,20 @@ def add_sequence_inputs(
             anchor2s.append(a2)
             fstart2s.append(s2)
             fend2s.append(e2)
+        
+        keep_pos.append(pos)
+
+    # personal mode may have dropped rows (unliftable / allele-mismatch); report + subset so the
+    # sequence lists (built only for kept rows) align with df before the column assignments
+    if sequence_mode == "personal":
+        tot = sum(g.stats["total"] for g in personal_genomes.values())
+        ok = sum(g.stats["ok"] for g in personal_genomes.values())
+        rate = (ok / tot) if tot else float("nan")
+        print(f"[personal] kept {len(keep_pos)}/{len(df)} rows "
+              f"(dropped {n_dropped_personal} unliftable/allele-mismatch); "
+              f"allele-match rate={rate:.3f} (low => hetSNV vs vcf2diploid reference mismatch).")
+    if len(keep_pos) < len(df):
+        df = df.iloc[keep_pos].reset_index(drop=True)
 
     if input_mode in single_modes:
         df["sequence"] = sequences
@@ -1195,23 +1238,14 @@ class RowSource:
     def describe(self) -> dict:
         return {"source_type": self.source_type, "has_variants": self.has_variants}
 
-class BetabinomCountRowSource(RowSource):
+class HaplotypeCountRowSource(RowSource):
     """
-    Beta-binomial count row source: one row per (donor, locus) with pre-summed allelic read counts, for the supervised beta-binomial ASB task
-
-    Reads the aggregated CSV produced by build_betabinom_counts.py (reads summed across tissues per unique haplotype-sequence locus)
-    
-    This source only carries coordinates + alleles + counts; the hap1/hap2 windows are built downstream
-    by add_sequence_inputs in hap_pair mode, and k/n reach train.csv via the count_cols
+    Haplotype count row source: one row per (donor, locus) with pre-summed allelic read counts, for the supervised ASB task
 
     Required CSV columns: chr, ref_start, ref_allele, hap1_allele, hap2_allele, k, n
     Optional (carried if present): imbalance_significance, donor, assay
-
-    supported_input_modes is "hap_pair" only:
-    the beta-binomial sign convention (mu = head(hap1) - head(hap2) = logit P(hap1), which matches k=hap1_count)
-    holds only when the head's two windows are (hap1, hap2)
     """
-    source_type = "betabinom_counts"
+    source_type = "hap_counts"
     has_variants = True
     supported_input_modes = {"hap_pair"}
 
@@ -1231,7 +1265,7 @@ class BetabinomCountRowSource(RowSource):
         missing = [c for c in need if c not in df.columns]
         if missing:
             raise ValueError(
-                f"betabinom_counts source: {self.counts_csv} missing columns {missing}. "
+                f"hap_counts source: {self.counts_csv} missing columns {missing}. "
                 f"Expected the output of build_betabinom_counts.py. Have: {sorted(df.columns)}")
         # optional donor/assay filters
         if self.donor is not None and "donor" in df.columns:
@@ -1241,7 +1275,7 @@ class BetabinomCountRowSource(RowSource):
             df = df[df["assay"].astype(str).str.contains(self.assay, case=False, na=False)]
         df = df.reset_index(drop=True)
         if df.empty:
-            raise ValueError(f"betabinom_counts source: no rows after donor/assay filter "
+            raise ValueError(f"hap_counts source: no rows after donor/assay filter "
                              f"(donor={self.donor!r}, assay={self.assay!r}).")
         df["ref_start"] = df["ref_start"].astype(int)
         df["ref_end"] = df["ref_start"] + 1
@@ -1250,7 +1284,7 @@ class BetabinomCountRowSource(RowSource):
         df["n"] = df["n"].astype(float)
         bad = int(((df["k"] < 0) | (df["n"] < df["k"]) | (df["n"] <= 0)).sum())
         if bad:
-            raise ValueError(f"betabinom_counts source: {bad} rows violate 0<=k<=n, n>0.")
+            raise ValueError(f"hap_counts source: {bad} rows violate 0<=k<=n, n>0.")
         return df
 
     def describe(self) -> dict:
@@ -1530,6 +1564,8 @@ def build_dataset(
     primary_label: LabelSpec,
     window_spec: WindowSpec,
     input_mode: str = "hap_pair",
+    sequence_mode: str = "reference",
+    personal_genomes: Optional[dict] = None,
     balance_spec: Optional[BalanceSpec] = None,
     balance_split: str = "all",
     split_ratio=(0.8, 0.1, 0.1),
@@ -1585,7 +1621,8 @@ def build_dataset(
         )
 
     df = add_label_columns(df, primary_label=primary_label)
-    df = add_sequence_inputs(df, ref_fasta=ref_fasta, input_mode=input_mode)
+    df = add_sequence_inputs(df, ref_fasta=ref_fasta, input_mode=input_mode,
+                             sequence_mode=sequence_mode, personal_genomes=personal_genomes)
     df = add_locus_and_example_ids(df)
 
     split_col = None
