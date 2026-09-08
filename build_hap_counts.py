@@ -58,12 +58,16 @@ def main():
     df["hap2_count"] = df.apply(lambda r: base_count(r, "hap2_allele"), axis=1)
     df["imbalance_significance"] = df["imbalance_significance"].astype(int)
 
+    # per-row reads in this tissue, counted only when this tissue itself called AS
+    df["as_reads"] = (df["hap1_count"] + df["hap2_count"]) * (df["imbalance_significance"] == 1)
+
     # tissue pool to form aggregated (donor, locus) entries
     key = ["chr", "ref_start", "ref_allele", "hap1_allele", "hap2_allele", "donor"]
     agg = (df.groupby(key, observed=True)
              .agg(k=("hap1_count", "sum"),
                   hap2_reads=("hap2_count", "sum"),
                   imbalance_significance=("imbalance_significance", "max"),
+                  n_as_reads=("as_reads", "sum"),
                   n_tissues=("tissue", "nunique"))
              .reset_index())
     agg["k"] = agg["k"].round().astype(int)
@@ -75,8 +79,11 @@ def main():
     agg = agg[agg["n"] >= a.min_total_reads].reset_index(drop=True)
     agg["total_reads"] = agg["n"]
     agg["ref_allele_ratio"] = np.where(agg["n"] > 0, agg["k"] / agg["n"], np.nan)
+    agg["n_as_reads"] = agg["n_as_reads"].round().astype(int)
+    # weight_depth = depth of the evidence for the label: AS-calling-tissue reads for positives, total pooled reads for negatives
+    agg["weight_depth"] = np.where(agg["imbalance_significance"] == 1, agg["n_as_reads"], agg["n"])
     cols = ["chr", "ref_start", "ref_allele", "hap1_allele", "hap2_allele",
-            "donor", "k", "n", "total_reads", "ref_allele_ratio",
+            "donor", "k", "n", "total_reads", "ref_allele_ratio", "n_as_reads", "weight_depth",
             "imbalance_significance", "assay", "n_tissues"]
     agg[cols].to_csv(a.out, index=False)
 
