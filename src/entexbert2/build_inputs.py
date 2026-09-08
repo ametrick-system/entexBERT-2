@@ -1657,7 +1657,7 @@ def build_dataset(
                   "tissue", "donor", "assay"]
     # Carry the AS-call columns so a regression run can be mapped back to imbalance_significance
     # post-hoc (threshold |prediction| -> AUPRC vs the binary call), and depth for stratification
-    meta_cols += ["imbalance_significance", "ref_allele_ratio", "total_reads"]
+    meta_cols += ["imbalance_significance", "ref_allele_ratio", "total_reads", "k", "n_tissues"]
 
     # Binding-regression reliability columns (multi_tissue_peak); skipped when absent
     meta_cols += ["binding_label_raw", "n_tissues_called", "cross_tissue_std",

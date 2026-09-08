@@ -78,11 +78,11 @@ def get_transform_fn(name):
     raise ValueError(f"Unsupported transform: {name!r}")
 
 # ---------------------------------------------------------------------------
-# Row source registry  (extension point #1)
+# Row source registry
 # ---------------------------------------------------------------------------
 
 def _build_multi_tissue_peak_source(cfg):
-    tracks = cfg["tissue_tracks"]          # [{tissue, peak_path, bigwig_path}, ...]
+    tracks = cfg["tissue_tracks"] # [{tissue, peak_path, bigwig_path}, ...]
     return MultiTissuePeakRowSource(
         datasets=tracks,
         assay=cfg["assay"],
@@ -107,15 +107,14 @@ def _build_hap_counts_source(cfg):
 
 ROW_SOURCE_BUILDERS = {
     "multi_tissue_peak": _build_multi_tissue_peak_source,   # Stage 1 (binding trunk)
-    "hap_counts": _build_hap_counts_source,            # Stage 2 (ASB contrast head)
+    "hap_counts": _build_hap_counts_source,                 # Stage 2 (ASB contrast head)
 }
 
-
 # ---------------------------------------------------------------------------
-# Label registry  (extension point #2)
+# Label registry
 # ---------------------------------------------------------------------------
 
-# Default post-fn transform per label type.
+# Default post-fn transform per label type
 _DEFAULT_TRANSFORM = {
     "bigwig": "log1p",
     "column": "identity",
@@ -123,10 +122,8 @@ _DEFAULT_TRANSFORM = {
     "multitrack": "log1p",      # per-tissue fold-change, log1p like the mean binding target
 }
 
-
 def _label_name(cfg, fallback):
     return cfg.get("name") or cfg.get("target_name") or fallback
-
 
 def _build_bigwig(cfg, tf):
     return make_bigwig_label_spec(
@@ -141,12 +138,10 @@ def _build_bigwig(cfg, tf):
         exact=True,
     )
 
-
 def _build_column(cfg, tf):
     return make_column_label_spec(
         column=cfg["column"], name=cfg.get("name"), transform_fn=tf
     )
-
 
 def _build_as_class(cfg, tf):
     # Binary allele-specific-binding label (e.g. imbalance_significance, 0/1) read directly
