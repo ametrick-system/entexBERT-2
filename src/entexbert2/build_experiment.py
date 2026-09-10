@@ -184,7 +184,6 @@ LABEL_BUILDERS = {
     "multitrack": _build_multitrack,       # Stage 1 multi-track binding (one target per tissue)
 }
 
-
 def build_label(cfg):
     ltype = cfg["type"]
     if ltype not in LABEL_BUILDERS:
@@ -192,13 +191,11 @@ def build_label(cfg):
     tf = get_transform_fn(cfg.get("transform", _DEFAULT_TRANSFORM.get(ltype, "identity")))
     return LABEL_BUILDERS[ltype](cfg, tf)
 
-
 def build_source(cfg):
     stype = cfg["type"]
     if stype not in ROW_SOURCE_BUILDERS:
         raise ValueError(f"Unknown row_source type {stype!r}. Known: {sorted(ROW_SOURCE_BUILDERS)}.")
     return ROW_SOURCE_BUILDERS[stype](cfg)
-
 
 # ---------------------------------------------------------------------------
 # Config loading / helpers
@@ -217,7 +214,6 @@ def load_config(path):
             return json.load(f)
     raise ValueError(f"Unsupported config extension {ext!r}; use .yaml/.yml/.json.")
 
-
 def load_exclude_loci(meta_paths):
     import pandas as pd
     loci = set()
@@ -234,10 +230,9 @@ def build_partition_spec(cfg):
     the block is absent or partition.enabled is false (in which case build_dataset falls back to
     the group-shuffle split — fully backward-compatible).
 
-    Nothing about any specific dataset lives in code: the held-out test chromosome(s), bin size,
-    salt, and active fold all come from the config. `fold_assignment` maps chromosome -> fold index;
-    the chromosome whose fold index == fold_id becomes the TEST set, the rest are hashed into
-    train/dev. Chromosome keys are coerced to str so YAML ints (e.g. `1:`) match the 'chr' column.
+    `fold_assignment` maps chromosome -> fold index
+    (the chromosome whose fold index == fold_id becomes the TEST set),
+    the rest are hashed into train/dev
 
     Config block (all keys optional; shown with PartitionSpec defaults):
         partition:
@@ -285,11 +280,10 @@ def resolve_head(head, primary_label):
     head_hidden_size, and for classification proj_dim). The 2-stage ASB model supports:
       - task="regression"     : Stage-1 binding trunk, single-window score (num_labels=1
                                 scalar, or T tissue tracks for multi-track supervision)
-      - task="classification"  : Stage-2 ASB contrast head, s=||P(h1)-P(h2)||, p=sigma(a·s+b)
-    task is authoritative from the label's task_type and also selects the model head TOPOLOGY.
+      - task="classification" : Stage-2 ASB contrast head, s=||P(h1)-P(h2)||, p=sigma(a·s+b)
     """
     head = dict(head or {})
-    task = primary_label.task_type  # authoritative: comes from the label
+    task = primary_label.task_type  # comes from the label
 
     if "task" in head and head["task"] != task:
         raise ValueError(
@@ -302,16 +296,14 @@ def resolve_head(head, primary_label):
         raise ValueError(
             f"Supported tasks: 'regression' | 'classification'; got {task!r}."
         )
-    # Head width. Classification always emits ONE P(ASB) logit. Regression emits one scalar
-    # (single-track Stage-1 binding) UNLESS the primary label is multi-track, in which
-    # case the head width is T = number of tissue tracks (validated by the label builder).
+    # Head width
     n_tracks = getattr(primary_label, "multitrack_num_tracks", None)
     if task == "classification":
         if head.get("num_labels", 1) != 1:
             print(f"  note: classification forces num_labels=1 (config had {head.get('num_labels')}).")
         head["num_labels"] = 1
     elif n_tracks is not None:
-        # multi-track Stage-1 binding: T outputs, one per tissue.
+        # multi-track Stage-1 binding: T outputs, one per tissue
         head["num_labels"] = int(n_tracks)
         head["multitrack"] = True
     else:
@@ -322,10 +314,9 @@ def resolve_head(head, primary_label):
     head.setdefault("head_num_layers", 1)
     head.setdefault("head_hidden_size", -1)
     if task == "classification":
-        # projection dim d for the shared P: hidden -> d used to form the contrast distance.
+        # projection dim d for the shared P: hidden -> d used to form the contrast distance
         head.setdefault("proj_dim", 128)
     return head
-
 
 def emit_finetune_settings(head, output_dir, primary_name, depth_col):
     """Print the finetune settings recorded for this dataset (verified flags only)."""
@@ -336,12 +327,11 @@ def emit_finetune_settings(head, output_dir, primary_name, depth_col):
         print(f"  --head_hidden_size {head['head_hidden_size']}")
     if head["task"] == "classification":
         print(f"  --proj_dim {head.get('proj_dim', 128)}   (shared projection dim d for the contrast distance)")
-        print(f"  --balanced_sampler True   (class-balanced batches: AS is rare, ~5-6% positive)")
+        print(f"  --balanced_sampler True   (class-balanced batches)")
     if depth_col:
-        print(f"  --neff_s <s>   (privileged precision weight from '{depth_col}' -> depth; LUPI)")
+        print(f"  --neff_s <s>   (privileged precision weight from '{depth_col}' -> depth)")
     print(f"  trainer data path: {output_dir}")
     print(f"  primary label column: {primary_name}")
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -354,16 +344,17 @@ def parse_args():
     p.add_argument("--output_dir", default=None, help="Override output_dir from the config")
     return p.parse_args()
 
-
 def build_personal_genomes(seqcfg):
-    """Construct {donor: PersonalGenome} from a personal `sequence:` config section.
+    """Construct {donor: PersonalGenome} from a personal `sequence:` config section
 
     Per donor:
-        hap_fastas: {ENC-00X: [hap1.fa, hap2.fa]}          # hap1 = maternal, hap2 = paternal (README)
+        hap_fastas: {ENC-00X: [hap1.fa, hap2.fa]} 
         chains:     {ENC-00X: [maternal.chain, paternal.chain]}
-    hap1 FASTA pairs with the maternal chain, hap2 with the paternal chain; PersonalGenome then
-    re-derives the hap1<->hap2 assignment PER LOCUS by allele-match, so the sex-chromosome
-    exceptions in the personal-genome README need no special handling here.
+
+    For entex personal genomes v2:
+    hap1 -> maternal chain
+    hap2 -> paternal chain
+    PersonalGenome re-derives the hap1<->hap2 assignment for sex-chromosomes per locus by allele-match (to handle edge cases)
     """
     hap_fastas = seqcfg.get("hap_fastas") or {}
     chains = seqcfg.get("chains") or {}
@@ -384,13 +375,11 @@ def build_personal_genomes(seqcfg):
               f"hap2<-{os.path.basename(h2_fa)}/{os.path.basename(pat_chain)}")
     return genomes
 
-
 def run_from_config(cfg, ref_fasta=None, output_dir=None):
     """
-    Build a dataset from a config dict. Importable for notebooks/tests.
-
-    ref_fasta / output_dir override the config when provided.
-    Returns the final DataFrame.
+    Build a dataset from a config dict,
+    ref_fasta / output_dir override the config when provided,
+    returns the final DataFrame; importable for notebooks/tests!
     """
     name = cfg.get("experiment", "experiment")
     ref_fasta_path = ref_fasta or cfg["ref_fasta"]
@@ -400,6 +389,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     source = build_source(cfg["row_source"])
     primary_label = build_label(cfg["primary_label"])
 
+    # window config
     wcfg = cfg.get("window", {})
     window_spec = WindowSpec(
         left_bp=wcfg["left_bp"],
@@ -409,6 +399,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         jitter_max_bp=wcfg.get("jitter_max_bp", 0),
     )
 
+    # split config
     scfg = cfg.get("split", {})
     seed = scfg.get("seed", 42)
     split_mode = scfg.get("mode", "train_dev_test")
@@ -418,25 +409,23 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
     exclude_loci = load_exclude_loci(scfg.get("exclude_loci_meta")) or None
     dedup_across_splits = scfg.get("dedup_across_splits", True)
 
+    # balance config
     bcfg = cfg.get("balance", {})
     balance_spec = BalanceSpec(
         strategy=bcfg.get("strategy", "none"),
         label_col=bcfg.get("label_col", "imbalance_significance"),
         random_state=seed,
     )
-    balance_split = bcfg.get("apply_to", "all")  # "all" = balance before split; "train" = train only
+    balance_split = bcfg.get("apply_to", "all")  # "all" = balance before split; "train" = balance train split only
     if balance_split not in {"all", "train"}:
         raise ValueError(f"balance.apply_to must be 'all' or 'train', got {balance_split!r}.")
 
     input_mode = cfg.get("sequence", {}).get("input_mode", "hap_pair")
     sequence_mode = cfg.get("sequence", {}).get("mode", "reference")   # "reference" (hg38+swap) | "personal"
-    depth_col = cfg.get("depth_col")   # Stage 2: "n" -> privileged precision weight (w = n_eff)
+    depth_col = cfg.get("depth_col")   # Stage 2: privileged precision weight (w = n_eff)
     count_cols = list(cfg.get("count_cols") or [])  # optional: extra columns carried into train.csv
 
-    # Multi-track Stage-1: carry the per-tissue target + mask columns into train.csv via the
-    # count_cols passthrough (they need no transform here; build_inputs emits them log1p-scaled).
-    # This is why build_dataset/split_and_write_csvs need no change: the track columns ride the
-    # existing count_cols channel untouched, exactly like Stage-2's raw count columns.
+    # Multi-track Stage-1: carry the per-tissue target + mask columns into train.csv via the count_cols passthrough
     _mt_y = getattr(primary_label, "multitrack_y_cols", None)
     if _mt_y:
         _mt_m = getattr(primary_label, "multitrack_m_cols", [])
@@ -445,11 +434,11 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
                 count_cols.append(c)
     count_cols = count_cols or None
 
-    # Optional hybrid cross-individual partition (held-out test chrom(s) + hashed genomic bins).
-    # None => fall back to the group-shuffle split. Everything dataset-specific is in the config.
+    # Optional hybrid cross-individual partition (held-out test chrom(s) + hashed genomic bins) for leak-free cross-donor eval
+    # None -> fall back to the group-shuffle split
     partition_spec = build_partition_spec(cfg)
 
-    # Head is derived from the label's task_type (single source of truth).
+    # Head is derived from the label's task_type
     head = resolve_head(cfg.get("head"), primary_label)
 
     print(f"Experiment: {name}")
@@ -471,11 +460,7 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
               f"(overrides group-shuffle)")
     print(f"  output_dir: {output_dir}")
 
-    # Self-documenting manifest = the resolved config + derived head + resolved partition.
-    # partition_resolved captures the FULL fold_assignment actually used, so a run is re-derivable
-    # and a later K-fold sweep just re-runs with a different fold_id.
-    # Multi-track Stage-1: emit a sidecar naming each track's tissue (order == y_track_* index),
-    # so a run is self-describing and per-track predictions can be mapped back to tissues.
+    # Save all the experiments's actual setup parameters, dataset split info, for reproducibility
     _mt_y = getattr(primary_label, "multitrack_y_cols", None)
     if _mt_y:
         _tissues = list(getattr(source, "tissues", []))
@@ -529,17 +514,15 @@ def run_from_config(cfg, ref_fasta=None, output_dir=None):
         count_cols=count_cols,
     )
 
-    print(f"\nDone. Final rows: {len(df)}")
+    print(f"\nDone building! Final rows: {len(df)}")
     emit_finetune_settings(head, output_dir, primary_label.name, depth_col)
     return df
-
 
 def main():
     args = parse_args()
     cfg = load_config(args.config)
     cfg.setdefault("experiment", os.path.splitext(os.path.basename(args.config))[0])
     run_from_config(cfg, ref_fasta=args.ref_fasta, output_dir=args.output_dir)
-
 
 if __name__ == "__main__":
     main()

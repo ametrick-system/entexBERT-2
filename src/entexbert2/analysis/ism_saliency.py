@@ -184,7 +184,10 @@ def main():
 
     arr = assemble(seqs, index, scores, task)
     tb = a.twin_baseline if task == "classification" else "n/a"
-    np.savez_compressed(a.out, seqs=np.array(seqs), task=task, twin_baseline=tb, **arr)
+    # carry per-window provenance (coords + depth + label) in seqs order, so an external perVariant
+    # prediction can be joined by chr+anchor to split TP/FP/TN/FN (plot_aggregate --score_csv).
+    meta = {c: df[c].to_numpy() for c in ("chr", "anchor", "total_reads", "as_label") if c in df.columns}
+    np.savez_compressed(a.out, seqs=np.array(seqs), task=task, twin_baseline=tb, **arr, **meta)
     imp = arr["importance"]
     print(f"[ISM] saved -> {a.out} | task={task} | importance range [{imp.min():.3f},{imp.max():.3f}] "
           f"mean per-window peak {imp.max(axis=1).mean():.3f}")

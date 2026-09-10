@@ -25,6 +25,8 @@ def main():
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--max_points", type=int, default=8000, help="subsample for legible scatter")
+    ap.add_argument("--heatmap", action="store_true",
+                    help="render a log-density hexbin instead of a scatter (de-emphasizes outliers)")
     ap.add_argument("--tf_label", default="binding", help="TF name for the title (e.g. CTCF, EP300)")
     ap.add_argument("--out", default="binding_pred_vs_actual.png")
     a = ap.parse_args()
@@ -44,25 +46,28 @@ def main():
           + (f"  sigma[min={sigma.min():.3f} med={np.median(sigma):.3f} max={sigma.max():.3f}]"
              if sigma is not None else "  (no sigma head)"))
 
-    # subsample for a legible scatter (keep the fit stats on the full set, reported above)
-    rng = np.random.default_rng(1)
-    idx = rng.choice(len(y), min(a.max_points, len(y)), replace=False)
-    yp, mp = y[idx], mu[idx]
-    sp = sigma[idx] if sigma is not None else None
-
-    fig, ax = plt.subplots(figsize=(4.6, 4.4), dpi=300)
-    lo = float(min(yp.min(), mp.min())); hi = float(max(yp.max(), mp.max()))
+    lo = float(min(y.min(), mu.min())); hi = float(max(y.max(), mu.max()))
     pad = 0.04 * (hi - lo)
-    ax.plot([lo-pad, hi+pad], [lo-pad, hi+pad], color="#999999", lw=1.0,
-            ls="--", zorder=1, label="y = x")
-    if sp is not None:
-        sc = ax.scatter(yp, mp, c=sp, s=7, alpha=0.45, linewidths=0,
-                        cmap="viridis", zorder=2)
-        cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.03)
-        cb.set_label("predicted $\\sigma$ (uncertainty)", fontsize=7)
-        cb.ax.tick_params(labelsize=6)
+    fig, ax = plt.subplots(figsize=(4.8, 4.6), dpi=300)
+    ax.plot([lo-pad, hi+pad], [lo-pad, hi+pad], color="#3a3a3a", lw=1.0,
+            ls="--", zorder=3, label="y = x")
+    if a.heatmap:
+        from matplotlib.colors import LogNorm
+        hb = ax.hexbin(y, mu, gridsize=55, cmap="magma_r", norm=LogNorm(),
+                       mincnt=1, extent=(lo, hi, lo, hi), zorder=2)   # full set, density
+        cb = fig.colorbar(hb, ax=ax, fraction=0.046, pad=0.03)
+        cb.set_label("loci per bin (log)", fontsize=7); cb.ax.tick_params(labelsize=6)
     else:
-        ax.scatter(yp, mp, s=7, alpha=0.4, linewidths=0, color="#1f3a5f", zorder=2)
+        rng = np.random.default_rng(1)
+        idx = rng.choice(len(y), min(a.max_points, len(y)), replace=False)
+        yp, mp = y[idx], mu[idx]
+        sp = sigma[idx] if sigma is not None else None
+        if sp is not None:
+            sc = ax.scatter(yp, mp, c=sp, s=7, alpha=0.45, linewidths=0, cmap="viridis", zorder=2)
+            cb = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.03)
+            cb.set_label("predicted $\\sigma$ (uncertainty)", fontsize=7); cb.ax.tick_params(labelsize=6)
+        else:
+            ax.scatter(yp, mp, s=7, alpha=0.4, linewidths=0, color="#1f3a5f", zorder=2)
 
     ax.set_xlim(lo-pad, hi+pad); ax.set_ylim(lo-pad, hi+pad)
     ax.set_aspect("equal", adjustable="box")
