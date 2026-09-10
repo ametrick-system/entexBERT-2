@@ -15,7 +15,7 @@ import argparse, itertools, sys
 import pandas as pd, numpy as np
 
 # genome-level policy (TF-INDEPENDENT): special-regime chromosomes to always exclude.
-SPECIAL_DEFAULT = ["chrX", "chrY", "chr6",                    # sex + MHC/HLA
+SPECIAL_DEFAULT = ["chrX", "chrY", "chr6",                       # sex + MHC/HLA
                    "chr13", "chr14", "chr15", "chr21", "chr22"]  # acrocentric (rDNA/satellite)
 
 def natural_key(c):

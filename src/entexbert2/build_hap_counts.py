@@ -17,7 +17,7 @@ To run:
       --hetsnv_tsv /path/to/hetsnv_tsv \
       --assay assay_name --out /path/to/out.csv
 """
-import argparse
+import argparse, re
 import numpy as np, pandas as pd
 
 _BASECOL = {"A": "cA", "C": "cC", "G": "cG", "T": "cT"}
@@ -44,7 +44,9 @@ def main():
     for ch in pd.read_csv(a.hetsnv_tsv, sep="\t", usecols=lambda c: c in usecols, chunksize=1_000_000):
         n_rows += len(ch)
         if a.assay and a.assay.upper() != "ALL":
-            ch = ch[ch["assay"].astype(str).str.contains(a.assay, case=False, na=False)]
+            # fix unwanted prefix match (POLR2A and POLR2AphosphoS5)
+            pat = re.escape(a.assay) + r"(?![A-Za-z0-9])"
+            ch = ch[ch["assay"].astype(str).str.contains(pat, case=False, na=False, regex=True)]
         if len(ch):
             keep.append(ch)
     df = (pd.concat(keep, ignore_index=True) if keep
