@@ -27,7 +27,6 @@ from typing import Optional
 import torch
 import transformers
 
-# The trained model class (importing entexbert2.model is side-effect-free).
 from entexbert2.model import entexBERT2ForSequencePrediction
 
 # ---------------------------------------------------------------------------
@@ -35,7 +34,7 @@ from entexbert2.model import entexBERT2ForSequencePrediction
 # ---------------------------------------------------------------------------
 
 def load_run_config(checkpoint_dir: str) -> dict:
-    """Read run_config.json written by the trainer. Errors clearly if absent."""
+    """Read run_config.json written by the trainer. Errors clearly if absent"""
     path = os.path.join(checkpoint_dir, "run_config.json")
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -46,15 +45,13 @@ def load_run_config(checkpoint_dir: str) -> dict:
     with open(path) as f:
         return json.load(f)
 
-
 def apply_overrides(run_config: dict, overrides: dict) -> dict:
-    """Override run_config fields with any non-None values (e.g. from CLI)."""
+    """Override run_config fields with any non-None values (from CLI)"""
     rc = dict(run_config)
     for k, v in (overrides or {}).items():
         if v is not None:
             rc[k] = v
     return rc
-
 
 # ---------------------------------------------------------------------------
 # Weights
@@ -62,8 +59,8 @@ def apply_overrides(run_config: dict, overrides: dict) -> dict:
 
 def find_weights_file(checkpoint_dir: str) -> str:
     """
-    Locate the saved weights. Prefers the top-level save (best model, since the trainer
-    runs with load_best_model_at_end), then falls back to the latest checkpoint-* dir.
+    Locate the saved weights; prefers the top-level save (best model, since the trainer
+    runs with load_best_model_at_end), then falls back to the latest checkpoint-* dir
     """
     candidates = [
         os.path.join(checkpoint_dir, "pytorch_model.bin"),
@@ -88,16 +85,14 @@ def find_weights_file(checkpoint_dir: str) -> str:
         f"or its checkpoint-* subdirectories."
     )
 
-
 def _load_state_dict(weights_path: str) -> dict:
     if weights_path.endswith(".safetensors"):
         from safetensors.torch import load_file
         return load_file(weights_path)
     return torch.load(weights_path, map_location="cpu")
 
-
 def load_model_weights(model: torch.nn.Module, weights_path: str) -> torch.nn.Module:
-    """Load a state dict into model, reporting missing/unexpected keys (don't fail silently)."""
+    """Load a state dict into model, reporting missing/unexpected keys"""
     state_dict = _load_state_dict(weights_path)
     result = model.load_state_dict(state_dict, strict=False)
     missing = list(getattr(result, "missing_keys", []))
@@ -110,18 +105,16 @@ def load_model_weights(model: torch.nn.Module, weights_path: str) -> torch.nn.Mo
     if unexpected:
         print("  first unexpected:", unexpected[:10])
 
-    # Heuristic guard: if the trained head didn't load, the analysis would be meaningless.
-    # The head params differ by task: regression -> main_head.*, classification -> proj.*/dist_*.
+    # If the trained head didn't load, flag if the head params differ from expected by task
     task = getattr(model, "task", "regression")
     head_prefixes = ("main_head",) if task == "regression" else ("proj", "dist_a", "dist_b")
     head_missing = [k for k in missing if k.startswith(head_prefixes)]
     if head_missing:
         raise RuntimeError(
             f"{task} head weights did not load ({head_missing[:5]}...). The checkpoint and the "
-            f"run_config architecture likely disagree. Refusing to run on an untrained head."
+            f"run_config architecture likely disagree. Refusing to run on an untrained head!"
         )
     return model
-
 
 # ---------------------------------------------------------------------------
 # Build / load
@@ -150,7 +143,6 @@ def build_model(run_config: dict, device: str = "cpu") -> torch.nn.Module:
     )
     return model.to(device)
 
-
 def load_tokenizer(run_config: dict):
     return transformers.AutoTokenizer.from_pretrained(
         run_config["model_name_or_path"],
@@ -158,7 +150,6 @@ def load_tokenizer(run_config: dict):
         model_max_length=run_config.get("model_max_length", 512),
         trust_remote_code=True,
     )
-
 
 def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides: dict = None):
     """
@@ -172,9 +163,8 @@ def load_model_and_tokenizer(checkpoint_dir: str, device: str = "cpu", overrides
     tokenizer = load_tokenizer(run_config)
     return model, tokenizer, run_config
 
-
 # ---------------------------------------------------------------------------
-# Inference helper (reuses the model's own backbone + pooling -> no drift)
+# Inference helper (reuses the model's own backbone + pooling)
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()

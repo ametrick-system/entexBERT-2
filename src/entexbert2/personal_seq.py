@@ -110,16 +110,32 @@ def lift_point(chain_index, chrom, pos0):
 # ---------------------------------------------------------------------------------------------
 # Haplotype window extraction (FASTA-agnostic: anything supporting fa[chrom][a:b] -> str)
 # ---------------------------------------------------------------------------------------------
+_HAP_SUFFIXES = ("_maternal", "_paternal", "_hap1", "_hap2")
+
+
+def _base_chrom(name):
+    """Strip a haplotype/parent tag: 'chr1_maternal'->'chr1', 'chr1_hap1'->'chr1', 'chr1'->'chr1'."""
+    for suf in _HAP_SUFFIXES:
+        if name.endswith(suf):
+            return name[: -len(suf)]
+    return name
+
+
 def _resolve_chrom(fasta, q_name):
-    """The chain query is e.g. 'chr1_maternal'; the haplotype FASTA may use that or a renamed
-    'chr1'. Return the key present in the FASTA, or None."""
-    keys = set(getattr(fasta, "keys", lambda: [])())
-    if q_name in keys:
+    """Map a chain query contig (e.g. 'chr1_maternal') to a haplotype-FASTA key. The FASTA may use
+    the same name, a bare 'chr1', or a DIFFERENT haplotype tag -- the entex v2 genomes label chain
+    query 'chr1_maternal'/'chr1_paternal' as FASTA 'chr1_hap1'/'chr1_hap2'. Resolve by matching on
+    the BASE chromosome after stripping either side's tag. Returns the FASTA key, or None (also None
+    if the base chrom is ambiguous across keys, which cannot happen for a single-haplotype FASTA)."""
+    keys = list(getattr(fasta, "keys", lambda: [])())
+    kset = set(keys)
+    if q_name in kset:                                  # exact match (same naming)
         return q_name
-    for suf in ("_maternal", "_paternal", "_hap1", "_hap2"):
-        if q_name.endswith(suf) and q_name[: -len(suf)] in keys:
-            return q_name[: -len(suf)]
-    return None
+    base = _base_chrom(q_name)                          # chr1_maternal -> chr1
+    if base in kset:                                    # FASTA uses the bare chrom
+        return base
+    hits = [k for k in keys if _base_chrom(k) == base]  # FASTA tags differently (chr1_maternal -> chr1_hap1)
+    return hits[0] if len(hits) == 1 else None
 
 
 def extract_window(fasta, q_name, q_pos0, left, right):

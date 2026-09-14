@@ -1,47 +1,28 @@
 #!/usr/bin/env python
 """
-In-silico mutagenesis (ISM) saliency for entexBERT-2. Works on ANY checkpoint -- the task is
-read from run_config.json and the scoring target is chosen accordingly:
+Calculates in-silico mutagenesis (ISM) saliency for entexBERT-2 from any checkpoint
 
-  regression  (Stage-1 binding trunk):  single-seq forward, target = binding score mu.
-      delta[w,i,b] = mu(mutate pos i -> b) - mu(ref)          (ref entry = 0)
-      importance[w,i] = -mean_{b!=ref} delta[w,i,b]           (>0 where mutating AWAY hurts
-                        binding -> motif positions; mu is predicted fold-change)
+  regression  (Stage-1 binding trunk):  single-seq forward, target = binding score mu
+    delta[w, i, b] = mu(sequence window w with position i mutated to base b) - mu(reference sequence window w)
+    => importance[w, i] = -mean_{b != ref nucleotide} delta[w, i, b]
+    * negative sign since mutating away from ref nucleotide hurts binding 
+        (so delta[w, i, b] < 0 but should have importance[w, i] > 0) *
 
-  classification (Stage-2 ASB head, SFT-head OR no-SFT-head): TWIN forward. We mutate window1
-      and HOLD window2 = the unmutated reference window, then score the ASB logit
-      ell = a*||z1 - z2|| + b. Baseline ell(ref,ref) is the minimum contrast (a*0 + b). A base
-      whose mutation the head reads as allele-specific pushes z1 away from z_ref and RAISES ell.
-      delta[w,i,b] = ell(mut,ref) - ell(ref,ref)              (ref entry = 0, delta >= 0-ish)
-      importance[w,i] = +mean_{b!=ref} delta[w,i,b]           (>0 where a variant would create
-                        the largest allelic-binding contrast -> the head's motif-sensitivity map)
-      NOTE: the head is symmetric (||z1-z2||), so ell-ISM is SIGN-BLIND -- it flags positions
-      that CHANGE binding, not the direction. That is exactly right for motif LOCALIZATION
-      (the aggregate-density and logo overlays care about *where*), which is what these figures
-      replicate. A signed head-ISM would need a fixed projection axis; not done here.
-
-Either way the output .npz carries the SAME arrays (onehot/delta/importance/hyp_scores/contrib/
-base_score) so every downstream plotter (aggregate density, logo, MoDISco) is unchanged.
-
-Both re-TOKENIZE each mutant (BPE re-run per mutant -> tokenization-agnostic attribution, the
-whole reason ISM beats gradient/attention here). Runs on the cluster (GPU + checkpoint);
-plot/overlay happens locally from the saved .npz.
-
-MoDISco convention:
-  hyp_scores[w,i,b] = delta[w,i,b] - mean_b delta[w,i,b]  (mean-centered per position; the REF
-                      base carries -mean(delta) = +importance at conserved sites. -delta alone is
-                      WRONG: it's 0 at the ref base, so onehot*(-delta) is all zeros.)
-  contrib[w,i,:]    = onehot[w,i,:] * hyp_scores[w,i,:]
+  classification (Stage-2 ASB head): twin forward
+    ell = a*||z1 - z2|| + b (baseline ell(ref, ref) is minimum contrast)
+    delta[w,i,b] = ell(mut,ref) - ell(ref,ref)
+    importance[w, i] = +mean_{b != ref nucleotide} delta[w, i, b]
+    * positive sign since mutating away from ref nucleotide is likely to create more contrast 
+        (so delta[w, i, b] > 0, which matches importance[w, i] > 0 goal) *
 """
 import argparse, numpy as np, pandas as pd
 
 BASES = "ACGT"
 B2I = {b: i for i, b in enumerate(BASES)}
 
-
+# Ror Stage-1 checkpoints
 def build_mutant_list(seqs):
-    """Flatten [ref, all single mutants] with an index of (win, pos, base_idx); pos=-1 = baseline.
-    Returns single-sequence inputs (regression)."""
+    """Flatten [ref, all single mutants] with an index of (window, pos, base_idx); pos=-1 = baseline"""
     inputs, index = [], []
     for w, s in enumerate(seqs):
         inputs.append(s); index.append((w, -1, -1))
@@ -53,7 +34,7 @@ def build_mutant_list(seqs):
                 index.append((w, i, B2I[b]))
     return inputs, index
 
-
+# For Stage-2 checkpoints
 def build_mutant_pairs(seqs, partners=None):
     """Twin-ISM inputs: mutate window1, HOLD window2 = a fixed partner. Each element is a
     [window1, window2] pair; baseline (pos=-1) is [seq, partner]. Same (win,pos,base) index.
@@ -65,20 +46,18 @@ def build_mutant_pairs(seqs, partners=None):
     inputs, index = [], []
     for w, s in enumerate(seqs):
         p = s if partners is None else partners[w]
-        inputs.append([s, p]); index.append((w, -1, -1))       # baseline: ell(seq, partner)
+        inputs.append([s, p]); index.append((w, -1, -1)) # baseline: ell(seq, partner)
         for i, ch in enumerate(s):
             for b in BASES:
                 if b == ch:
                     continue
-                inputs.append([s[:i] + b + s[i + 1:], p])      # mutate w1, hold w2 = partner
+                inputs.append([s[:i] + b + s[i + 1:], p]) # mutate w1, hold w2 = partner
                 index.append((w, i, B2I[b]))
     return inputs, index
 
 
 def assemble(seqs, index, scores, task):
-    """Flat scores -> per-window onehot / delta / importance / hyp / contrib arrays.
-    task='regression': importance = -mean delta (mutating away hurts binding).
-    task='classification': importance = +mean delta (mutating creates allelic contrast)."""
+    """Flat scores -> per-window onehot / delta / importance / hyp / contrib arrays"""
     N = len(seqs); L = len(seqs[0])
     base = np.full(N, np.nan, dtype=np.float64)
     delta = np.zeros((N, L, 4), dtype=np.float32)
@@ -94,17 +73,14 @@ def assemble(seqs, index, scores, task):
         if i == -1:
             continue
         delta[w, i, b] = sc - base[w]
-    # importance = mean over the 3 non-ref bases (ref entry is 0, so sum/3), sign by task:
-    #   regression     -> -mean (mutating AWAY from a motif base lowers binding => delta<0 => +imp)
-    #   classification -> +mean (a variant at a read-out base RAISES the allelic contrast ell)
+    # importance = mean over the 3 non-ref bases (ref entry is 0, so sum/3), sign by task
     sign = -1.0 if task == "regression" else +1.0
     importance = (sign * delta.sum(axis=2) / 3.0).astype(np.float32)
-    # MoDISco hypothetical contributions: mean-center delta per position (ref base carries -mean).
+    # MoDISco hypothetical contributions: mean-center delta per position (ref base carries -mean)
     hyp = (delta - delta.mean(axis=2, keepdims=True)).astype(np.float32)
     contrib = (onehot * hyp).astype(np.float32)
     return dict(onehot=onehot, delta=delta, importance=importance,
                 hyp_scores=hyp, contrib=contrib, base_score=base.astype(np.float32))
-
 
 def main():
     ap = argparse.ArgumentParser()
@@ -135,7 +111,7 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    from entexbert2.model_io import run_inference, load_run_config   # cluster-only import
+    from entexbert2.model_io import run_inference, load_run_config
 
     task = load_run_config(a.checkpoint_dir).get("task", "regression")
     print(f"[ISM] checkpoint task = {task}  ->  "
@@ -184,14 +160,13 @@ def main():
 
     arr = assemble(seqs, index, scores, task)
     tb = a.twin_baseline if task == "classification" else "n/a"
-    # carry per-window provenance (coords + depth + label) in seqs order, so an external perVariant
-    # prediction can be joined by chr+anchor to split TP/FP/TN/FN (plot_aggregate --score_csv).
+    # carry per-window metadata (coords + depth + label) in seqs order, so an external perVariant
+    # prediction can be joined by chr+anchor to split TP/FP/TN/FN
     meta = {c: df[c].to_numpy() for c in ("chr", "anchor", "total_reads", "as_label") if c in df.columns}
     np.savez_compressed(a.out, seqs=np.array(seqs), task=task, twin_baseline=tb, **arr, **meta)
     imp = arr["importance"]
     print(f"[ISM] saved -> {a.out} | task={task} | importance range [{imp.min():.3f},{imp.max():.3f}] "
           f"mean per-window peak {imp.max(axis=1).mean():.3f}")
-
 
 if __name__ == "__main__":
     main()

@@ -43,8 +43,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from scipy.stats import spearmanr
 
 from entexbert2.model_io import run_inference
-
-_BASECOL = {"A": "cA", "C": "cC", "G": "cG", "T": "cT"}
+from entexbert2.eval_utils import load_hetsnv, seen_bins_from_meta, flag_leaky
 
 
 # ----------------------------------------------------------------------
@@ -143,35 +142,6 @@ def balanced_auroc(score, label, seed=1, n_boot=1000, cover=None, n_qbins=20):
 # ----------------------------------------------------------------------
 # Shared: leakage — collect the SEEN (chr, bin) set from meta sidecars.
 # ----------------------------------------------------------------------
-def seen_bins_from_meta(coord_files, bin_size):
-    seen = set()
-    for path in coord_files or []:
-        if not os.path.exists(path):
-            print(f"[leakage] WARNING: {path} not found; skipping."); continue
-        tc = pd.read_csv(path)
-        chrom_col = "chr" if "chr" in tc.columns else tc.columns[0]
-        pos_col = ("SNV" if "SNV" in tc.columns else "pos" if "pos" in tc.columns
-                   else "anchor" if "anchor" in tc.columns else None)
-        if pos_col is None:
-            print(f"[leakage] {path}: no SNV/pos/anchor column ({list(tc.columns)[:6]}...); skipping.")
-            continue
-        before = len(seen)
-        seen |= set(zip(tc[chrom_col].astype(str), (tc[pos_col].astype(int) // bin_size)))
-        print(f"[leakage] {os.path.basename(path)}: +{len(seen)-before} bins, {len(seen)} seen total")
-    return seen
-
-
-def flag_leaky(df, seen, bin_size, chrom_col, pos_col, pos_is_1based):
-    if not seen:
-        return np.zeros(len(df), dtype=bool)
-    if pos_is_1based:
-        bins = ((df[pos_col].astype(int) - 1) // bin_size)
-    else:
-        bins = (df[pos_col].astype(int) // bin_size)
-    pairs = list(zip(df[chrom_col].astype(str), bins))
-    return np.array([b in seen for b in pairs])
-
-
 # ----------------------------------------------------------------------
 # Loaders
 # ----------------------------------------------------------------------
@@ -183,29 +153,23 @@ def load_adastra(eval_csv):
     return ev
 
 
-def load_hetsnv(path, assay, min_total_reads):
-    usecols = ["chr", "ref_start", "ref_end", "ref_allele", "hap1_allele", "hap2_allele",
-               "donor", "tissue", "assay", "cA", "cC", "cG", "cT",
-               "ref_allele_ratio", "p_betabinom", "imbalance_significance"]
-    df = pd.read_csv(path, sep="\t", usecols=lambda c: c in usecols)
-    if assay and assay.upper() != "ALL":
-        df = df[df["assay"].astype(str).str.contains(assay, case=False, na=False)]
-    df = df.reset_index(drop=True)
-
-    def base_count(row, allele_col):
-        col = _BASECOL.get(str(row[allele_col]).upper())
-        return float(row[col]) if col in row and pd.notna(row[col]) else 0.0
-
-    df["hap1_count"] = df.apply(lambda r: base_count(r, "hap1_allele"), axis=1)
-    df["hap2_count"] = df.apply(lambda r: base_count(r, "hap2_allele"), axis=1)
-    df["total_reads"] = df["hap1_count"] + df["hap2_count"]
-    df["signed_log_count_ratio"] = np.log2((df["hap1_count"] + 0.5) / (df["hap2_count"] + 0.5))
-    if min_total_reads:
-        n0 = len(df)
-        df = df[df["total_reads"] >= min_total_reads].reset_index(drop=True)
-        print(f"[filter] total_reads>={min_total_reads}: {len(df)}/{n0} rows kept")
-    df["label"] = df["imbalance_significance"].astype(int)
-    return df
+def pool_hetsnv_tissues(df):
+    """Pool hetSNV rows per LOCUS across tissues to match the tissue-pooled TRAINING label (hap_counts):
+    sum hap1/hap2 counts, recompute signed_log_count_ratio, label = any-sig (max over the locus's
+    tissues), total_reads = summed. One row per locus (tissue='pooled'). The head emits ONE
+    tissue-agnostic score per locus, so this is the train-matched eval; per-tissue rows cap a
+    per-locus model near chance when ASB varies by tissue."""
+    keys = [k for k in ["chr", "ref_start", "ref_end", "ref_allele", "hap1_allele",
+                        "hap2_allele", "donor", "assay"] if k in df.columns]
+    g = df.groupby(keys, sort=False).agg(
+        hap1_count=("hap1_count", "sum"), hap2_count=("hap2_count", "sum"),
+        imbalance_significance=("imbalance_significance", "max"),
+        n_tissues=("tissue", "nunique")).reset_index()
+    g["total_reads"] = g["hap1_count"] + g["hap2_count"]
+    g["signed_log_count_ratio"] = np.log2((g["hap1_count"] + 0.5) / (g["hap2_count"] + 0.5))
+    g["label"] = g["imbalance_significance"].astype(int)
+    g["tissue"] = "pooled"
+    return g
 
 
 # ----------------------------------------------------------------------
@@ -335,6 +299,10 @@ def eval_adastra(args):
 def eval_hetsnv(args):
     full = load_hetsnv(args.hetsnv_tsv, args.assay, args.min_total_reads)
     print(f"[load] {len(full)} hetSNV rows over donors={sorted(full.donor.unique())}")
+    if not args.per_tissue:
+        n0 = len(full)
+        full = pool_hetsnv_tissues(full)
+        print(f"[pool] tissue-pooled {n0} rows -> {len(full)} per-locus (label=any-sig, counts summed; matches training)")
     seen = seen_bins_from_meta(args.train_coords, args.bin_size)
 
     all_rows, summary = [], []
@@ -391,21 +359,22 @@ def eval_hetsnv(args):
             if args.match_coverage:
                 rep("leak_free", d.loc[~leaky], cover_matched=True)
 
-        d_tis = d.loc[~leaky] if leaky.any() else d
-        tis_regime = "leak_free" if leaky.any() else "full"
-        print(f"  --- per-tissue [{tis_regime}] (>= {args.min_tissue_pos} pos & neg) ---")
-        for tis, sub in d_tis.groupby("tissue"):
-            npos = int((sub.label == 1).sum()); nneg = int((sub.label == 0).sum())
-            if npos < args.min_tissue_pos or nneg < args.min_tissue_pos:
-                continue
-            _sc = "delta" if _task["t"] == "classification" else "abs_delta"
-            pt, aupr, (lo, hi), m = balanced_auroc(sub[_sc].to_numpy(), sub["label"].to_numpy())
-            mag = (np.nan if _task["t"] == "classification"
-                   else spearmanr(sub["abs_delta"], sub["signed_log_count_ratio"].abs()).correlation)
-            print(f"    {tis:32s} AUROC={pt:.4f} n_pos={m} mag_Sp={mag:.4f}")
-            summary.append(dict(donor=donor, donor_kind=d["donor_kind"].iloc[0], regime=tis_regime,
-                                tissue=tis, auroc=pt, auroc_lo=lo, auroc_hi=hi, auprc=aupr,
-                                n_pos=m, mag_spearman=mag, signed_spearman=np.nan))
+        if args.per_tissue:   # per-tissue breakdown only meaningful when NOT tissue-pooled
+            d_tis = d.loc[~leaky] if leaky.any() else d
+            tis_regime = "leak_free" if leaky.any() else "full"
+            print(f"  --- per-tissue [{tis_regime}] (>= {args.min_tissue_pos} pos & neg) ---")
+            for tis, sub in d_tis.groupby("tissue"):
+                npos = int((sub.label == 1).sum()); nneg = int((sub.label == 0).sum())
+                if npos < args.min_tissue_pos or nneg < args.min_tissue_pos:
+                    continue
+                _sc = "delta" if _task["t"] == "classification" else "abs_delta"
+                pt, aupr, (lo, hi), m = balanced_auroc(sub[_sc].to_numpy(), sub["label"].to_numpy())
+                mag = (np.nan if _task["t"] == "classification"
+                       else spearmanr(sub["abs_delta"], sub["signed_log_count_ratio"].abs()).correlation)
+                print(f"    {tis:32s} AUROC={pt:.4f} n_pos={m} mag_Sp={mag:.4f}")
+                summary.append(dict(donor=donor, donor_kind=d["donor_kind"].iloc[0], regime=tis_regime,
+                                    tissue=tis, auroc=pt, auroc_lo=lo, auroc_hi=hi, auprc=aupr,
+                                    n_pos=m, mag_spearman=mag, signed_spearman=np.nan))
         all_rows.append((d, pool_ref, pool_alt))
 
     if all_rows:
@@ -449,6 +418,9 @@ def parse_args():
     ap.add_argument("--matched_donor", default="ENC-002")
     ap.add_argument("--min_total_reads", type=int, default=20)
     ap.add_argument("--min_tissue_pos", type=int, default=20)
+    ap.add_argument("--per_tissue", action="store_true",
+                    help="score per (locus x tissue); DEFAULT pools tissues per locus to match the "
+                         "tissue-pooled training label (any-sig). Per-tissue caps a per-locus model near chance.")
     # shared
     ap.add_argument("--train_coords", nargs="+", default=None,
                     help="fold0/train.meta.csv fold0/dev.meta.csv (leak filter; NOT test.meta.csv)")
