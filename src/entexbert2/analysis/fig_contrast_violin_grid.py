@@ -10,13 +10,15 @@ Choose which quantity to violin with --metric:
     head_norm  (default) = distance s   -- the head's learned contrast, the discriminative axis
     trunk_norm           = ||h1-h2||    -- the frozen trunk's raw contrast (usually NOT discriminative)
     ell                  = logit P(ASB) -- the decision axis
-Each panel annotates the rank-AUROC of that metric (AS vs non-AS separation) and n per class. Login node.
+Each panel's TOP LABEL is, by default, the HEAD's test-split AUROC from eval_results.json (--label_auroc
+eval_results; --label_arm sets which arm, default = --arm). The violins still show the chosen --metric
+distribution; --label_auroc metric restores the old rank-AUROC-of-the-plotted-metric label. Login node.
 
   python fig_contrast_violin_grid.py --exp_root experiments --donor ENC-002 --arm ref \
       --metric head_norm --assays CTCF,EP300,POLR2A,POLR2AphosphoS5,ATAC,H3K4me3,H3K27ac,H3K4me1,H3K9me3,H3K36me3,H3K27me3 \
       --title "Head contrast distance s by class (reference), ENC-002" --out fig_contrast_violin_head_ref.png
 """
-import argparse, os, math
+import argparse, os, math, json, glob
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
@@ -28,6 +30,36 @@ METRIC_XLABEL = {"head_norm": "distance  s = ||P(h1)-P(h2)||",
                  "trunk_norm": "trunk contrast  ||h1-h2||",
                  "ell": "ell = logit P(ASB)",
                  "gain": "distance gained  z(head) - z(trunk)"}
+
+
+KEY_CANDIDATES = ["eval_auroc", "eval_roc_auc", "eval_auc", "auroc", "roc_auc", "auc",
+                  "eval_AUROC", "eval_auROC"]
+
+
+def find_auroc(d, forced=None):
+    """Return (value, key) for the AUROC in an eval_results.json dict, or (None, None)."""
+    if forced:
+        return (float(d[forced]), forced) if forced in d else (None, None)
+    for k in KEY_CANDIDATES:
+        if k in d:
+            return float(d[k]), k
+    cands = [k for k in d if "auroc" in k.lower()] or [k for k in d if "auc" in k.lower()]
+    if cands:
+        cands.sort(key=lambda k: ("auroc" not in k.lower(), k))
+        return float(d[cands[0]]), cands[0]
+    return None, None
+
+
+def eval_results_auroc(exp_root, assay, donor, arm, run_subdir, metric_key):
+    """Head test-split AUROC from eval_results.json (nested under runs/<run_subdir>/results/<clf_...>/)."""
+    base = os.path.join(exp_root, f"{assay.lower()}_{donor}", f"stage2_{arm}", "runs", run_subdir)
+    hits = (glob.glob(os.path.join(base, "results", "*", "eval_results.json"))
+            or glob.glob(os.path.join(base, "**", "eval_results.json"), recursive=True))
+    if not hits:
+        return None
+    with open(sorted(hits)[0]) as fh:
+        v, _ = find_auroc(json.load(fh), metric_key)
+    return v
 
 
 def rank_auroc(y, x):
@@ -93,6 +125,15 @@ def main():
     ap.add_argument("--donor", default="ENC-002")
     ap.add_argument("--arm", default="ref", choices=["ref", "personal"])
     ap.add_argument("--metric", default="head_norm", choices=["head_norm", "trunk_norm", "ell", "gain"])
+    ap.add_argument("--label_auroc", default="eval_results", choices=["eval_results", "metric"],
+                    help="what the per-panel top AUROC label reports: eval_results = the head's "
+                         "test-split AUROC from eval_results.json (canonical head number); "
+                         "metric = the rank-AUROC of the PLOTTED contrast metric (old behavior).")
+    ap.add_argument("--label_arm", default=None, choices=[None, "ref", "personal"],
+                    help="arm whose eval_results.json supplies the label (default = --arm; pass "
+                         "'personal' to always label with the personal head).")
+    ap.add_argument("--run_subdir", default="clf_s20_seed20", help="head run dir under stage2_<arm>/runs/")
+    ap.add_argument("--metric_key", default=None, help="force the eval_results.json AUROC key")
     ap.add_argument("--npz_name", default="contrast_<arm>_entex.npz",
                     help="per-cell npz under <cell>/eval/ ; '<arm>' is substituted")
     ap.add_argument("--ncols", type=int, default=4)
@@ -109,14 +150,18 @@ def main():
     for ax in axes_flat[len(assays):]:
         ax.axis("off")
 
-    print(f"{'assay':18} {'n_AS':>7} {'n_nonAS':>8} {'AUROC':>7}  metric={a.metric}")
+    label_arm = a.label_arm or a.arm
+    print(f"{'assay':18} {'n_AS':>7} {'n_nonAS':>8} {'rankAUROC':>10} {'evalAUROC':>10}  "
+          f"metric={a.metric} label={a.label_auroc}({label_arm})")
     for i, (ax, assay) in enumerate(zip(axes_flat, assays)):
         val, y, p = load_metric(a.exp_root, assay, a.donor, a.arm, a.npz_name, a.metric)
         if val is None:
             ax.text(0.5, 0.5, f"{assay}\n(no contrast npz)", ha="center", va="center",
                     transform=ax.transAxes, fontsize=8, color="0.5")
             ax.set_title(assay, fontsize=10); ax.set_xticks([]); continue
-        au = rank_auroc(y, val)
+        au = rank_auroc(y, val)                         # separation of the PLOTTED contrast metric
+        au_eval = eval_results_auroc(a.exp_root, assay, a.donor, label_arm, a.run_subdir, a.metric_key)
+        au_label = au_eval if a.label_auroc == "eval_results" else au
         # clip display tail (violins squish on long tails); keep both classes on the same clip
         if a.metric in ("ell", "gain"):   # centered quantities: clip both tails
             lo, hi = np.percentile(val, [0.5, 99.5]); vshow = np.clip(val, lo, hi)
@@ -125,7 +170,8 @@ def main():
             vshow = np.clip(val, lo, hi)
         data = [vshow[y == 0], vshow[y == 1]]
         n0, n1 = int((y == 0).sum()), int((y == 1).sum())
-        print(f"{assay:18} {n1:>7} {n0:>8} {au:>7.3f}  ({os.path.basename(p)})")
+        print(f"{assay:18} {n1:>7} {n0:>8} {au:>10.3f} "
+              f"{('%.3f'%au_eval) if au_eval is not None else '   n/a':>10}  ({os.path.basename(p)})")
         parts = ax.violinplot(data, positions=[0, 1], showmedians=True, showextrema=False,
                               widths=0.85)
         for b, c in zip(parts["bodies"], [NONAS_COLOR, AS_COLOR]):
@@ -134,7 +180,8 @@ def main():
             parts["cmedians"].set_color("0.15"); parts["cmedians"].set_linewidth(1.2)
         if a.metric in ("ell", "gain"):
             ax.axhline(0.0, ls="--", color="k", lw=1.0, alpha=0.7)  # ell: p=0.5 ; gain: no head-over-trunk gain
-        ax.set_title(f"{assay}  (AUROC {au:.2f})", fontsize=9)
+        _lab = f"AUROC {au_label:.2f}" if au_label is not None else "AUROC n/a"
+        ax.set_title(f"{assay}  ({_lab})", fontsize=9)
         ax.set_xticks([0, 1])
         ax.set_xticklabels([f"non-AS\n(n={n0})", f"AS\n(n={n1})"] if i // ncols == nrows - 1
                            else ["non-AS", "AS"], fontsize=8)
